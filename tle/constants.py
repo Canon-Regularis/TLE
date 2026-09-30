@@ -1,6 +1,12 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Before any setting below is read. Variables already in the environment (e.g.
+# set by Docker) win over .env.
+load_dotenv()
+
 DATA_DIR = Path('data')
 LOGS_DIR = Path('logs')
 
@@ -10,6 +16,7 @@ TEMP_DIR = DATA_DIR / 'temp'
 
 USER_DB_FILE_PATH = DB_DIR / 'user.db'
 CACHE_DB_FILE_PATH = DB_DIR / 'cache.db'
+KCPC_DB_FILE_PATH = DB_DIR / 'kcpc.db'
 
 _SYSTEM_FONT_DIR = Path('/usr/share/fonts/opentype/noto')
 NOTO_SANS_CJK_REGULAR_FONT_PATH = _SYSTEM_FONT_DIR / 'NotoSansCJK-Regular.ttc'
