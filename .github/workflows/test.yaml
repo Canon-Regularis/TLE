@@ -9,6 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A normal run takes a few minutes, mostly installs. The async tests tend
+    # to hang rather than fail when broken, so stop them long before GitHub's
+    # 6-hour default.
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -25,6 +29,9 @@ jobs:
         run: pip install ".[test]"
       - name: Run tests
         run: pytest --cov=tle --cov-report=xml -v
+      - name: Type check
+        if: matrix.python-version == '3.11'
+        run: pip install "mypy==2.3.1" && mypy tle
       - name: Upload coverage
         if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@v4
