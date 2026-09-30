@@ -4,7 +4,8 @@ version = "0.1.0"
 requires-python = ">= 3.10"
 dependencies = [
   # Discord bot core
-  "discord.py >= 2.3, < 3",
+  "discord.py >= 2.4, < 3",
+  "aiohttp >= 3.9, < 4",
   "aiocache >= 0.12, < 1",
   # Data & plotting
   "numpy >= 1.24, < 3",
@@ -18,6 +19,10 @@ dependencies = [
   "aiosqlite >= 0.19, < 1",
   # Config
   "python-dotenv >= 1.0, < 2",
+  # Time zones (zoneinfo needs tzdata on Windows / minimal images)
+  "tzdata >= 2024.1",
+  # Calendar feeds (Luma iCal)
+  "icalendar >= 6.1, < 8",
   # OAuth / JWT
   "PyJWT >= 2.8, < 3",
 ]
@@ -25,7 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest >= 7.0, < 9",
-  "pytest-asyncio >= 0.23, < 1",
+  "pytest-asyncio >= 0.24, < 1",
   "pytest-cov >= 4.0, < 6",
   "pytest-mock >= 3.10, < 4",
 ]
@@ -83,6 +88,7 @@ disable_error_code = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks integration tests requiring mocked Discord context",
