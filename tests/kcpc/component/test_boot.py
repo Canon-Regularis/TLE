@@ -1,0 +1,376 @@
+"""Boot tests: ``TLEBot.setup_hook`` with different extensions switched off.
+
+The bot never logs in. TLE's database setup (``cf_common.initialize``) and the
+slash command sync are stubbed out, OAuth is off, no log channel is set and
+kcpc.db goes in a temporary directory. The rest runs for real: choosing the
+extensions, starting KCPC, loading every cog and, at the end, closing the bot.
+"""
+
+import importlib
+import logging
+import pkgutil
+import sqlite3
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, closing
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+from unittest.mock import AsyncMock
+
+import discord
+import pytest
+from discord import app_commands
+from discord.ext import commands
+
+from tle import constants, extensions
+from tle.config import Settings
+from tle.kcpc import bootstrap
+from tle.kcpc.bot.cog import KcpcCog
+from tle.kcpc.core.errors import MigrationError
+from tle.kcpc.services import KcpcServices
+
+# TLE's cogs draw with cairo and pango, through gi, and tle.__main__ imports
+# matplotlib and seaborn: Docker and CI have them, a bare virtualenv may not.
+pytest.importorskip('gi')
+
+from tle.__main__ import TLEBot  # noqa: E402
+from tle.util import codeforces_common as cf_common  # noqa: E402
+
+COGS_DIR = Path(__file__).resolve().parents[3] / 'tle' / 'cogs'
+TLE_MODULES = frozenset(
+    f'tle.cogs.{path.stem}'
+    for path in COGS_DIR.glob('*.py')
+    if not path.stem.startswith('_')
+)
+LOGGING_MODULE = 'tle.cogs.logging'
+KCPC_ADMIN_MODULE = 'tle.kcpc.features.admin.cog'
+KCPC_FAILED = 'KCPC failed to start; KCPC extensions will not be loaded'
+# Where TLE's and KCPC's extension modules live (KCPC's in features/*/cog.py).
+EXTENSION_PACKAGES = ('tle.cogs.', 'tle.kcpc.features.')
+
+
+@dataclass(frozen=True)
+class Stubs:
+    """Stand-ins for the calls that would reach TLE's databases or Discord."""
+
+    initialize: AsyncMock  # cf_common.initialize
+    sync: AsyncMock  # CommandTree.sync
+
+
+@pytest.fixture(autouse=True)
+def stubs(monkeypatch: pytest.MonkeyPatch) -> Stubs:
+    stubs = Stubs(initialize=AsyncMock(), sync=AsyncMock(return_value=[]))
+    monkeypatch.setattr(cf_common, 'initialize', stubs.initialize)
+    monkeypatch.setattr(app_commands.CommandTree, 'sync', stubs.sync)
+    monkeypatch.setattr(constants, 'OAUTH_CONFIGURED', False)
+    # Unset, the logging extension loads but installs no log handler.
+    monkeypatch.delenv('LOGGING_COG_CHANNEL_ID', raising=False)
+    return stubs
+
+
+@pytest.fixture
+def db_path(tmp_path: Path) -> Path:
+    return tmp_path / 'db' / 'kcpc.db'
+
+
+@asynccontextmanager
+async def booted(
+    db_path: Path, *, disabled: str = '', nodb: bool = False
+) -> AsyncIterator[TLEBot]:
+    """A bot whose ``setup_hook`` has run; it is closed on the way out.
+
+    The extension modules imported before it booted are then put back in
+    sys.modules (see ``extension_modules``).
+    """
+    settings = Settings.from_env(
+        {'DISABLED_EXTENSIONS': disabled, 'KCPC_DB_PATH': str(db_path)}
+    )
+    intents = discord.Intents.default()  # as tle.__main__.main sets them
+    intents.members = True
+    intents.message_content = True
+    bot = TLEBot(nodb=nodb, settings=settings, command_prefix=';', intents=intents)
+    imported = extension_modules()
+    try:
+        # The context manager sets the bot up for the running loop, as logging
+        # in would; KCPC's jobs wait on bot.wait_until_ready, which needs that.
+        async with bot:
+            await bot.setup_hook()
+            yield bot
+    finally:
+        sys.modules.update(imported)
+        # bot.close() should have done this already (shutting down twice is
+        # fine), but a database left open would keep pytest from exiting.
+        if bot.kcpc is not None:
+            await bot.kcpc.shutdown()
+
+
+def extension_modules() -> dict[str, ModuleType]:
+    """The extension modules imported so far, which booting takes away.
+
+    discord.py loads each extension as a new module, which replaces the one in
+    sys.modules, and removes it when the bot closes. Other tests import TLE's
+    cogs and patch them by name, e.g. ``patch('tle.cogs.codeforces.cf_common')``,
+    and since Python 3.11 such a name is looked up through sys.modules. If
+    these modules weren't put back, those patches would import new copies and
+    miss the modules the tests use.
+    """
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith(EXTENSION_PACKAGES)
+    }
+
+
+async def is_closed(services: KcpcServices) -> bool:
+    try:
+        await services.db.fetchval('SELECT 1')
+    except sqlite3.ProgrammingError:
+        return True
+    return False
+
+
+def make_newer_kcpc_db(path: Path) -> None:
+    """A kcpc.db written by a newer version of the bot, which KCPC must refuse."""
+    path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(
+            'CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL, '
+            'name TEXT NOT NULL, applied_at INTEGER NOT NULL)'
+        )
+        conn.execute("INSERT INTO schema_version VALUES (999, 'future', 0)")
+        conn.commit()
+
+
+def bot_records(
+    caplog: pytest.LogCaptureFixture, level: int
+) -> list[logging.LogRecord]:
+    """What tle.__main__, which logs to the root logger, logged at ``level``."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == 'root' and record.levelno == level
+    ]
+
+
+def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [record.getMessage() for record in bot_records(caplog, level)]
+
+
+@pytest.mark.parametrize(
+    ('disabled', 'nodb', 'expected', 'kcpc_runs'),
+    [
+        ('', False, TLE_MODULES | {KCPC_ADMIN_MODULE}, True),
+        (
+            'tle.duel,tle.graphs,tle.starboard',
+            False,
+            (TLE_MODULES - {'tle.cogs.duel', 'tle.cogs.graphs', 'tle.cogs.starboard'})
+            | {KCPC_ADMIN_MODULE},
+            True,
+        ),
+        ('kcpc', False, TLE_MODULES, False),
+        # The whole TLE family, tle.logging included.
+        ('tle', False, frozenset({KCPC_ADMIN_MODULE}), True),
+        ('', True, TLE_MODULES, False),
+    ],
+    ids=['nothing disabled', 'some TLE cogs disabled', 'kcpc', 'tle', 'nodb'],
+)
+async def test_the_bot_boots_with_the_enabled_extensions(
+    stubs: Stubs,
+    db_path: Path,
+    disabled: str,
+    nodb: bool,
+    expected: frozenset[str],
+    kcpc_runs: bool,
+) -> None:
+    async with booted(db_path, disabled=disabled, nodb=nodb) as bot:
+        assert set(bot.extensions) == expected
+        assert (bot.get_cog('KcpcAdmin') is not None) is kcpc_runs
+        assert (bot.tree.get_command('kcpc') is not None) is kcpc_runs
+        services = bot.kcpc
+        if kcpc_runs:
+            assert isinstance(services, KcpcServices)
+            assert services.scheduler.running
+        else:
+            assert services is None
+        # Where KCPC doesn't run, it doesn't even create its database.
+        assert db_path.exists() is kcpc_runs
+        stubs.initialize.assert_awaited_once_with(bot, nodb)
+        stubs.sync.assert_awaited_once_with()
+
+        await bot.close()
+
+        assert bot.extensions == {}
+        if services is not None:
+            assert not services.scheduler.running
+            assert await is_closed(services)
+
+
+async def test_setup_hook_starts_things_in_order(
+    monkeypatch: pytest.MonkeyPatch, stubs: Stubs, db_path: Path
+) -> None:
+    steps: list[str] = []
+    stubs.initialize.side_effect = lambda *args: steps.append('cf_common.initialize')
+    stubs.sync.side_effect = lambda: steps.append('tree.sync')
+    real_build_services = bootstrap.build_services
+    real_load_extension = TLEBot.load_extension
+
+    async def build_services(*args: Any, **kwargs: Any) -> KcpcServices:
+        steps.append('kcpc.build_services')
+        return await real_build_services(*args, **kwargs)
+
+    async def load_extension(bot: TLEBot, name: str) -> None:
+        steps.append(name)
+        await real_load_extension(bot, name)
+
+    monkeypatch.setattr(bootstrap, 'build_services', build_services)
+    monkeypatch.setattr(TLEBot, 'load_extension', load_extension)
+
+    async with booted(db_path):
+        pass
+
+    # The log channel first, so that it hears of problems while starting up,
+    # and KCPC's services before the extensions that use them.
+    assert steps == [
+        LOGGING_MODULE,
+        'cf_common.initialize',
+        'kcpc.build_services',
+        *sorted(TLE_MODULES - {LOGGING_MODULE}),
+        KCPC_ADMIN_MODULE,
+        'tree.sync',
+    ]
+
+
+@pytest.mark.parametrize('cause', ['newer database', 'bug'])
+async def test_tle_boots_when_kcpc_fails_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    cause: str,
+) -> None:
+    error: type[Exception]
+    if cause == 'newer database':
+        make_newer_kcpc_db(db_path)
+        error = MigrationError
+    else:
+        error = RuntimeError
+        monkeypatch.setattr(
+            bootstrap, 'build_services', AsyncMock(side_effect=RuntimeError('boom'))
+        )
+
+    async with booted(db_path) as bot:
+        assert set(bot.extensions) == TLE_MODULES
+        assert bot.kcpc is None
+        assert bot.get_cog('KcpcAdmin') is None
+        await bot.close()
+
+    (record,) = [r for r in caplog.records if r.getMessage() == KCPC_FAILED]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None and record.exc_info[0] is error
+
+
+@pytest.mark.parametrize('cause', ['cog_load raises', 'package missing'])
+async def test_the_bot_boots_without_a_kcpc_extension_that_fails_to_load(
+    monkeypatch: pytest.MonkeyPatch,
+    stubs: Stubs,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    cause: str,
+) -> None:
+    error: type[Exception]
+    if cause == 'cog_load raises':
+
+        async def cog_load(cog: KcpcCog) -> None:
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(KcpcCog, 'cog_load', cog_load)
+        failed, error, admin_loads = 'kcpc.admin', commands.ExtensionFailed, False
+    else:
+        # Its package doesn't exist either, so load_extension raises the import
+        # error itself rather than an ExtensionError. It comes first, and the
+        # extension after it must still load.
+        missing = ('kcpc.missing', 'tle.kcpc.features.missing.cog')
+        monkeypatch.setattr(
+            extensions, 'KCPC_EXTENSIONS', (missing, *extensions.KCPC_EXTENSIONS)
+        )
+        failed, error, admin_loads = 'kcpc.missing', ModuleNotFoundError, True
+
+    async with booted(db_path) as bot:
+        kcpc_modules = {KCPC_ADMIN_MODULE} if admin_loads else set()
+        assert set(bot.extensions) == TLE_MODULES | kcpc_modules
+        assert (bot.get_cog('KcpcAdmin') is not None) is admin_loads
+        assert (bot.get_command('kcpc') is not None) is admin_loads
+        assert (bot.tree.get_command('kcpc') is not None) is admin_loads
+        # KCPC's services keep running, so that the reconcile job still settles
+        # the posts left unconfirmed when the bot last stopped.
+        assert bot.kcpc is not None
+        assert bot.kcpc.scheduler.running
+        jobs = [job.name for job in bot.kcpc.scheduler.status()]
+        assert jobs == [bootstrap.RECONCILE_JOB]
+        stubs.sync.assert_awaited_once_with()
+
+    (record,) = bot_records(caplog, logging.ERROR)
+    assert record.getMessage() == (
+        f'KCPC extension {failed} failed to load; the bot carries on without it'
+    )
+    assert record.exc_info is not None and record.exc_info[0] is error
+
+
+async def test_a_tle_extension_that_fails_to_load_still_stops_the_bot(
+    monkeypatch: pytest.MonkeyPatch, stubs: Stubs, db_path: Path
+) -> None:
+    missing = extensions.Extension(
+        'tle.missing', 'tle.cogs.missing', extensions.TLE_FAMILY
+    )
+    discover = extensions.discover
+    monkeypatch.setattr(extensions, 'discover', lambda: [*discover(), missing])
+
+    with pytest.raises(commands.ExtensionNotFound):
+        async with booted(db_path):
+            pass
+
+    stubs.sync.assert_not_awaited()
+
+
+async def test_booting_puts_back_the_extension_modules_tests_imported(
+    db_path: Path,
+) -> None:
+    # As tests/integration/test_codeforces_cog.py does before it patches
+    # 'tle.cogs.codeforces.cf_common'. Since Python 3.11, mock finds the module
+    # to patch with pkgutil.resolve_name.
+    names = ('tle.cogs.codeforces', KCPC_ADMIN_MODULE)
+    imported = {name: importlib.import_module(name) for name in names}
+
+    async with booted(db_path):
+        for name, module in imported.items():
+            # discord.py loaded a module of its own in its place.
+            assert sys.modules[name] is not module
+
+    for name, module in imported.items():
+        assert pkgutil.resolve_name(name) is module
+
+
+async def test_nodb_is_reported(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        async with booted(db_path, nodb=True):
+            pass
+
+    assert 'KCPC is disabled with --nodb' in bot_messages(caplog, logging.INFO)
+    assert bot_messages(caplog, logging.ERROR) == []
+
+
+async def test_unknown_disabled_extensions_are_reported(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with booted(db_path, disabled='tle.duel,tle.nope,kcpc.nope') as bot:
+        assert set(bot.extensions) == (TLE_MODULES - {'tle.cogs.duel'}) | {
+            KCPC_ADMIN_MODULE
+        }
+
+    assert bot_messages(caplog, logging.WARNING) == [
+        "Ignoring unknown extension 'kcpc.nope' in DISABLED_EXTENSIONS",
+        "Ignoring unknown extension 'tle.nope' in DISABLED_EXTENSIONS",
+    ]
