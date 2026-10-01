@@ -11,7 +11,7 @@ it ``skipped``. Claims left unresolved by a crash or a timeout are found with
 
 import hashlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -22,6 +22,10 @@ from tle.kcpc.core.messages import OutgoingMessage
 from tle.kcpc.core.timeutil import from_epoch, to_epoch
 
 logger = logging.getLogger(__name__)
+
+# The most subject ids that history_for puts in one query. SQLite before 3.32
+# allows at most 999 parameters in a statement.
+_HISTORY_CHUNK = 500
 
 
 class DeliveryStatus(str, Enum):
@@ -35,8 +39,8 @@ class Delivery:
     """One thing to post at most once, such as one reminder for one guild.
 
     ``subject``, ``subject_id`` and ``kind`` identify what the delivery is about
-    (e.g. 'event', a Luma id and the reminder offset), for ``latest_for``.
-    Past ``expires_at``, (re)sending it is pointless.
+    (e.g. 'event', a Luma id and the reminder offset), for ``latest_for`` and
+    ``history_for``. Past ``expires_at``, (re)sending it is pointless.
     """
 
     key: str
@@ -236,6 +240,33 @@ class DeliveryLedger:
             (str(guild_id), subject, subject_id, kind),
         )
         return None if row is None else self._record(row)
+
+    async def history_for(
+        self, guild_id: int, subject: str, subject_ids: Collection[str]
+    ) -> dict[str, list[DeliveryRecord]]:
+        """Every delivery in the guild about each of ``subject_ids``, by id.
+
+        That is every row about ``subject`` with one of those ids, of any kind
+        and status. Each id's rows are oldest first: by ``claimed_at``, then in
+        the order they were written. An id without rows maps to ``[]``.
+        """
+        history: dict[str, list[DeliveryRecord]] = {
+            subject_id: [] for subject_id in subject_ids
+        }
+        ids = list(history)
+        for first in range(0, len(ids), _HISTORY_CHUNK):
+            chunk = ids[first : first + _HISTORY_CHUNK]
+            placeholders = ', '.join('?' * len(chunk))
+            rows = await self._db.fetchall(
+                'SELECT * FROM delivery_log '
+                'WHERE guild_id = ? AND subject = ? '
+                f'AND subject_id IN ({placeholders}) '
+                'ORDER BY claimed_at, rowid',
+                (str(guild_id), subject, *chunk),
+            )
+            for row in rows:
+                history[row['subject_id']].append(self._record(row))
+        return history
 
     async def status_counts(
         self, guild_id: int | None = None

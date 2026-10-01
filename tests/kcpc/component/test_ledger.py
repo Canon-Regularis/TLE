@@ -440,6 +440,115 @@ async def test_latest_for_returns_the_most_recent_claim(
     assert await ledger.latest_for(GUILD, 'event', 'e3', '60') is None
 
 
+async def claim_about(
+    ledger: DeliveryLedger,
+    key: str,
+    subject_id: str,
+    *,
+    subject: str = 'event',
+    kind: str | None = None,
+    guild_id: int = GUILD,
+) -> str:
+    """Claim ``key``, about ``subject_id``, as a post of its own; return the batch."""
+    item = delivery(
+        key, guild_id=guild_id, subject=subject, subject_id=subject_id, kind=kind
+    )
+    _, batch = await ledger.claim([item], channel_id=CHANNEL, message=MESSAGE)
+    assert batch is not None
+    return batch
+
+
+async def test_history_for_lists_every_row_about_each_id_oldest_first(
+    ledger: DeliveryLedger, clock: FakeClock
+) -> None:
+    sent = await claim_about(ledger, 'z-sent', 'e1', kind='1440m')
+    await ledger.confirm(sent, MESSAGE_ID)
+    # Claimed in the same second: the later insert comes later, whatever the key.
+    await claim_about(ledger, 'a-claimed', 'e1', kind='moved')
+    await clock.advance(timedelta(minutes=1))
+    await ledger.record_skip(
+        delivery('m-skipped', subject='event', subject_id='e1', kind='60m'), 'late'
+    )
+    await ledger.mark_skipped(await claim_about(ledger, 'refused', 'e2'), 'discord-403')
+    # Rows that are not asked about: another guild, subject or id.
+    await claim_about(ledger, 'elsewhere', 'e1', guild_id=OTHER_GUILD)
+    await claim_about(ledger, 'contest', 'e1', subject='contest')
+    await claim_about(ledger, 'unasked', 'e4')
+
+    history = await ledger.history_for(GUILD, 'event', ['e1', 'e2', 'e3'])
+
+    assert {subject_id: keys_of(rows) for subject_id, rows in history.items()} == {
+        'e1': ['z-sent', 'a-claimed', 'm-skipped'],
+        'e2': ['refused'],
+        'e3': [],
+    }
+    assert [(record.kind, record.status) for record in history['e1']] == [
+        ('1440m', SENT),
+        ('moved', CLAIMED),
+        ('60m', SKIPPED),
+    ]
+    assert history['e2'] == [await get(ledger, 'refused')]
+
+
+async def test_history_for_orders_by_claim_time_before_insertion(
+    ledger: DeliveryLedger, db: Database, clock: FakeClock
+) -> None:
+    await claim_about(ledger, 'claimed-now', 'e1')
+    # Written later but claimed earlier, as after the system clock was set back.
+    behind = DeliveryLedger(db, FakeClock(clock.now() - timedelta(minutes=5)))
+    await claim_about(behind, 'claimed-before', 'e1')
+
+    history = await ledger.history_for(GUILD, 'event', ['e1'])
+
+    assert keys_of(history['e1']) == ['claimed-before', 'claimed-now']
+
+
+async def test_history_for_no_ids_is_empty(ledger: DeliveryLedger) -> None:
+    await claim_about(ledger, 'k1', 'e1')
+
+    assert await ledger.history_for(GUILD, 'event', []) == {}
+
+
+async def test_history_for_lists_a_repeated_id_once(ledger: DeliveryLedger) -> None:
+    await claim_about(ledger, 'k1', 'e1')
+
+    history = await ledger.history_for(GUILD, 'event', ['e1', 'e1'])
+
+    assert {subject_id: keys_of(rows) for subject_id, rows in history.items()} == {
+        'e1': ['k1']
+    }
+
+
+async def test_history_for_asks_for_at_most_500_ids_per_query(
+    ledger: DeliveryLedger, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SQLite before 3.32 takes at most 999 parameters per statement.
+    ids = [f'e{i}' for i in range(1201)]
+    for subject_id in ('e0', 'e499', 'e500', 'e1200'):
+        await claim_about(ledger, f'key-{subject_id}', subject_id)
+    fetchall = db.fetchall
+    parameter_counts: list[int] = []
+
+    async def counting_fetchall(sql: str, params: Sequence[Any] = ()) -> list[Any]:
+        parameter_counts.append(len(params))
+        return await fetchall(sql, params)
+
+    monkeypatch.setattr(db, 'fetchall', counting_fetchall)
+
+    history = await ledger.history_for(GUILD, 'event', ids)
+
+    assert parameter_counts == [502, 502, 203]  # the guild, the subject and the ids
+    assert set(history) == set(ids)
+    assert {
+        subject_id: keys_of(rows) for subject_id, rows in history.items() if rows
+    } == {
+        'e0': ['key-e0'],
+        'e499': ['key-e499'],
+        'e500': ['key-e500'],
+        'e1200': ['key-e1200'],
+    }
+
+
 async def test_status_counts(ledger: DeliveryLedger) -> None:
     assert await ledger.status_counts() == {CLAIMED: 0, SENT: 0, SKIPPED: 0}
 
