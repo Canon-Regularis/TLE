@@ -37,7 +37,7 @@ ENV_VARS_WITH_DEFAULTS = (
     'KCPC_DB_PATH',
 )
 # Where the variables are documented, for operators and for developers.
-ENV_DOCS = ('README.md', '.env.example', 'KCPC_ARCHITECTURE.md')
+ENV_DOCS = ('README.md', '.env.example')
 
 
 def test_an_empty_environment_gives_the_defaults() -> None:
