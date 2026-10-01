@@ -147,6 +147,15 @@ class TestEpoch:
             dt = utc(2026, 1, 1) + timedelta(seconds=rng.randrange(-(10**9), 2 * 10**9))
             assert from_epoch(to_epoch(dt)) == dt
 
+    @pytest.mark.parametrize(
+        'dt',
+        [utc(1, 1, 1), utc(1969, 7, 20, 20, 17), utc(3001, 1, 1), utc(9999, 12, 31)],
+        ids=str,
+    )
+    def test_round_trip_in_any_year(self, dt: datetime) -> None:
+        # A feed can hold any year; Windows' own conversion fails for these.
+        assert from_epoch(to_epoch(dt)) == dt
+
     def test_to_epoch_floors_fractions_of_a_second(self) -> None:
         assert to_epoch(utc(2026, 10, 17, 9, 0, 0, 999_999)) == SAMPLE_EPOCH
         assert to_epoch(utc(1969, 12, 31, 23, 59, 59, 500_000)) == -1

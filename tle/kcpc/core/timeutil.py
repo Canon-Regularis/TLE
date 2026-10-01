@@ -24,6 +24,8 @@ _LOCAL_DATETIME_HINT = 'Use the format YYYY-MM-DD HH:MM, for example 2026-10-17 
 
 _DURATION_UNITS = (('d', 86_400), ('h', 3_600), ('m', 60), ('s', 1))
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
 
 def ensure_utc(dt: datetime) -> datetime:
     """Return ``dt`` converted to UTC; naive datetimes are rejected."""
@@ -38,8 +40,13 @@ def to_epoch(dt: datetime) -> int:
 
 
 def from_epoch(seconds: float) -> datetime:
-    """Inverse of ``to_epoch``: an aware UTC datetime."""
-    return datetime.fromtimestamp(seconds, UTC)
+    """Inverse of ``to_epoch``: an aware UTC datetime.
+
+    Counting from the epoch works for any year on every platform, unlike
+    ``datetime.fromtimestamp``: Windows can't convert timestamps before 1970 or
+    after 3000, and a calendar feed may hold such times.
+    """
+    return _EPOCH + timedelta(seconds=seconds)
 
 
 def zone(name: str) -> ZoneInfo:
