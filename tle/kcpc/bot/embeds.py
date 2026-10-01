@@ -2,7 +2,7 @@
 
 ``to_embed`` renders a feature's ``OutgoingMessage``. For an automatic post the
 footer ends with its batch marker, ``ref <batch>``, which the reconciler looks
-for to tell whether a post reached its channel (KCPC_ARCHITECTURE.md section 4.3).
+for to tell whether a post reached its channel (see ``publisher``).
 """
 
 import re

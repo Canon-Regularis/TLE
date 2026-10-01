@@ -1,7 +1,7 @@
 """Tests for TLE's bot_error_handler, which replies to discord.py's own errors.
 
 KCPC cogs leave those errors to it (see ``KcpcCog.cog_command_error``), so a
-failed permission check gets its reply here (KCPC_ARCHITECTURE.md section 4.8).
+failed permission check gets its reply here.
 """
 
 import logging

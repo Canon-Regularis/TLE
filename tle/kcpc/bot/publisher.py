@@ -1,7 +1,7 @@
 """Posts automatic KCPC messages to Discord, each delivery at most once.
 
 ``DiscordPublisher`` implements ``core.publishing.Publisher`` on the delivery
-ledger (KCPC_ARCHITECTURE.md section 4.3). It claims the deliveries, sends one
+ledger (``tle.kcpc.core.ledger``). It claims the deliveries, sends one
 message whose footer carries the batch marker, then confirms the batch, or marks
 it skipped if Discord refused the message. When the outcome of a send is unknown
 (a timeout, a Discord 5xx, or an unexpected error once the send has begun) the

@@ -30,7 +30,7 @@ class KcpcServices:
     publisher knows which posts are still on their way, and so must not be sent
     again, only among its own sends. Call ``publisher.publish`` outside any
     ``db.transaction()``, so that its claim is committed before the post is
-    sent (KCPC_ARCHITECTURE.md section 4.3).
+    sent (see ``tle.kcpc.core.ledger``).
     """
 
     settings: Settings

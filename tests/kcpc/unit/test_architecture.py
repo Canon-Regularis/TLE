@@ -1,8 +1,8 @@
 """The import rules between KCPC's layers, checked on the source with ast.
 
 Every import in tle/kcpc counts, wherever it is: at the top of a module, further
-down, inside a function or under ``if TYPE_CHECKING:``. The rules, from
-KCPC_ARCHITECTURE.md section 2:
+down, inside a function or under ``if TYPE_CHECKING:``. The rules (outlined
+in tle/kcpc/__init__.py):
 
 - core imports only the standard library, aiosqlite, aiohttp and core;
 - bot imports only the standard library, discord, aiohttp, core, bot,

@@ -1,7 +1,7 @@
 """Builds and starts the KCPC services when the bot starts.
 
 TLE's ``setup_hook`` calls ``build_services`` before it loads the KCPC
-extensions, and leaves them out if it fails (KCPC_ARCHITECTURE.md section 7).
+extensions, and leaves them out if it fails.
 """
 
 from datetime import datetime, timedelta

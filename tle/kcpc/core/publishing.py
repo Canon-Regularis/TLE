@@ -2,7 +2,7 @@
 
 A feature describes a post as ``Delivery`` rows plus an ``OutgoingMessage`` and
 hands them to a ``Publisher``. ``tle.kcpc.bot.publisher.DiscordPublisher`` is the
-real one; tests use fakes. See KCPC_ARCHITECTURE.md section 4.3.
+real one; tests use fakes. ``ledger`` explains how deliveries are recorded.
 """
 
 from collections.abc import Sequence

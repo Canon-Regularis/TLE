@@ -20,8 +20,7 @@ A non-persistent job keeps that state in memory and never retries, and after a
 long pause it runs only its next slot, not every slot it missed.
 
 Each job runs in an asyncio task that ends only when cancelled: an unexpected
-error is logged, and the job tries again a minute later. See
-KCPC_ARCHITECTURE.md section 4.2.
+error is logged, and the job tries again a minute later.
 """
 
 import asyncio

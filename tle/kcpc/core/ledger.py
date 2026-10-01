@@ -6,8 +6,7 @@ committed before the post is sent, so claims are refused inside a caller's
 transaction. A key that is already in the ledger means the delivery was already
 handled. After sending, the publisher confirms the batch as ``sent`` or marks
 it ``skipped``. Claims left unresolved by a crash or a timeout are found with
-``stale_batches`` and settled by the reconciler in ``tle.kcpc.bot``. See
-KCPC_ARCHITECTURE.md section 4.3.
+``stale_batches`` and settled by the reconciler in ``tle.kcpc.bot.publisher``.
 """
 
 import hashlib
