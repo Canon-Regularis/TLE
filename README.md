@@ -27,8 +27,8 @@ everything.
 
 The bot also runs the KCPC club's own features (in `tle/kcpc`): contest and
 workshop reminders, account linking, a weekly problem and more, added in
-phases. [KCPC_ARCHITECTURE.md](KCPC_ARCHITECTURE.md) explains the design and
-the plan. KCPC keeps its data in its own database, `data/db/kcpc.db`, and
+phases; `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps
+its data in its own database, `data/db/kcpc.db`, and
 doesn't run when the bot is started with `--nodb`.
 
 Every extension, TLE's or KCPC's, can be switched off with
