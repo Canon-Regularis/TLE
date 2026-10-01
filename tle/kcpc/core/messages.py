@@ -75,15 +75,15 @@ class OutgoingMessage:
             content_limit -= ROLE_MENTION_RESERVE
         fitted = replace(
             self,
-            title=_shorten(self.title, TITLE_LIMIT),
-            description=_shorten(self.description, DESCRIPTION_LIMIT),
+            title=shorten(self.title, TITLE_LIMIT),
+            description=shorten(self.description, DESCRIPTION_LIMIT),
             url=_fit_url(self.url),
             color=_fit_color(self.color),
             fields=tuple(
                 _fit_field(field) for field in self.fields[:FIELD_COUNT_LIMIT]
             ),
-            footer=_shorten(self.footer, FOOTER_LIMIT - REF_MARKER_RESERVE),
-            content=_shorten(self.content, content_limit),
+            footer=shorten(self.footer, FOOTER_LIMIT - REF_MARKER_RESERVE),
+            content=shorten(self.content, content_limit),
         )
         return _fit_embed_total(fitted)
 
@@ -113,8 +113,11 @@ class OutgoingMessage:
         )
 
 
-def _shorten(text: str | None, limit: int) -> str | None:
-    """``text`` cut to ``limit`` characters ending in '…'; None if it is blank."""
+def shorten(text: str | None, limit: int) -> str | None:
+    """``text`` cut to ``limit`` characters ending in '…'; None if it is blank.
+
+    Text within the limit is returned as it is.
+    """
     if text is None or not text.strip():
         return None
     if len(text) <= limit:
@@ -153,8 +156,8 @@ def _fit_color(color: int | None) -> int | None:
 def _fit_field(field: EmbedField) -> EmbedField:
     return replace(
         field,
-        name=_shorten(field.name, FIELD_NAME_LIMIT) or ZERO_WIDTH_SPACE,
-        value=_shorten(field.value, FIELD_VALUE_LIMIT) or ZERO_WIDTH_SPACE,
+        name=shorten(field.name, FIELD_NAME_LIMIT) or ZERO_WIDTH_SPACE,
+        value=shorten(field.value, FIELD_VALUE_LIMIT) or ZERO_WIDTH_SPACE,
     )
 
 
@@ -183,7 +186,7 @@ def _fit_embed_total(message: OutgoingMessage) -> OutgoingMessage:
     if excess > 0:
         return replace(
             message,
-            description=_shorten(description, len(description) - excess),
+            description=shorten(description, len(description) - excess),
             fields=tuple(fields),
         )
     return replace(message, fields=tuple(fields))

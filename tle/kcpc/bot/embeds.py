@@ -9,7 +9,12 @@ import re
 
 import discord
 
-from tle.kcpc.core.messages import OutgoingMessage
+from tle.kcpc.core.messages import (
+    DESCRIPTION_LIMIT,
+    TITLE_LIMIT,
+    OutgoingMessage,
+    shorten,
+)
 
 KCPC_COLOR = 0x1E88E5
 # The colours of TLE's discord_common.embed_success and embed_alert, so KCPC
@@ -57,20 +62,33 @@ def _footer_with_marker(footer: str | None, batch: str | None) -> str | None:
     return marker if footer is None else f'{footer} · {marker}'
 
 
+# The replies below cut over-long text to Discord's limits, ending it in '…'.
+# They may repeat what a member or admin typed, and Discord would reject a
+# reply over the limits, leaving the command unanswered.
+
+
 def info_embed(
     title: str | None = None, description: str | None = None
 ) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=KCPC_COLOR)
+    return discord.Embed(
+        title=shorten(title, TITLE_LIMIT),
+        description=shorten(description, DESCRIPTION_LIMIT),
+        color=KCPC_COLOR,
+    )
 
 
 def success_embed(text: str) -> discord.Embed:
     """Like TLE's ``discord_common.embed_success``."""
-    return discord.Embed(description=text, color=SUCCESS_COLOR)
+    return discord.Embed(
+        description=shorten(text, DESCRIPTION_LIMIT), color=SUCCESS_COLOR
+    )
 
 
 def alert_embed(text: str) -> discord.Embed:
     """Like TLE's ``discord_common.embed_alert``."""
-    return discord.Embed(description=text, color=ALERT_COLOR)
+    return discord.Embed(
+        description=shorten(text, DESCRIPTION_LIMIT), color=ALERT_COLOR
+    )
 
 
 def find_batch_marker(message: discord.Message) -> str | None:

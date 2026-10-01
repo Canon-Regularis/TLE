@@ -49,6 +49,8 @@ from tle.kcpc.core.errors import (
     KcpcUserError,
 )
 from tle.kcpc.core.messages import (
+    DESCRIPTION_LIMIT,
+    ELLIPSIS,
     FIELD_COUNT_LIMIT,
     FOOTER_LIMIT,
     TITLE_LIMIT,
@@ -212,6 +214,23 @@ def test_reply_embeds() -> None:
 
     alert = alert_embed('Nope.')
     assert (alert.description, alert.color) == ('Nope.', discord.Colour(ALERT_COLOR))
+
+
+def test_reply_embeds_cut_over_long_text_to_discords_limits() -> None:
+    # A reply may echo what someone typed, such as an unknown feature's name;
+    # Discord would reject one over its limits, leaving the command unanswered.
+    for embed in (
+        alert_embed('x' * 5000),
+        success_embed('x' * 5000),
+        info_embed('x' * 300, 'x' * 5000),
+    ):
+        assert embed.description is not None
+        assert len(embed.description) == DESCRIPTION_LIMIT
+        assert embed.description.endswith(ELLIPSIS)
+    title = info_embed('x' * 300).title
+    assert title is not None and len(title) == TITLE_LIMIT
+    at_limit = 'x' * DESCRIPTION_LIMIT
+    assert alert_embed(at_limit).description == at_limit
 
 
 def test_success_and_alert_embeds_match_tles() -> None:
