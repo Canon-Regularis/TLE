@@ -25,17 +25,21 @@ everything.
 
 ### KCPC club features
 
-The bot also runs the KCPC club's own features (in `tle/kcpc`): contest and
-workshop reminders, account linking, a weekly problem and more, added in
-phases; `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps
-its data in its own database, `data/db/kcpc.db`, and
-doesn't run when the bot is started with `--nodb`.
+The bot also runs the KCPC club's own features (in `tle/kcpc`), added in
+phases. So far it reminds members of the club's workshops on Luma; contest
+reminders, account linking and a weekly problem are to follow.
+`tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps its data
+in its own database, `data/db/kcpc.db`, and doesn't run when the bot is
+started with `--nodb`.
 
 Every extension, TLE's or KCPC's, can be switched off with
 `DISABLED_EXTENSIONS`: e.g. `tle.duel,tle.graphs,tle.starboard`, or `kcpc`
-for all of KCPC. KCPC's own settings are all optional: `KCPC_TIMEZONE`,
-`KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`,
-`CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and `.env.example`).
+for all of KCPC. KCPC's extensions are `kcpc.admin` (`/kcpc`),
+`kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`) and
+`kcpc.notify` (`/notify`). KCPC's own settings are all optional:
+`KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`,
+`ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and
+`.env.example`).
 
 Server admins set KCPC up with `/kcpc` (or `;kcpc`). It needs the Manage
 Server permission or the `TLE_ADMIN` role. Discord only shows `/kcpc` to
@@ -45,12 +49,53 @@ under Server Settings → Integrations.
 ```text
 /kcpc show                          every feature's settings in this server
 /kcpc channel workshops #workshops  where a feature posts (checks the bot can)
-/kcpc role workshops @Workshops     the role its posts mention (optional)
+/kcpc role workshops @Workshops     a pings-only role its posts mention (optional)
 /kcpc enable workshops              turn it on (/kcpc disable turns it off)
 /kcpc status                        database, jobs, post counts and recent skips
 ```
 
-The features are `algo`, `contests`, `weekly` and `workshops`.
+The features are `algo`, `contests`, `weekly` and `workshops`; so far only
+`workshops` posts anything.
+
+#### Workshop reminders
+
+To have the bot remind a server of the club's workshops:
+
+```text
+/kcpc channel workshops #workshops          where the reminders go
+/kcpc role workshops @Workshops             a pings-only role they mention
+/kcpc workshops calendar <ID or iCal link>  the club's Luma calendar
+/kcpc enable workshops                      start reminding
+```
+
+The calendar is its ID (`cal-…`) or its iCal link, from "Add to calendar" on
+the calendar's Luma page. A server that sets none follows `LUMA_CALENDAR_ID`.
+The bot reads the calendar every 10 minutes (`/kcpc workshops sync` reads it
+at once) and reminds members 24 hours and 1 hour before each workshop. If a
+workshop they were reminded of moves, is cancelled or comes back, it tells
+them. Luma drops cancelled events from the calendar, so a workshop counts as
+cancelled once three reads in a row have missed it, the last at least 20
+minutes after it was last listed (about half an hour; `/kcpc workshops sync`
+can't hurry this). If more than half of four or more upcoming workshops vanish
+at once, as a glitch at Luma would look, the bot still applies the rest of the
+calendar at once, but counts the missing ones as cancelled only after six reads
+over at least 50 minutes (about an hour).
+
+Members can use:
+
+```text
+/event next                the next workshop
+/event this-week           this week's workshops, Monday to Sunday
+/notify workshops on|off   get the workshop pings, or stop them
+```
+
+`/notify` gives members the feature's ping role, or takes it away. For that
+the bot needs the Manage Roles permission, and its highest role must be above
+the ping role (Server Settings → Roles). As any member can have it, the ping
+role must be just for pings, and `/notify` refuses any other: a role with a
+permission that @everyone lacks, one that changes what members can do in a
+channel (such as a member or verified role), or one of TLE's roles (admin,
+moderator, trusted or purgatory).
 
 ---
 
@@ -99,7 +144,7 @@ docker compose up -d           # recreate the container on the new image
 | `KCPC_TIMEZONE` | ❌ | `Europe/London` | the club's time zone, for schedules and times admins type |
 | `KCPC_DB_PATH` | ❌ | `data/db/kcpc.db` | where the KCPC database lives |
 | `HTTP_USER_AGENT` | ❌ | `KCPC-bot (+https://…)` | User-Agent of KCPC's requests to other sites |
-| `LUMA_CALENDAR_ID` | ❌ | `cal-…` | Luma calendar for servers that haven't set their own |
+| `LUMA_CALENDAR_ID` | ❌ | `cal-…` | default Luma calendar (its ID), for servers that haven't set one |
 | `ICPC_CONTEST_CODES` | ❌ | `UKIEPC,Northwestern-Europe-2027` | icpc.global contests to track |
 | `CLIST_USERNAME`, `CLIST_API_KEY` | ❌ | | clist.by account, an optional extra contest source |
 
@@ -115,12 +160,12 @@ every key in `.env` to the container. Run without Docker, the bot reads
 
 * `db/user.db`: TLE's server data, such as linked handles, duels, reminder
   settings and starboards.
-* `db/kcpc.db`: each server's KCPC settings, the progress of KCPC's scheduled
-  jobs, and the delivery ledger, which records KCPC's automatic posts so that
-  none goes out twice. Before each upgrade of its database the bot copies it
-  to `kcpc.db.v<N>.bak`, next to it. If you set `KCPC_DB_PATH`, these files
-  are there instead; under Docker, keep that path inside `data/`, or they are
-  lost when the container is recreated.
+* `db/kcpc.db`: each server's KCPC settings, the workshops read from Luma, the
+  progress of KCPC's scheduled jobs, and the delivery ledger, which records
+  KCPC's automatic posts so that none goes out twice. Before each upgrade of
+  its database the bot copies it to `kcpc.db.v<N>.bak`, next to it. If you set
+  `KCPC_DB_PATH`, these files are there instead; under Docker, keep that path
+  inside `data/`, or they are lost when the container is recreated.
 * `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
   but an admin has to refill the rating changes and problemsets with
   `;cache ratingchanges all` and `;cache problemsets all`.
