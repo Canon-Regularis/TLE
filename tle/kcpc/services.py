@@ -15,6 +15,7 @@ from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import KcpcDisabledError
 from tle.kcpc.core.http import HttpClient
 from tle.kcpc.core.ledger import DeliveryLedger
+from tle.kcpc.core.reminders import ReminderEngine
 from tle.kcpc.core.scheduler import Scheduler
 from tle.kcpc.core.settings import FeatureRegistry, GuildSettingsRepo
 
@@ -31,6 +32,9 @@ class KcpcServices:
     again, only among its own sends. Call ``publisher.publish`` outside any
     ``db.transaction()``, so that its claim is committed before the post is
     sent (see ``tle.kcpc.core.ledger``).
+
+    A feature that reminds members of upcoming occurrences registers a source
+    with ``reminders``, which posts through ``publisher`` every minute.
     """
 
     settings: Settings
@@ -41,6 +45,7 @@ class KcpcServices:
     guild_settings: GuildSettingsRepo
     ledger: DeliveryLedger
     publisher: DiscordPublisher
+    reminders: ReminderEngine
     scheduler: Scheduler
 
     async def shutdown(self) -> None:

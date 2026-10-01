@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,21 +16,35 @@ from discord.ext import commands
 
 from tle.config import Settings
 from tle.kcpc import bootstrap
-from tle.kcpc.bootstrap import RECONCILE_JOB, build_services
+from tle.kcpc.bootstrap import RECONCILE_JOB, REMINDERS_JOB, build_services
 from tle.kcpc.bot.publisher import DiscordPublisher, ReconcileReport
 from tle.kcpc.core.clock import FakeClock, SystemClock
 from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import ExternalServiceError, KcpcDisabledError
 from tle.kcpc.core.ledger import Delivery
 from tle.kcpc.core.messages import OutgoingMessage
-from tle.kcpc.core.migrations import schema_version
-from tle.kcpc.core.publishing import PublishOutcome
+from tle.kcpc.core.migrations import ALL_MIGRATIONS, schema_version
+from tle.kcpc.core.publishing import PublishOutcome, PublishResult
+from tle.kcpc.core.reminders import (
+    Notice,
+    Occurrence,
+    ReminderEngine,
+    ReminderPolicy,
+    TickReport,
+)
 from tle.kcpc.core.scheduler import Scheduler
+from tle.kcpc.core.settings import FeatureSettings
+from tle.kcpc.features.workshops.settings import (
+    SPEC as WORKSHOPS_SPEC,
+    WORKSHOPS,
+    WorkshopSettings,
+)
 from tle.kcpc.services import KcpcServices, get_services
 
 GUILD_ID = 1_100_000_000_000_000_001
 CHANNEL_ID = 1_200_000_000_000_000_001
 SERVICES_LOGGER = 'tle.kcpc.services'
+LATEST_SCHEMA = ALL_MIGRATIONS[-1].version
 # Real seconds a healthy shutdown needs, many times over. A shutdown that hangs
 # then fails its test instead of stalling the whole run.
 SHUTDOWN_TIMEOUT = 10
@@ -106,7 +120,7 @@ async def test_build_services_opens_and_migrates_the_database(
 ) -> None:
     assert settings.kcpc_db_path.is_file()  # its directory was created too
     assert services.db.path == str(settings.kcpc_db_path)
-    assert await schema_version(services.db) == 1
+    assert await schema_version(services.db) == LATEST_SCHEMA
 
 
 async def test_build_services_wires_the_services_together(
@@ -116,6 +130,7 @@ async def test_build_services_wires_the_services_together(
     assert services.clock is clock
     assert services.features.keys() == ['algo', 'contests', 'weekly', 'workshops']
     assert services.guild_settings.registry is services.features
+    assert services.reminders.features == []  # features register their sources
 
     # The settings repository and the ledger both use the services' database.
     await services.guild_settings.update(
@@ -132,6 +147,22 @@ async def test_build_services_wires_the_services_together(
     )
     assert result.outcome is PublishOutcome.UNDELIVERABLE
     assert result.reason == 'channel-missing'
+
+
+async def test_workshop_settings_are_typed_whichever_extensions_load(
+    services: KcpcServices,
+) -> None:
+    # No extension has loaded, yet the workshops settings are their own type:
+    # /kcpc shows them so, and the extension never sees the base type.
+    assert services.features.get(WORKSHOPS) is WORKSHOPS_SPEC
+
+    await services.guild_settings.update(
+        GUILD_ID, WORKSHOPS, enabled=True, calendar_id='cal-ClubWorkshops01'
+    )
+
+    assert await services.guild_settings.get(GUILD_ID, WORKSHOPS) == WorkshopSettings(
+        enabled=True, calendar_id='cal-ClubWorkshops01'
+    )
 
 
 async def test_the_http_client_sends_the_configured_user_agent(
@@ -158,14 +189,16 @@ async def test_the_http_client_sends_the_configured_user_agent(
     assert agents == ['kcpc-test/1.0']
 
 
-async def test_the_reconcile_job_is_registered_and_started(
+async def test_the_reconcile_and_reminders_jobs_are_registered_and_started(
     services: KcpcServices,
 ) -> None:
-    (job,) = services.scheduler.status()
+    reconcile, reminders = services.scheduler.status()
 
-    assert job.name == RECONCILE_JOB == 'kcpc.reconcile'
-    assert job.description == 'every 2m'
-    assert not job.persistent
+    assert reconcile.name == RECONCILE_JOB == 'kcpc.reconcile'
+    assert reconcile.description == 'every 2m'
+    assert reminders.name == REMINDERS_JOB == 'kcpc.reminders'
+    assert reminders.description == 'every 1m'
+    assert not reconcile.persistent and not reminders.persistent
     assert services.scheduler.running
 
 
@@ -219,6 +252,85 @@ async def test_the_reconcile_job_uses_the_publisher_that_features_publish_with(
     assert caller is services.publisher
 
 
+async def test_reminders_run_once_ready_then_every_minute(
+    monkeypatch: pytest.MonkeyPatch,
+    bot: MagicMock,
+    settings: Settings,
+    clock: FakeClock,
+    ready: asyncio.Event,
+) -> None:
+    start = clock.now()  # on a 1-minute slot
+    ticks: list[datetime] = []
+
+    async def tick(engine: ReminderEngine) -> TickReport:
+        ticks.append(clock.now())
+        return TickReport()
+
+    monkeypatch.setattr(ReminderEngine, 'tick', tick)
+    services = await build_services(bot, settings, clock=clock)
+    try:
+        await clock.settle()
+        assert ticks == []  # the bot isn't ready yet
+
+        ready.set()
+        await eventually(lambda: len(ticks) == 1, 'reminders run at start')
+        await clock.advance(timedelta(minutes=1))
+        await eventually(lambda: len(ticks) == 2, 'reminders run again')
+
+        assert ticks == [start, start + timedelta(minutes=1)]
+    finally:
+        await shut_down(services)
+
+
+class OneWorkshop:
+    """A reminder source with one workshop, half an hour after ``start``."""
+
+    feature = 'workshops'
+
+    def __init__(self, start: datetime) -> None:
+        self._workshop = Occurrence(
+            'event', 'evt-1', 'Graphs 101', start + timedelta(minutes=30), None, None, 0
+        )
+
+    def policy(self, settings: FeatureSettings) -> ReminderPolicy:
+        return ReminderPolicy(offsets=(timedelta(hours=1),))
+
+    async def occurrences(
+        self, guild_id: int, settings: FeatureSettings, start: datetime, end: datetime
+    ) -> list[Occurrence]:
+        return [self._workshop]
+
+    def render(self, notice: Notice) -> OutgoingMessage:
+        return OutgoingMessage(title=notice.occurrences[0].title)
+
+
+async def test_reminders_go_out_through_the_publisher_that_reconciles(
+    monkeypatch: pytest.MonkeyPatch, services: KcpcServices, clock: FakeClock
+) -> None:
+    # As for the reconcile job: the publisher leaves alone only the posts it
+    # is sending itself, so any other instance could duplicate a reminder.
+    callers: list[DiscordPublisher] = []
+
+    async def publish(
+        publisher: DiscordPublisher,
+        deliveries: Sequence[Delivery],
+        message: OutgoingMessage,
+    ) -> PublishResult:
+        callers.append(publisher)
+        return PublishResult(PublishOutcome.SENT, message_id=1)
+
+    monkeypatch.setattr(DiscordPublisher, 'publish', publish)
+    await services.guild_settings.update(
+        GUILD_ID, 'workshops', enabled=True, channel_id=CHANNEL_ID
+    )
+    services.reminders.register(OneWorkshop(clock.now()))
+
+    await services.scheduler.run_slot(REMINDERS_JOB)
+
+    (caller,) = callers
+    assert caller is services.publisher
+
+
 async def test_the_default_clock_is_the_system_clock(
     bot: MagicMock, settings: Settings
 ) -> None:
@@ -238,7 +350,7 @@ async def test_services_start_again_on_an_existing_database(
 
     second = await build_services(bot, settings, clock=clock)
     try:
-        assert await schema_version(second.db) == 1
+        assert await schema_version(second.db) == LATEST_SCHEMA
         assert (await second.guild_settings.get(GUILD_ID, 'weekly')).enabled
     finally:
         await shut_down(second)

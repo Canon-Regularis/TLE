@@ -4,6 +4,8 @@ The bot never logs in. TLE's database setup (``cf_common.initialize``) and the
 slash command sync are stubbed out, OAuth is off, no log channel is set and
 kcpc.db goes in a temporary directory. The rest runs for real: choosing the
 extensions, starting KCPC, loading every cog and, at the end, closing the bot.
+KCPC's jobs wait for the bot to be ready, which it never is here, so none of
+them runs.
 """
 
 import importlib
@@ -11,7 +13,7 @@ import logging
 import pkgutil
 import sqlite3
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection, Iterable
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +31,8 @@ from tle.config import Settings
 from tle.kcpc import bootstrap
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.core.errors import MigrationError
+from tle.kcpc.core.scheduler import ScheduledJob, Scheduler
+from tle.kcpc.features.workshops.settings import WorkshopSettings
 from tle.kcpc.services import KcpcServices
 
 # TLE's cogs draw with cairo and pango, through gi, and tle.__main__ imports
@@ -45,10 +49,35 @@ TLE_MODULES = frozenset(
     if not path.stem.startswith('_')
 )
 LOGGING_MODULE = 'tle.cogs.logging'
-KCPC_ADMIN_MODULE = 'tle.kcpc.features.admin.cog'
 KCPC_FAILED = 'KCPC failed to start; KCPC extensions will not be loaded'
 # Where TLE's and KCPC's extension modules live (KCPC's in features/*/cog.py).
 EXTENSION_PACKAGES = ('tle.cogs.', 'tle.kcpc.features.')
+
+
+@dataclass(frozen=True)
+class KcpcExtension:
+    """A KCPC extension, with the cog and the top-level command it adds."""
+
+    name: str  # as DISABLED_EXTENSIONS names it
+    module: str
+    cog: str
+    command: str  # a hybrid command or group: prefix and slash
+
+
+ADMIN = KcpcExtension('kcpc.admin', 'tle.kcpc.features.admin.cog', 'KcpcAdmin', 'kcpc')
+WORKSHOPS = KcpcExtension(
+    'kcpc.workshops', 'tle.kcpc.features.workshops.cog', 'KcpcWorkshops', 'event'
+)
+NOTIFY = KcpcExtension(
+    'kcpc.notify', 'tle.kcpc.features.notify.cog', 'KcpcNotify', 'notify'
+)
+KCPC = (ADMIN, WORKSHOPS, NOTIFY)  # in load order
+KCPC_BY_NAME = {extension.name: extension for extension in KCPC}
+# What kcpc.workshops starts besides its commands: a sync job, a reminder
+# source, and admin commands in the /kcpc group (if kcpc.admin is loaded).
+WORKSHOPS_SYNC_JOB = 'workshops.sync'
+WORKSHOPS_FEATURE = 'workshops'
+CORE_JOBS = [bootstrap.RECONCILE_JOB, bootstrap.REMINDERS_JOB]
 
 
 @dataclass(frozen=True)
@@ -143,6 +172,80 @@ def make_newer_kcpc_db(path: Path) -> None:
         conn.commit()
 
 
+def modules_of(loaded: Iterable[KcpcExtension]) -> frozenset[str]:
+    return frozenset(extension.module for extension in loaded)
+
+
+def assert_kcpc_extensions(bot: TLEBot, loaded: Collection[KcpcExtension]) -> None:
+    """Exactly the ``loaded`` KCPC extensions are in, with their cogs and commands."""
+    for extension in KCPC:
+        present = extension in loaded
+        assert (extension.module in bot.extensions) is present, extension
+        assert (bot.get_cog(extension.cog) is not None) is present, extension
+        assert (bot.get_command(extension.command) is not None) is present, extension
+        slash = bot.tree.get_command(extension.command)
+        assert (slash is not None) is present, extension
+
+
+def assert_features_started(
+    bot: TLEBot, services: KcpcServices, loaded: Collection[KcpcExtension]
+) -> None:
+    """What the ``loaded`` KCPC extensions started: jobs, reminders, admin commands.
+
+    Only kcpc.workshops starts anything. Its admin commands join /kcpc when
+    kcpc.admin is loaded, and are never added at the top level.
+    """
+    workshops = WORKSHOPS in loaded
+    feature_jobs = [WORKSHOPS_SYNC_JOB] if workshops else []
+    assert [job.name for job in services.scheduler.status()] == sorted(
+        CORE_JOBS + feature_jobs
+    )
+    assert services.reminders.features == ([WORKSHOPS_FEATURE] if workshops else [])
+    in_kcpc = workshops and ADMIN in loaded
+    assert (bot.get_command('kcpc workshops') is not None) is in_kcpc
+    kcpc_group = bot.tree.get_command('kcpc')
+    slash_children = (
+        [] if not isinstance(kcpc_group, app_commands.Group) else kcpc_group.commands
+    )
+    assert ('workshops' in [child.name for child in slash_children]) is in_kcpc
+    assert bot.get_command('workshops') is None
+    assert bot.tree.get_command('workshops') is None
+
+
+def fail_cog_load(monkeypatch: pytest.MonkeyPatch, cog_name: str) -> None:
+    """Make ``cog_load`` raise for the KCPC cog called ``cog_name``.
+
+    It is patched on the base class, because discord.py runs each extension's
+    module afresh: the cog classes that the tests could import are not the
+    ones that load. So it suits only a cog without a ``cog_load`` of its own.
+    """
+    real_cog_load = KcpcCog.cog_load
+
+    async def cog_load(cog: KcpcCog) -> None:
+        if type(cog).__name__ == cog_name:
+            raise RuntimeError('boom')
+        await real_cog_load(cog)
+
+    monkeypatch.setattr(KcpcCog, 'cog_load', cog_load)
+
+
+def fail_to_add_job(monkeypatch: pytest.MonkeyPatch, job_name: str) -> None:
+    """Make ``Scheduler.add`` raise for the job called ``job_name``."""
+    real_add = Scheduler.add
+
+    def add(scheduler: Scheduler, job: ScheduledJob) -> None:
+        if job.name == job_name:
+            raise RuntimeError('boom')
+        real_add(scheduler, job)
+
+    monkeypatch.setattr(Scheduler, 'add', add)
+
+
+def errors_logged(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every record at ERROR or above, whichever logger it came from."""
+    return [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
 def bot_records(
     caplog: pytest.LogCaptureFixture, level: int
 ) -> list[logging.LogRecord]:
@@ -159,43 +262,62 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ('disabled', 'nodb', 'expected', 'kcpc_runs'),
+    ('disabled', 'nodb', 'tle_modules', 'kcpc'),
     [
-        ('', False, TLE_MODULES | {KCPC_ADMIN_MODULE}, True),
+        ('', False, TLE_MODULES, KCPC),
         (
             'tle.duel,tle.graphs,tle.starboard',
             False,
-            (TLE_MODULES - {'tle.cogs.duel', 'tle.cogs.graphs', 'tle.cogs.starboard'})
-            | {KCPC_ADMIN_MODULE},
-            True,
+            TLE_MODULES - {'tle.cogs.duel', 'tle.cogs.graphs', 'tle.cogs.starboard'},
+            KCPC,
         ),
-        ('kcpc', False, TLE_MODULES, False),
+        ('kcpc.admin', False, TLE_MODULES, (WORKSHOPS, NOTIFY)),
+        ('kcpc.workshops', False, TLE_MODULES, (ADMIN, NOTIFY)),
+        ('kcpc.notify', False, TLE_MODULES, (ADMIN, WORKSHOPS)),
+        ('kcpc', False, TLE_MODULES, ()),
+        ('kcpc.admin,kcpc.workshops,kcpc.notify', False, TLE_MODULES, ()),
         # The whole TLE family, tle.logging included.
-        ('tle', False, frozenset({KCPC_ADMIN_MODULE}), True),
-        ('', True, TLE_MODULES, False),
+        ('tle', False, frozenset(), KCPC),
+        ('', True, TLE_MODULES, ()),
     ],
-    ids=['nothing disabled', 'some TLE cogs disabled', 'kcpc', 'tle', 'nodb'],
+    ids=[
+        'nothing disabled',
+        'some TLE cogs disabled',
+        'kcpc.admin',
+        'kcpc.workshops',
+        'kcpc.notify',
+        'kcpc',
+        'every kcpc extension by name',
+        'tle',
+        'nodb',
+    ],
 )
 async def test_the_bot_boots_with_the_enabled_extensions(
     stubs: Stubs,
     db_path: Path,
+    caplog: pytest.LogCaptureFixture,
     disabled: str,
     nodb: bool,
-    expected: frozenset[str],
-    kcpc_runs: bool,
+    tle_modules: frozenset[str],
+    kcpc: tuple[KcpcExtension, ...],
 ) -> None:
     async with booted(db_path, disabled=disabled, nodb=nodb) as bot:
-        assert set(bot.extensions) == expected
-        assert (bot.get_cog('KcpcAdmin') is not None) is kcpc_runs
-        assert (bot.tree.get_command('kcpc') is not None) is kcpc_runs
+        assert set(bot.extensions) == tle_modules | modules_of(kcpc)
+        assert_kcpc_extensions(bot, kcpc)
         services = bot.kcpc
-        if kcpc_runs:
+        # KCPC runs if any of its extensions is enabled, and not with --nodb.
+        if kcpc:
             assert isinstance(services, KcpcServices)
             assert services.scheduler.running
+            assert_features_started(bot, services, kcpc)
+            # /kcpc shows the workshop settings, whether or not kcpc.workshops
+            # is loaded.
+            spec = services.features.get(WORKSHOPS_FEATURE)
+            assert spec.settings_type is WorkshopSettings
         else:
             assert services is None
         # Where KCPC doesn't run, it doesn't even create its database.
-        assert db_path.exists() is kcpc_runs
+        assert db_path.exists() is bool(kcpc)
         stubs.initialize.assert_awaited_once_with(bot, nodb)
         stubs.sync.assert_awaited_once_with()
 
@@ -205,6 +327,46 @@ async def test_the_bot_boots_with_the_enabled_extensions(
         if services is not None:
             assert not services.scheduler.running
             assert await is_closed(services)
+            # Unloading the features undid what they had started, although the
+            # services had shut down first.
+            assert [job.name for job in services.scheduler.status()] == CORE_JOBS
+            assert services.reminders.features == []
+
+    assert errors_logged(caplog) == []
+
+
+async def test_kcpc_adds_three_commands_and_puts_its_admin_commands_in_kcpc(
+    db_path: Path,
+) -> None:
+    def from_kcpc(module: str | None) -> bool:
+        return module is not None and module.startswith('tle.kcpc.')
+
+    async with booted(db_path) as bot:
+        prefix = {command.name for command in bot.commands if from_kcpc(command.module)}
+        slash = {
+            command.name
+            for command in bot.tree.get_commands()
+            if from_kcpc(command.module)
+        }
+        assert prefix == slash == {'kcpc', 'event', 'notify'}
+
+        kcpc_group = bot.get_command('kcpc')
+        assert isinstance(kcpc_group, commands.HybridGroup)
+        workshops = kcpc_group.get_command('workshops')
+        assert isinstance(workshops, commands.HybridGroup)
+        assert workshops.cog is bot.get_cog(WORKSHOPS.cog)
+        assert {command.name for command in workshops.commands} == {
+            'calendar',
+            'sync',
+        }
+        kcpc_slash = bot.tree.get_command('kcpc')
+        assert isinstance(kcpc_slash, app_commands.Group)
+        workshops_slash = kcpc_slash.get_command('workshops')
+        assert isinstance(workshops_slash, app_commands.Group)
+        assert {command.name for command in workshops_slash.commands} == {
+            'calendar',
+            'sync',
+        }
 
 
 async def test_setup_hook_starts_things_in_order(
@@ -231,13 +393,14 @@ async def test_setup_hook_starts_things_in_order(
         pass
 
     # The log channel first, so that it hears of problems while starting up,
-    # and KCPC's services before the extensions that use them.
+    # and KCPC's services before the extensions that use them. kcpc.admin
+    # comes before the features that add their admin commands to /kcpc.
     assert steps == [
         LOGGING_MODULE,
         'cf_common.initialize',
         'kcpc.build_services',
         *sorted(TLE_MODULES - {LOGGING_MODULE}),
-        KCPC_ADMIN_MODULE,
+        *(extension.module for extension in KCPC),
         'tree.sync',
     ]
 
@@ -262,7 +425,7 @@ async def test_tle_boots_when_kcpc_fails_to_start(
     async with booted(db_path) as bot:
         assert set(bot.extensions) == TLE_MODULES
         assert bot.kcpc is None
-        assert bot.get_cog('KcpcAdmin') is None
+        assert_kcpc_extensions(bot, ())
         await bot.close()
 
     (record,) = [r for r in caplog.records if r.getMessage() == KCPC_FAILED]
@@ -270,49 +433,53 @@ async def test_tle_boots_when_kcpc_fails_to_start(
     assert record.exc_info is not None and record.exc_info[0] is error
 
 
-@pytest.mark.parametrize('cause', ['cog_load raises', 'package missing'])
+@pytest.mark.parametrize(
+    ('failing', 'cause'),
+    [
+        ('kcpc.admin', 'cog_load raises'),
+        # Its sync job is added last, so the steps before it must be undone.
+        ('kcpc.workshops', 'its job cannot be added'),
+        ('kcpc.notify', 'cog_load raises'),
+        ('kcpc.missing', 'package missing'),
+    ],
+)
 async def test_the_bot_boots_without_a_kcpc_extension_that_fails_to_load(
     monkeypatch: pytest.MonkeyPatch,
     stubs: Stubs,
     db_path: Path,
     caplog: pytest.LogCaptureFixture,
+    failing: str,
     cause: str,
 ) -> None:
-    error: type[Exception]
+    error: type[Exception] = commands.ExtensionFailed
     if cause == 'cog_load raises':
-
-        async def cog_load(cog: KcpcCog) -> None:
-            raise RuntimeError('boom')
-
-        monkeypatch.setattr(KcpcCog, 'cog_load', cog_load)
-        failed, error, admin_loads = 'kcpc.admin', commands.ExtensionFailed, False
+        fail_cog_load(monkeypatch, KCPC_BY_NAME[failing].cog)
+    elif cause == 'its job cannot be added':
+        fail_to_add_job(monkeypatch, WORKSHOPS_SYNC_JOB)
     else:
         # Its package doesn't exist either, so load_extension raises the import
         # error itself rather than an ExtensionError. It comes first, and the
-        # extension after it must still load.
-        missing = ('kcpc.missing', 'tle.kcpc.features.missing.cog')
+        # extensions after it must still load.
+        missing = (failing, 'tle.kcpc.features.missing.cog')
         monkeypatch.setattr(
             extensions, 'KCPC_EXTENSIONS', (missing, *extensions.KCPC_EXTENSIONS)
         )
-        failed, error, admin_loads = 'kcpc.missing', ModuleNotFoundError, True
+        error = ModuleNotFoundError
+    loaded = [extension for extension in KCPC if extension.name != failing]
 
     async with booted(db_path) as bot:
-        kcpc_modules = {KCPC_ADMIN_MODULE} if admin_loads else set()
-        assert set(bot.extensions) == TLE_MODULES | kcpc_modules
-        assert (bot.get_cog('KcpcAdmin') is not None) is admin_loads
-        assert (bot.get_command('kcpc') is not None) is admin_loads
-        assert (bot.tree.get_command('kcpc') is not None) is admin_loads
+        assert set(bot.extensions) == TLE_MODULES | modules_of(loaded)
+        assert_kcpc_extensions(bot, loaded)
         # KCPC's services keep running, so that the reconcile job still settles
         # the posts left unconfirmed when the bot last stopped.
         assert bot.kcpc is not None
         assert bot.kcpc.scheduler.running
-        jobs = [job.name for job in bot.kcpc.scheduler.status()]
-        assert jobs == [bootstrap.RECONCILE_JOB]
+        assert_features_started(bot, bot.kcpc, loaded)
         stubs.sync.assert_awaited_once_with()
 
     (record,) = bot_records(caplog, logging.ERROR)
     assert record.getMessage() == (
-        f'KCPC extension {failed} failed to load; the bot carries on without it'
+        f'KCPC extension {failing} failed to load; the bot carries on without it'
     )
     assert record.exc_info is not None and record.exc_info[0] is error
 
@@ -339,7 +506,7 @@ async def test_booting_puts_back_the_extension_modules_tests_imported(
     # As tests/integration/test_codeforces_cog.py does before it patches
     # 'tle.cogs.codeforces.cf_common'. Since Python 3.11, mock finds the module
     # to patch with pkgutil.resolve_name.
-    names = ('tle.cogs.codeforces', KCPC_ADMIN_MODULE)
+    names = ('tle.cogs.codeforces', *(extension.module for extension in KCPC))
     imported = {name: importlib.import_module(name) for name in names}
 
     async with booted(db_path):
@@ -366,9 +533,9 @@ async def test_unknown_disabled_extensions_are_reported(
     db_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     async with booted(db_path, disabled='tle.duel,tle.nope,kcpc.nope') as bot:
-        assert set(bot.extensions) == (TLE_MODULES - {'tle.cogs.duel'}) | {
-            KCPC_ADMIN_MODULE
-        }
+        assert set(bot.extensions) == (TLE_MODULES - {'tle.cogs.duel'}) | (
+            modules_of(KCPC)
+        )
 
     assert bot_messages(caplog, logging.WARNING) == [
         "Ignoring unknown extension 'kcpc.nope' in DISABLED_EXTENSIONS",

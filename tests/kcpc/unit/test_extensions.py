@@ -18,6 +18,10 @@ from tle.extensions import (
 REPO_COGS_DIR = Path(__file__).resolve().parents[3] / 'tle' / 'cogs'
 
 KCPC_ADMIN = Extension('kcpc.admin', 'tle.kcpc.features.admin.cog', 'kcpc')
+KCPC_WORKSHOPS = Extension('kcpc.workshops', 'tle.kcpc.features.workshops.cog', 'kcpc')
+KCPC_NOTIFY = Extension('kcpc.notify', 'tle.kcpc.features.notify.cog', 'kcpc')
+# The real KCPC extensions, in load order.
+KCPC = [KCPC_ADMIN, KCPC_WORKSHOPS, KCPC_NOTIFY]
 
 # Made-up extensions, listed out of order.
 ZETA = Extension('tle.zeta', 'tle.cogs.zeta', 'tle')
@@ -32,6 +36,10 @@ def names(selected: list[Extension]) -> list[str]:
     return [extension.name for extension in selected]
 
 
+def kcpc_names(selected: list[Extension]) -> list[str]:
+    return [extension.name for extension in selected if extension.family == 'kcpc']
+
+
 def test_discover_finds_every_tle_cog_then_the_kcpc_extensions() -> None:
     cogs = sorted(
         path.stem
@@ -44,15 +52,32 @@ def test_discover_finds_every_tle_cog_then_the_kcpc_extensions() -> None:
     assert 'logging' in cogs  # the glob above found the real cogs
     assert found == [
         *(Extension(f'tle.{cog}', f'tle.cogs.{cog}', 'tle') for cog in cogs),
-        KCPC_ADMIN,
+        *KCPC,
     ]
 
 
 def test_kcpc_extensions_are_listed_in_order() -> None:
-    assert KCPC_EXTENSIONS == (('kcpc.admin', 'tle.kcpc.features.admin.cog'),)
+    # kcpc.admin first: it owns /kcpc, which the features that load after it
+    # add their admin commands to.
+    assert KCPC_EXTENSIONS == (
+        ('kcpc.admin', 'tle.kcpc.features.admin.cog'),
+        ('kcpc.workshops', 'tle.kcpc.features.workshops.cog'),
+        ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
+    )
     kcpc = [extension for extension in discover() if extension.family == 'kcpc']
 
     assert [(ext.name, ext.module) for ext in kcpc] == list(KCPC_EXTENSIONS)
+
+
+def test_each_kcpc_extension_is_named_after_its_feature_package() -> None:
+    # As tle.extensions documents: kcpc.<feature> loads
+    # tle/kcpc/features/<feature>/cog.py. The boot tests find KCPC's extension
+    # modules by this layout.
+    for name, module in KCPC_EXTENSIONS:
+        family, _, feature = name.partition('.')
+        assert family == 'kcpc' and feature, name
+        assert module == f'tle.kcpc.features.{feature}.cog', name
+    assert len({name for name, _ in KCPC_EXTENSIONS}) == len(KCPC_EXTENSIONS)
 
 
 def test_every_discovered_module_exists() -> None:
@@ -80,7 +105,7 @@ def test_discover_skips_private_and_other_files(
     (tmp_path / 'package' / 'inner.py').write_text('')
     monkeypatch.setattr(extensions, 'TLE_COGS_DIR', tmp_path)
 
-    assert names(discover()) == ['tle.alpha', 'tle.zeta', 'kcpc.admin']
+    assert names(discover()) == ['tle.alpha', 'tle.zeta', *names(KCPC)]
 
 
 def test_select_orders_logging_then_tle_by_name_then_kcpc_as_listed() -> None:
@@ -139,6 +164,28 @@ def test_select_accepts_the_disabled_extensions_setting() -> None:
 
     assert enabled[0].name == LOGGING_EXTENSION
     assert {'tle.duel', 'tle.graphs', 'tle.starboard'}.isdisjoint(names(enabled))
-    assert names(enabled)[-1] == 'kcpc.admin'
+    # KCPC's last, as listed.
+    assert names(enabled)[-len(KCPC) :] == names(KCPC)
     assert len(enabled) == len(discover()) - 3
+    assert unknown == []
+
+
+@pytest.mark.parametrize('disabled', KCPC, ids=names(KCPC))
+def test_each_kcpc_extension_can_be_disabled_alone(disabled: Extension) -> None:
+    settings = Settings.from_env({'DISABLED_EXTENSIONS': disabled.name})
+
+    enabled, unknown = select(discover(), settings.disabled_extensions)
+
+    assert kcpc_names(enabled) == [ext.name for ext in KCPC if ext != disabled]
+    assert len(enabled) == len(discover()) - 1
+    assert unknown == []
+
+
+def test_the_kcpc_family_disables_every_kcpc_extension_and_nothing_else() -> None:
+    settings = Settings.from_env({'DISABLED_EXTENSIONS': 'kcpc'})
+
+    enabled, unknown = select(discover(), settings.disabled_extensions)
+
+    assert kcpc_names(enabled) == []
+    assert len(enabled) == len(discover()) - len(KCPC)
     assert unknown == []

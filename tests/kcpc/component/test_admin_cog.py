@@ -32,6 +32,8 @@ from tle.kcpc.core.errors import KcpcDisabledError, KcpcUserError
 from tle.kcpc.core.http import HttpClient
 from tle.kcpc.core.ledger import Delivery, DeliveryLedger
 from tle.kcpc.core.messages import OutgoingMessage
+from tle.kcpc.core.migrations import ALL_MIGRATIONS
+from tle.kcpc.core.reminders import ReminderEngine
 from tle.kcpc.core.schedule import Every
 from tle.kcpc.core.scheduler import JobStatus, ScheduledJob, Scheduler
 from tle.kcpc.core.settings import FeatureRegistry, FeatureSpec, GuildSettingsRepo
@@ -91,6 +93,7 @@ async def services(
     guild_settings: GuildSettingsRepo,
     ledger: DeliveryLedger,
 ) -> AsyncIterator[KcpcServices]:
+    publisher = DiscordPublisher(bot, guild_settings, ledger, clock)
     services = KcpcServices(
         settings=Settings(),
         clock=clock,
@@ -99,7 +102,8 @@ async def services(
         features=feature_registry,
         guild_settings=guild_settings,
         ledger=ledger,
-        publisher=DiscordPublisher(bot, guild_settings, ledger, clock),
+        publisher=publisher,
+        reminders=ReminderEngine(guild_settings, ledger, publisher, clock),
         scheduler=Scheduler(db, clock),
     )
     bot.kcpc = services
@@ -200,13 +204,26 @@ def make_channel(
 
 
 def make_role(
-    *, name: str = 'Workshops', mentionable: bool = True, default: bool = False
+    *,
+    name: str = 'Workshops',
+    mentionable: bool = True,
+    default: bool = False,
+    permissions: discord.Permissions | None = None,
 ) -> MagicMock:
+    """A role in a server whose @everyone has no permissions and no channel
+    overwrites it: by default, one just for pings.
+    """
     role = MagicMock(
         spec=discord.Role, id=ROLE_ID, mention=f'<@&{ROLE_ID}>', mentionable=mentionable
     )
     role.name = name  # not MagicMock(name=...), which names the mock itself
     role.is_default.return_value = default
+    role.permissions = permissions or discord.Permissions.none()
+    # What ping_role_problem reads besides the role itself.
+    role.guild = MagicMock(spec=discord.Guild, id=GUILD_ID, channels=[])
+    role.guild.default_role = MagicMock(
+        spec=discord.Role, permissions=discord.Permissions.none()
+    )
     return role
 
 
@@ -365,7 +382,9 @@ async def test_status_shows_the_database_zone_and_kcpc_extensions(
     embed = reply(ctx)
     assert embed.title == 'KCPC status'
     fields = fields_of(embed)
-    assert fields['Database'] == '`:memory:`, schema version 1'
+    assert fields['Database'] == (
+        f'`:memory:`, schema version {ALL_MIGRATIONS[-1].version}'
+    )
     assert fields['Time zone'] == 'Europe/London'
     assert fields['Extensions'] == '`tle.kcpc.features.admin.cog`'
     assert fields['Posts in this server'] == 'sent: 0 · skipped: 0 · pending: 0'
@@ -593,7 +612,8 @@ async def test_role_sets_the_role_posts_mention(
 
     assert (await guild_settings.get(GUILD_ID, 'workshops')).role_id == ROLE_ID
     assert reply(ctx).description == lines(
-        f'Workshops posts mention <@&{ROLE_ID}>.',
+        f'Workshops posts mention <@&{ROLE_ID}>. Members get or drop it with '
+        '`/notify workshops on|off`.',
         '',
         WORKSHOPS,
         'Status: disabled',
@@ -624,6 +644,40 @@ async def test_role_refuses_everyone(
         await run(cog, 'role', ctx, 'workshops', everyone)
 
     assert (await guild_settings.get(GUILD_ID, 'workshops')).role_id is None
+
+
+@pytest.mark.parametrize(
+    ('role', 'problem'),
+    [
+        (
+            {'name': 'Helpers', 'permissions': discord.Permissions(administrator=True)},
+            'it grants Administrator',
+        ),
+        ({'name': 'Committee'}, "it is TLE's admin role"),
+    ],
+    ids=['an administrator role', "TLE's admin role"],
+)
+async def test_role_refuses_a_role_that_is_not_just_for_pings(
+    monkeypatch: pytest.MonkeyPatch,
+    cog: KcpcAdmin,
+    ctx: MagicMock,
+    guild_settings: GuildSettingsRepo,
+    role: dict[str, Any],
+    problem: str,
+) -> None:
+    # Every member can give themselves a feature's ping role with /notify.
+    monkeypatch.setattr(constants, 'TLE_ADMIN', 'Committee')
+
+    with pytest.raises(KcpcUserError) as raised:
+        await run(cog, 'role', ctx, 'workshops', make_role(**role))
+
+    assert str(raised.value) == (
+        f"<@&{ROLE_ID}> can't be a ping role: it isn't just for pings "
+        f"({problem}), and every member can give themselves a feature's ping "
+        'role with /notify. Choose a pings-only role.'
+    )
+    assert (await guild_settings.get(GUILD_ID, 'workshops')).role_id is None
+    cast(AsyncMock, ctx.send).assert_not_awaited()
 
 
 async def test_role_refuses_a_role_the_bot_cannot_mention(

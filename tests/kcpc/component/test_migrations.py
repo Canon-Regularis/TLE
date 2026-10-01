@@ -1,4 +1,4 @@
-"""Tests for the kcpc.db migrations and migration 1's schema."""
+"""Tests for the kcpc.db migrations and the schemas of migrations 1 and 2."""
 
 import contextlib
 import sqlite3
@@ -59,12 +59,14 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
     path = tmp_path / 'kcpc.db'
     db = await open_database(path)
     try:
-        assert await schema_version(db) == 1
+        assert await schema_version(db) == 2
         assert await table_names(db) == {
             'schema_version',
             'guild_settings',
             'delivery_log',
             'job_state',
+            'event',
+            'calendar_state',
         }
         assert await migrate(db, ALL_MIGRATIONS, backup_dir=tmp_path) == []
     finally:
@@ -90,7 +92,7 @@ async def test_migrate_applies_only_pending_migrations_in_order() -> None:
 async def test_failed_migration_leaves_the_previous_version_intact(
     tmp_path: Path,
 ) -> None:
-    db = await open_database(tmp_path / 'kcpc.db')
+    db = await open_database(tmp_path / 'kcpc.db', [CORE])
     try:
         with pytest.raises(
             MigrationError, match=r'^Migration 2 \(broken\) failed: boom$'
@@ -159,7 +161,7 @@ async def test_open_database_closes_the_database_when_migrating_fails(
 
 async def test_upgrade_backs_up_the_previous_version(tmp_path: Path) -> None:
     path = tmp_path / 'kcpc.db'
-    db = await open_database(path)
+    db = await open_database(path, [CORE])
     await db.execute("INSERT INTO job_state (job, updated_at) VALUES ('probe', 0)")
     await db.close()
 
@@ -178,16 +180,54 @@ async def test_upgrade_backs_up_the_previous_version(tmp_path: Path) -> None:
         assert conn.execute('SELECT job FROM job_state').fetchall() == [('probe',)]
 
 
+async def test_a_version_1_database_upgrades_to_version_2(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, [CORE])
+    await db.execute(
+        'INSERT INTO guild_settings (guild_id, feature, data, updated_at) '
+        "VALUES ('1', 'workshops', '{\"enabled\": true}', 0)"
+    )
+    await db.close()
+
+    db = await open_database(path)
+    try:
+        assert await schema_version(db) == 2
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [(1, 'core'), (2, 'workshops')]
+        assert {'event', 'calendar_state'} <= await table_names(db)
+        assert await db.fetchval('SELECT data FROM guild_settings') == (
+            '{"enabled": true}'
+        )
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v1.bak'
+    assert tables_in_file(backup) == {
+        'schema_version',
+        'guild_settings',
+        'delivery_log',
+        'job_state',
+    }
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            1,
+        )
+
+
 async def test_no_backup_when_disabled(tmp_path: Path) -> None:
     path = tmp_path / 'kcpc.db'
-    await (await open_database(path)).close()
-    await (await open_database(path, [CORE, EXTRA], backup=False)).close()
+    await (await open_database(path, [CORE])).close()
+    db = await open_database(path, [CORE, EXTRA], backup=False)
+    try:
+        assert await schema_version(db) == 2  # upgraded, without a backup
+    finally:
+        await db.close()
     assert list(tmp_path.glob('*.bak')) == []
 
 
 async def test_failed_backup_stops_the_upgrade(tmp_path: Path) -> None:
     path = tmp_path / 'kcpc.db'
-    db = await open_database(path)
+    db = await open_database(path, [CORE])
     not_a_directory = tmp_path / 'occupied'
     not_a_directory.write_text('a file where the backup directory should be')
     try:
@@ -276,3 +316,79 @@ async def test_core_schema(db: Database) -> None:
             'INSERT INTO delivery_log (key, batch, guild_id, feature, status, '
             "claimed_at) VALUES ('k', 'b', '1', 'f', 'lost', 0)"
         )
+
+
+WORKSHOP_COLUMNS = {
+    'event': [
+        'event_id',
+        'calendar_id',
+        'luma_id',
+        'name',
+        'start_time',
+        'end_time',
+        'url',
+        'location',
+        'status',
+        'revision',
+        'fingerprint',
+        'miss_count',
+        'first_seen',
+        'last_synced',
+    ],
+    'calendar_state': [
+        'calendar_id',
+        'last_attempt',
+        'last_ok',
+        'last_future_count',
+        'consecutive_failures',
+        'last_error',
+    ],
+}
+WORKSHOP_NOT_NULL = {
+    'event': {
+        'calendar_id',
+        'luma_id',
+        'name',
+        'start_time',
+        'status',
+        'revision',
+        'fingerprint',
+        'miss_count',
+        'first_seen',
+        'last_synced',
+    },
+    'calendar_state': {'calendar_id', 'consecutive_failures'},
+}
+INSERT_EVENT = (
+    'INSERT INTO event (event_id, calendar_id, luma_id, name, start_time, '
+    "fingerprint, first_seen, last_synced) VALUES (NULL, ?, ?, 'DP', 0, 'f', 0, 0)"
+)
+
+
+async def test_workshops_schema(db: Database) -> None:
+    for table, expected in WORKSHOP_COLUMNS.items():
+        columns = await db.fetchall(f'PRAGMA table_info({table})')
+        assert [column['name'] for column in columns] == expected, table
+        not_null = {column['name'] for column in columns if column['notnull']}
+        assert not_null == WORKSHOP_NOT_NULL[table], table
+    index = await db.fetchall('PRAGMA index_info(ix_event_calendar_start)')
+    assert [row['name'] for row in index] == ['calendar_id', 'start_time']
+
+    # event_id is the rowid, so even an explicit NULL gets an id.
+    await db.execute(INSERT_EVENT, ('cal-a', 'evt-1'))
+    row = await db.fetchone(
+        'SELECT event_id, status, revision, miss_count, end_time, url, location '
+        'FROM event'
+    )
+    assert tuple(row or ()) == (1, 'scheduled', 0, 0, None, None, None)
+
+    # Each calendar stores a Luma event once.
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_EVENT, ('cal-a', 'evt-1'))
+    await db.execute(INSERT_EVENT, ('cal-b', 'evt-1'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute("UPDATE event SET status = 'deleted'")
+
+    await db.execute("INSERT INTO calendar_state (calendar_id) VALUES ('cal-a')")
+    row = await db.fetchone('SELECT * FROM calendar_state')
+    assert tuple(row or ()) == ('cal-a', None, None, None, 0, None)

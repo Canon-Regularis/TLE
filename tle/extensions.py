@@ -1,9 +1,9 @@
 """The bot's extensions, and which of them to load.
 
 TLE's extensions are its cogs, named ``tle.<file>`` after ``tle/cogs/<file>.py``.
-KCPC's are listed in ``KCPC_EXTENSIONS`` and named ``kcpc.<feature>``. The
-``DISABLED_EXTENSIONS`` setting turns off single extensions by name, or whole
-families (``tle`` or ``kcpc``).
+KCPC's are listed in ``KCPC_EXTENSIONS``, named ``kcpc.<feature>`` after
+``tle/kcpc/features/<feature>/cog.py``. The ``DISABLED_EXTENSIONS`` setting
+turns off single extensions by name, or whole families (``tle`` or ``kcpc``).
 """
 
 from collections.abc import Iterable, Sequence
@@ -15,8 +15,12 @@ TLE_FAMILY = 'tle'
 KCPC_FAMILY = 'kcpc'
 
 LOGGING_EXTENSION = 'tle.logging'
+# Loaded in this order. kcpc.admin comes first: it owns the /kcpc group, which
+# other features add their admin commands to as they load.
 KCPC_EXTENSIONS: tuple[tuple[str, str], ...] = (
     ('kcpc.admin', 'tle.kcpc.features.admin.cog'),
+    ('kcpc.workshops', 'tle.kcpc.features.workshops.cog'),
+    ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
 )
 
 # Found from this file rather than the working directory, so discovery works

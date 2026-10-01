@@ -30,6 +30,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 KCPC_DIR = REPO_ROOT / 'tle' / 'kcpc'
 STDLIB = frozenset(sys.stdlib_module_names)
+NOTIFY = 'tle.kcpc.features.notify'
+WORKSHOPS = 'tle.kcpc.features.workshops'
 
 
 @dataclass(frozen=True)
@@ -215,11 +217,16 @@ _LAYER_CHECKS: tuple[tuple[str, Callable[[ImportRef], str | None]], ...] = (
 def test_the_rules_are_checked_on_real_modules() -> None:
     modules = [name for name, _ in kcpc_modules()]
 
-    # Guards against a path mistake that would leave nothing to check.
+    # Guards against a path mistake that would leave a layer unchecked.
     for expected in (
         'tle.kcpc.core.db',
+        'tle.kcpc.core.reminders',
         'tle.kcpc.bot.cog',
+        'tle.kcpc.platforms.luma',
         'tle.kcpc.features.admin.cog',
+        f'{WORKSHOPS}.sync',
+        f'{WORKSHOPS}.cog',
+        f'{NOTIFY}.cog',
         'tle.kcpc.services',
         'tle.kcpc.bootstrap',
     ):
@@ -235,6 +242,20 @@ def test_no_kcpc_module_breaks_the_layering_rules() -> None:
     ]
 
     assert problems == []
+
+
+def test_notify_never_imports_workshops() -> None:
+    # /notify serves every feature through the settings registry alone, so it
+    # keeps working with kcpc.workshops disabled, or failing to load.
+    refs = [
+        ref
+        for module, path in kcpc_modules()
+        if _under(module, NOTIFY)
+        for ref in imports_in(module, path.read_text(encoding='utf-8'))
+    ]
+
+    assert refs, 'the notify package has imports to check'
+    assert [str(ref) for ref in refs if _under(ref.target, WORKSHOPS)] == []
 
 
 def test_imports_anywhere_in_a_module_are_found() -> None:
@@ -344,8 +365,13 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         ('tle.kcpc.platforms.x', 'from tle.util import codeforces_api', True),
         ('tle.kcpc.platforms.x', 'from tle.util.cache import CacheSystem', True),
         ('tle.kcpc.platforms.x', 'import discord', False),
+        ('tle.kcpc.platforms.x', 'def f():\n    import discord', False),
         ('tle.kcpc.platforms.x', 'from tle.kcpc.bot import embeds', False),
         ('tle.kcpc.platforms.x', 'from tle.util import discord_common', False),
+        ('tle.kcpc.platforms.x', 'from tle.kcpc.features.workshops import repo', False),
+        ('tle.kcpc.platforms.x', 'from tle.kcpc import services', False),
+        ('tle.kcpc.platforms.luma', 'from icalendar import Calendar', True),
+        ('tle.kcpc.platforms.luma', 'from tle.kcpc.core.http import HttpClient', True),
         ('tle.kcpc.features.a.cog', 'import discord', True),
         ('tle.kcpc.features.a.views', 'from discord import ui', True),
         ('tle.kcpc.features.a.service', 'import discord', False),
@@ -357,6 +383,15 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         ('tle.kcpc.features.a.cog', 'from tle.kcpc.features import b', False),
         ('tle.kcpc.features.a.cog', 'from tle.kcpc import services', False),
         ('tle.kcpc.features', 'from tle.kcpc.features import a', False),
+        (f'{WORKSHOPS}.sync', 'from tle.kcpc.platforms.luma import LumaEvent', True),
+        (f'{WORKSHOPS}.reminders', 'from tle.kcpc.core.reminders import Notice', True),
+        (f'{WORKSHOPS}.reminders', 'import discord', False),
+        (f'{WORKSHOPS}.cog', f'from {WORKSHOPS}.sync import EventSync', True),
+        (f'{WORKSHOPS}.cog', 'from tle.kcpc.bot.admin import attach_admin_group', True),
+        (f'{WORKSHOPS}.cog', f'from {NOTIFY} import cog', False),
+        (f'{NOTIFY}.cog', f'from {WORKSHOPS}.settings import WORKSHOPS', False),
+        (f'{NOTIFY}.cog', f'def f():\n    from {WORKSHOPS} import cog', False),
+        (f'{NOTIFY}.cog', f'import {WORKSHOPS}.settings', False),
         ('tle.kcpc.services', 'from tle.kcpc.bot.publisher import X', True),
         ('tle.kcpc.bootstrap', 'from tle.kcpc.features.admin import cog', True),
         ('tle.kcpc.core.x', 'from . import db', False),

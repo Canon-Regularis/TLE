@@ -5,13 +5,14 @@ top-level commands: the group asks Discord to show it only to members with
 Manage Server, and ``cog_check`` makes sure on every invocation.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from tle.kcpc.bot.admin import permission_names, ping_role_problem
 from tle.kcpc.bot.checks import ensure_kcpc_admin
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.bot.embeds import success_embed, to_embed
@@ -144,7 +145,7 @@ class KcpcAdmin(KcpcCog):
         if missing:
             raise KcpcUserError(
                 f"I can't post in {channel.mention}. Give me these permissions "
-                f'there, then try again: {_permission_names(missing)}.'
+                f'there, then try again: {permission_names(missing)}.'
             )
         settings = await self.services.guild_settings.update(
             guild.id, spec.key, channel_id=channel.id
@@ -163,7 +164,8 @@ class KcpcAdmin(KcpcCog):
         """Set the role a feature's posts mention; without a role, they mention none.
 
         The bot must be able to notify the role: in the feature's channel once
-        that is set, or server-wide until then.
+        that is set, or server-wide until then. The role must be just for
+        pings, as every member can give it to themselves with /notify.
         """
         guild = _guild(ctx)
         spec = self._feature(feature)
@@ -171,11 +173,17 @@ class KcpcAdmin(KcpcCog):
         if role is not None:
             current = await guild_settings.get(guild.id, spec.key)
             _check_mentionable(role, guild, _post_channel(guild, current.channel_id))
+            _check_pings_only(role)
         settings = await guild_settings.update(
             guild.id, spec.key, role_id=None if role is None else role.id
         )
-        mentioned = 'no role' if role is None else role.mention
-        change = f'{spec.title} posts mention {mentioned}.'
+        if role is None:
+            change = f'{spec.title} posts mention no role.'
+        else:
+            change = (
+                f'{spec.title} posts mention {role.mention}. Members get or drop '
+                f'it with `/notify {spec.key} on|off`.'
+            )
         await _reply(ctx, _updated(spec, settings, change, guild))
 
     @kcpc.command(brief='Turn a feature on')  # type: ignore[arg-type]
@@ -301,9 +309,20 @@ def _check_mentionable(
         raise KcpcUserError(f"I can't mention {role.mention}. {_MENTION_FIX}.")
 
 
-def _permission_names(names: Sequence[str]) -> str:
-    """``['embed_links']`` as Discord shows it: ``'Embed Links'``."""
-    return ', '.join(name.replace('_', ' ').title() for name in names)
+def _check_pings_only(role: discord.Role) -> None:
+    """Raise ``KcpcUserError`` unless ``role`` is just for pings.
+
+    Every member can give themselves a feature's ping role with /notify, so
+    any other role would let them change what they can do (see
+    ``ping_role_problem``).
+    """
+    problem = ping_role_problem(role)
+    if problem is not None:
+        raise KcpcUserError(
+            f"{role.mention} can't be a ping role: it isn't just for pings "
+            f"({problem}), and every member can give themselves a feature's "
+            'ping role with /notify. Choose a pings-only role.'
+        )
 
 
 def _describe_job(job: JobStatus) -> str:
