@@ -92,4 +92,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks integration tests requiring mocked Discord context",
+    "network: reaches real sites; skipped unless KCPC_NETWORK_TESTS=1",
 ]

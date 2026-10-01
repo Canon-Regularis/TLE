@@ -1,0 +1,3 @@
+# Luma serves its feeds with LF line endings: keep them on every checkout, so
+# that the tests read the feeds as Luma sends them.
+*.ics text eol=lf

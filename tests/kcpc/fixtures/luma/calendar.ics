@@ -1,0 +1,101 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Luma//Example Coding Club//EN
+X-WR-CALNAME:Example Coding Club
+X-WR-CALDESC:Luma Calendar
+REFRESH-INTERVAL;VALUE=DURATION:PT12H
+X-PUBLISHED-TTL:PT12H
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+DTSTART:20260924T170000Z
+DTEND:20260924T190000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:calev-ExamplePartner1@events.lu.ma
+SUMMARY:Partner Hackathon Social
+DESCRIPTION:Find more information on https://luma.com/example-coding-club
+LOCATION:https://events.example.org/partner-hackathon-social
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261008T170000Z
+DTEND:20261008T190000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club Workshops Team":MAILTO:calendar-invite@example.com
+UID:evt-ExampleIntroDp1@events.lu.ma
+SUMMARY:Intro to Dynamic Programming
+DESCRIPTION:Get up-to-date information at: https://luma.com/intro-dp-exampl
+ e\n\nAddress:\nRoom 101, Example Building\n1 Example Street, London\nUnite
+ d Kingdom\n\nHosted by Example Host & 2 others
+LOCATION:Room 101, Example Building, 1 Example Street, London, UK
+GEO:51.501;-0.142
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261015T170000Z
+DTEND:20261015T183000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:evt-ExampleGraphs1@events.lu.ma
+SUMMARY:Graph Algorithms Workshop 🧩 shortest paths, network flows and ma
+ tchings for contest problems
+DESCRIPTION:Get up-to-date information at: https://luma.com/graphs-example\
+ n\nHosted by Example Host
+LOCATION:https://luma.com/event/evt-ExampleGraphs1
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+BEGIN:VEVENT
+DTSTART;VALUE=DATE:20261024
+DTEND;VALUE=DATE:20261026
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:evt-ExampleRetreat@events.lu.ma
+SUMMARY:Contest Practice Weekend
+DESCRIPTION:Get up-to-date information at: https://luma.com/practice-weeken
+ d-example\n\nHosted by Example Host
+LOCATION:Example Field Centre
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261105T180000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:evt-ExampleNoEnd01@events.lu.ma
+SUMMARY:Mock Contest
+DESCRIPTION:Get up-to-date information at: https://luma.com/mock-contest-ex
+ ample\n\nHosted by Example Host
+LOCATION:Lab 2, Example Building
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261112T180000Z
+DTEND:20261112T200000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:evt-ExampleCancel1@events.lu.ma
+SUMMARY:Cancelled Social
+DESCRIPTION:Get up-to-date information at: https://luma.com/social-example\
+ n\nHosted by Example Host
+LOCATION:Example Cafe
+SEQUENCE:123456789
+STATUS:CANCELLED
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261119T190000Z
+DTEND:20261119T210000Z
+DTSTAMP:20261001T115500Z
+ORGANIZER;CN="Example Coding Club":MAILTO:calendar-invite@example.com
+UID:calev-ExamplePartner2@events.lu.ma
+SUMMARY:Partner Talk: Careers in Competitive Programming
+DESCRIPTION:Find more information on https://luma.com/example-coding-club
+LOCATION:https://events.example.org/careers-talk
+SEQUENCE:123456789
+STATUS:TENTATIVE
+END:VEVENT
+END:VCALENDAR
