@@ -28,8 +28,9 @@ everything.
 The bot also runs the KCPC club's own features (in `tle/kcpc`), added in
 phases. So far it reminds members of the club's workshops on Luma and of
 contests: Codeforces, AtCoder, ICPC and the club's own, and with a clist.by
-account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. Account
-linking and a weekly problem are to follow.
+account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. Members can
+also link their Codeforces and AtCoder accounts, for profiles and server
+leaderboards. A weekly problem is to follow.
 `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps its data
 in its own database, `data/db/kcpc.db`, and doesn't run when the bot is
 started with `--nodb`.
@@ -38,11 +39,12 @@ Every extension, TLE's or KCPC's, can be switched off with
 `DISABLED_EXTENSIONS`: e.g. `tle.duel,tle.graphs,tle.starboard`, or `kcpc`
 for all of KCPC. KCPC's extensions are `kcpc.admin` (`/kcpc`),
 `kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`),
-`kcpc.contests` (contest reminders, `/contests` and `/kcpc contests`) and
-`kcpc.notify` (`/notify`). KCPC's own settings are all optional:
-`KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`,
-`ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and
-`.env.example`).
+`kcpc.contests` (contest reminders, `/contests` and `/kcpc contests`),
+`kcpc.accounts` (account linking, `/link`, `/unlink`, `/profile`, `/rank` and
+`/kcpc accounts`) and `kcpc.notify` (`/notify`). KCPC's own settings are all
+optional: `KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`,
+`LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY`
+(see §3 and `.env.example`).
 
 Server admins set KCPC up with `/kcpc` (or `;kcpc`). It needs the Manage
 Server permission or the `TLE_ADMIN` role. Discord only shows `/kcpc` to
@@ -182,6 +184,64 @@ TLE's own contest reminders (`;remind`) also ping for Codeforces rounds. In a
 server that uses KCPC's contest reminders, a TLE admin should switch TLE's off
 with `;remind clear`, or members are pinged twice for each round.
 
+#### Account linking
+
+Members link their Codeforces and AtCoder accounts to show their ratings and
+compare them within the server:
+
+```text
+/link codeforces <handle>   link your Codeforces account
+/link atcoder <handle>      link your AtCoder account
+/link verify <platform>     finish linking (the same as the Verify button)
+/unlink atcoder             unlink your AtCoder account
+/profile [member]           linked accounts, with rating, peak and rank
+/rank [platform]            the server's leaderboard (Codeforces by default)
+/handle show [member]       a member's linked handles
+```
+
+A member proves that an account is theirs with a token. `/link` replies, so
+that only they see it, with a token such as `kcpc-1a2b3c4d5e` and the steps: put
+it in the account's Affiliation on AtCoder (<https://atcoder.jp/settings>), or
+its Organization on Codeforces (<https://codeforces.com/settings/social>),
+save, then press Verify under the reply (or use `/link verify`). The token
+lasts 10 minutes, and `/link` again gives a new one. Once the account is
+linked, remove the token from the profile again. A handle can be linked to
+only one member of a server.
+
+Links stay when a member leaves the server, for if they come back. An AtCoder
+account that a member who left had linked is free, though: whoever proves it
+is theirs takes the link over. Admins (Manage Server or the `TLE_ADMIN` role)
+can unlink anyone's AtCoder account, e.g. one that a member linked but isn't
+theirs, so that its owner can link it:
+
+```text
+/kcpc accounts unlink <handle>   unlink an AtCoder account, whoever linked it
+```
+
+It needs the `kcpc.admin` extension. Without it, only the member who linked an
+AtCoder account can unlink it, with `/unlink atcoder`.
+
+`/profile` and `/rank` show the ratings the bot last read. Every 6 hours it
+reads the ratings of the accounts its servers' members have linked, and
+`/profile` reads a member's again if they are more than an hour old (if the
+site doesn't answer, it shows the older ratings and says so). `/rank` lists
+the server's linked members by rating, unrated last, 10 to a page, and shows
+where you stand.
+
+A Codeforces account linked with `/link codeforces` is shared with TLE: it
+sets the handle that `;handle set` sets, which TLE's own features, such as
+gitgud, duels and the rank roles, use. The member gets the role for their
+rank, so the server needs TLE's rank roles, and the bot needs the Manage Roles
+permission with its highest role above them. If the role for a rated
+account's rank is missing, `/link codeforces` says so before giving a token. A
+member who already has a Codeforces handle can't link another, and
+`/unlink codeforces` can't remove it: admins and moderators (`TLE_ADMIN`,
+`TLE_MODERATOR`) change it with `/handle set` and remove it with
+`/handle remove`. TLE keeps the handle of a member who leaves, for if they come
+back, so nobody else can link it until it is removed. Where Codeforces OAuth is
+set up, TLE's `;handle identify` links a Codeforces account too. AtCoder links
+are KCPC's own, and TLE's features don't use them.
+
 ---
 
 ## 2 · Quick start (production)
@@ -243,15 +303,18 @@ every key in `.env` to the container. Run without Docker, the bot reads
 
 `docker compose` mounts `./data` into the container. It holds:
 
-* `db/user.db`: TLE's server data, such as linked handles, duels, reminder
-  settings and starboards.
+* `db/user.db`: TLE's server data, such as members' Codeforces handles (those
+  linked with `/link codeforces` too), duels, reminder settings and
+  starboards.
 * `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
-  bot has read (and the contests and times admins have set), the progress of
-  KCPC's scheduled jobs, and the delivery ledger, which records
-  KCPC's automatic posts so that none goes out twice. Before each upgrade of
-  its database the bot copies it to `kcpc.db.v<N>.bak`, next to it. If you set
-  `KCPC_DB_PATH`, these files are there instead; under Docker, keep that path
-  inside `data/`, or they are lost when the container is recreated.
+  bot has read (and the contests and times admins have set), members' AtCoder
+  links and the links waiting to be verified, the ratings last read for
+  `/profile` and `/rank`, the progress of KCPC's scheduled jobs, and the
+  delivery ledger, which records KCPC's automatic posts so that none goes out
+  twice. Before each upgrade of its database the bot copies it to
+  `kcpc.db.v<N>.bak`, next to it. If you set `KCPC_DB_PATH`, these files are
+  there instead; under Docker, keep that path inside `data/`, or they are lost
+  when the container is recreated.
 * `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
   but an admin has to refill the rating changes and problemsets with
   `;cache ratingchanges all` and `;cache problemsets all`.
@@ -260,8 +323,9 @@ every key in `.env` to the container. Run without Docker, the bot reads
 * `temp/`: images the bot is drawing.
 
 Only `db/cache.db` (then refill it as above) and `temp/` are safe to delete.
-Keep the rest and back it up: losing `kcpc.db` loses every server's KCPC setup
-and the record of what was posted, so reminders could go out again.
+Keep the rest and back it up: losing `kcpc.db` loses every server's KCPC
+setup, members' AtCoder links and the record of what was posted, so reminders
+could go out again.
 
 To back up the databases, stop the bot (`docker compose stop`) and copy
 `data/db`, or use sqlite3's `.backup` command while it runs. The databases use

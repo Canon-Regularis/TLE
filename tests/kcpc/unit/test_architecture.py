@@ -12,10 +12,20 @@ in tle/kcpc/__init__.py):
   Codeforces modules tle.util.codeforces_api and tle.util.cache;
 - a feature imports from tle.kcpc only core, bot, platforms and itself, and
   only its cog.py and views.py import discord;
-- services.py and bootstrap.py, which assemble everything, may import anything.
+- services.py and bootstrap.py, which assemble everything, may import anything
+  but TLE's user database (below).
 
-Relative imports are not allowed anywhere. One more test checks, in a fresh
-interpreter, that tle.util.discord_common can be imported first.
+There is one exception. tle.kcpc.bot.codeforces_links, KCPC's only way to the
+Codeforces handles in TLE's user database, may also import
+tle.util.handle_linking and tle.util.codeforces_api, and no other KCPC module
+may import tle.util.handle_linking. No KCPC module imports what reaches TLE's
+user database otherwise, tle.util.db, tle.util.codeforces_common (which holds
+it) or TLE's cogs, and only the bridge uses the database the bot carries, as
+``bot.user_db``.
+
+Relative imports are not allowed anywhere. TLE's cogs import KCPC only lazily.
+One more test checks, in a fresh interpreter, that tle.util.discord_common can
+be imported first.
 """
 
 import ast
@@ -29,13 +39,20 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 KCPC_DIR = REPO_ROOT / 'tle' / 'kcpc'
+TLE_COGS_DIR = REPO_ROOT / 'tle' / 'cogs'
 STDLIB = frozenset(sys.stdlib_module_names)
 NOTIFY = 'tle.kcpc.features.notify'
 WORKSHOPS = 'tle.kcpc.features.workshops'
 CONTESTS = 'tle.kcpc.features.contests'
+ACCOUNTS = 'tle.kcpc.features.accounts'
 CODEFORCES = 'tle.kcpc.platforms.codeforces'
 ATCODER = 'tle.kcpc.platforms.atcoder'
 ICPC = 'tle.kcpc.platforms.icpc'
+CODEFORCES_LINKS = 'tle.kcpc.bot.codeforces_links'
+HANDLE_LINKING = 'tle.util.handle_linking'
+TLE_CODEFORCES = 'tle.util.codeforces_api'
+# What reaches TLE's user database, besides the bridge's handle linking.
+TLE_USER_DB = ('tle.util.db', 'tle.util.codeforces_common', 'tle.cogs')
 
 
 @dataclass(frozen=True)
@@ -124,6 +141,12 @@ def kcpc_modules() -> Iterator[tuple[str, Path]]:
         yield module_name(path), path
 
 
+def kcpc_imports() -> Iterator[ImportRef]:
+    """Every import in every KCPC module."""
+    for module, path in kcpc_modules():
+        yield from imports_in(module, path.read_text(encoding='utf-8'))
+
+
 def _under(name: str, *packages: str) -> bool:
     """Whether ``name`` is one of ``packages`` or inside one."""
     return any(
@@ -139,6 +162,10 @@ def violation(ref: ImportRef) -> str | None:
     """How ``ref`` breaks the rules, or None if it is allowed."""
     if ref.relative:
         return 'relative imports are not allowed'
+    if _under(ref.target, HANDLE_LINKING) and ref.module != CODEFORCES_LINKS:
+        return f'only {CODEFORCES_LINKS} may import {HANDLE_LINKING}'
+    if _under(ref.target, *TLE_USER_DB):
+        return f"KCPC reaches TLE's user database only through {CODEFORCES_LINKS}"
     for layer, check in _LAYER_CHECKS:
         if _under(ref.module, layer):
             return check(ref)
@@ -154,6 +181,9 @@ _BOT_ALLOWED = (
     'tle.util.discord_common',
     'tle.constants',
 )
+# What the bridge to TLE's handle table may import besides: TLE's handle
+# linking, and its Codeforces client to look up the accounts it links.
+_BRIDGE_ALLOWED = (HANDLE_LINKING, TLE_CODEFORCES)
 _PLATFORM_ALLOWED_FROM_TLE = (
     'tle.kcpc.core',
     'tle.kcpc.platforms',
@@ -177,6 +207,8 @@ def _check_bot(ref: ImportRef) -> str | None:
             'bot may import tle.kcpc.services only in a function or for type '
             'checking, since services imports bot'
         )
+    if ref.module == CODEFORCES_LINKS and _under(ref.target, *_BRIDGE_ALLOWED):
+        return None
     if _is_stdlib(ref.target) or _under(ref.target, *_BOT_ALLOWED):
         return None
     return (
@@ -226,16 +258,22 @@ def test_the_rules_are_checked_on_real_modules() -> None:
         'tle.kcpc.core.db',
         'tle.kcpc.core.reminders',
         'tle.kcpc.bot.cog',
+        CODEFORCES_LINKS,
         'tle.kcpc.platforms.luma',
         CODEFORCES,
         ATCODER,
         f'{ATCODER}.contests',
+        f'{ATCODER}.profile',
         ICPC,
         'tle.kcpc.features.admin.cog',
         f'{WORKSHOPS}.sync',
         f'{WORKSHOPS}.cog',
         f'{CONTESTS}.sources',
         f'{CONTESTS}.cog',
+        f'{ACCOUNTS}.repo',
+        f'{ACCOUNTS}.service',
+        f'{ACCOUNTS}.views',
+        f'{ACCOUNTS}.cog',
         f'{NOTIFY}.cog',
         'tle.kcpc.services',
         'tle.kcpc.bootstrap',
@@ -246,27 +284,88 @@ def test_the_rules_are_checked_on_real_modules() -> None:
 def test_no_kcpc_module_breaks_the_layering_rules() -> None:
     problems = [
         f'{ref}: {problem}'
-        for module, path in kcpc_modules()
-        for ref in imports_in(module, path.read_text(encoding='utf-8'))
+        for ref in kcpc_imports()
         if (problem := violation(ref)) is not None
     ]
 
     assert problems == []
 
 
+def test_only_the_bridge_uses_tles_handle_linking() -> None:
+    # KCPC links and reads members' Codeforces handles through
+    # tle.kcpc.bot.codeforces_links alone, the one bot module that may use
+    # TLE's handle linking and its Codeforces client.
+    refs = list(kcpc_imports())
+    handle_linking = {ref.module for ref in refs if _under(ref.target, HANDLE_LINKING)}
+    bot_codeforces = {
+        ref.module
+        for ref in refs
+        if _under(ref.module, 'tle.kcpc.bot') and _under(ref.target, TLE_CODEFORCES)
+    }
+
+    assert handle_linking == bot_codeforces == {CODEFORCES_LINKS}
+
+
+def mentions_user_db(node: ast.AST) -> bool:
+    """Whether ``node`` names ``user_db``, as ``bot.user_db`` or ``'user_db'`` do."""
+    return (
+        (isinstance(node, ast.Attribute) and node.attr == 'user_db')
+        or (isinstance(node, ast.Name) and node.id == 'user_db')
+        or (isinstance(node, ast.Constant) and node.value == 'user_db')
+    )
+
+
+def test_only_the_bridge_uses_tles_user_db() -> None:
+    # TLE attaches its user database to the bot, where no import rule can see
+    # a module reach it.
+    users = {
+        module
+        for module, path in kcpc_modules()
+        if any(
+            mentions_user_db(node)
+            for node in ast.walk(ast.parse(path.read_text(encoding='utf-8')))
+        )
+    }
+
+    assert users == {CODEFORCES_LINKS}
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        'self.bot.user_db.get_handle(1, 2)',
+        "getattr(bot, 'user_db', None)",
+        'user_db = None',
+    ],
+)
+def test_uses_of_tles_user_db_are_found(source: str) -> None:
+    assert any(mentions_user_db(node) for node in ast.walk(ast.parse(source)))
+
+
 def test_notify_never_imports_the_features_it_serves() -> None:
     # /notify serves every feature through the settings registry alone, so it
     # keeps working with kcpc.workshops or kcpc.contests disabled, or failing
     # to load.
-    refs = [
-        ref
-        for module, path in kcpc_modules()
-        if _under(module, NOTIFY)
-        for ref in imports_in(module, path.read_text(encoding='utf-8'))
-    ]
+    refs = [ref for ref in kcpc_imports() if _under(ref.module, NOTIFY)]
 
     assert refs, 'the notify package has imports to check'
     assert [str(ref) for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS)] == []
+
+
+def test_tles_cogs_import_kcpc_only_lazily() -> None:
+    # A TLE extension that fails to load stops the bot, and a KCPC one
+    # doesn't. Importing KCPC only when a command runs, as /handle show does to
+    # list a member's KCPC accounts, keeps a broken KCPC module from stopping
+    # TLE.
+    refs = [
+        ref
+        for path in sorted(TLE_COGS_DIR.glob('*.py'))
+        for ref in imports_in(module_name(path), path.read_text(encoding='utf-8'))
+        if _under(ref.target, 'tle.kcpc')
+    ]
+
+    assert refs, "TLE's cogs have KCPC imports to check"
+    assert [str(ref) for ref in refs if not ref.deferred] == []
 
 
 def test_imports_anywhere_in_a_module_are_found() -> None:
@@ -309,11 +408,7 @@ def test_imports_anywhere_in_a_module_are_found() -> None:
 
 
 def test_deferred_imports_in_real_modules_are_found() -> None:
-    refs = {
-        (ref.module, ref.target, ref.deferred)
-        for module, path in kcpc_modules()
-        for ref in imports_in(module, path.read_text(encoding='utf-8'))
-    }
+    refs = {(ref.module, ref.target, ref.deferred) for ref in kcpc_imports()}
 
     # The base cog gets the services on use and their type for type checking,
     # since tle.kcpc.services imports the bot package.
@@ -371,6 +466,29 @@ def test_tles_discord_common_imports_on_its_own() -> None:
             'if TYPE_CHECKING:\n    from tle.kcpc.services import KcpcServices',
             True,
         ),
+        # The bridge to TLE's handle table, and only it, may also use TLE's
+        # handle linking and Codeforces client.
+        (CODEFORCES_LINKS, 'from tle.util import codeforces_api as cf', True),
+        (CODEFORCES_LINKS, 'from tle.util import handle_linking', True),
+        (CODEFORCES_LINKS, 'from tle.util.handle_linking import link_handle', True),
+        (CODEFORCES_LINKS, 'import tle.util.codeforces_api', True),
+        (CODEFORCES_LINKS, 'from tle.kcpc.core.errors import KcpcUserError', True),
+        (CODEFORCES_LINKS, 'import discord', True),
+        (CODEFORCES_LINKS, 'from tle.util import codeforces_common', False),
+        (CODEFORCES_LINKS, 'from tle.util import db', False),
+        (CODEFORCES_LINKS, 'from tle.util.cache import CacheSystem', False),
+        (CODEFORCES_LINKS, f'from {ACCOUNTS}.repo import AccountRepo', False),
+        (CODEFORCES_LINKS, 'from tle.kcpc.services import get_services', False),
+        ('tle.kcpc.bot.x', 'from tle.util import handle_linking', False),
+        ('tle.kcpc.bot.x', 'from tle.util import codeforces_api', False),
+        (
+            'tle.kcpc.bot.cog',
+            'def f():\n    from tle.util import handle_linking',
+            False,
+        ),
+        ('tle.kcpc.bot.pages', 'import tle.util.codeforces_api', False),
+        ('tle.kcpc.bot', 'from tle.util import codeforces_api', False),
+        (f'{CODEFORCES_LINKS}.x', 'from tle.util import handle_linking', False),
         ('tle.kcpc.platforms.x', 'import icalendar', True),
         ('tle.kcpc.platforms.x', 'from tle.kcpc.core.http import HttpClient', True),
         ('tle.kcpc.platforms.x', 'from tle.util import codeforces_api', True),
@@ -391,6 +509,12 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{ATCODER}.contests', 'from html.parser import HTMLParser', True),
         (f'{ATCODER}.contests', 'from tle.kcpc.core.http import HttpClient', True),
         (f'{ATCODER}.contests', 'import discord', False),
+        (f'{ATCODER}.profile', 'from html.parser import HTMLParser', True),
+        (f'{ATCODER}.profile', 'from tle.kcpc.core.http import HttpClient', True),
+        (f'{ATCODER}.profile', 'import discord', False),
+        (f'{ATCODER}.profile', 'from tle.kcpc.bot import codeforces_links', False),
+        (f'{ATCODER}.profile', f'from {ACCOUNTS}.repo import AccountRepo', False),
+        (CODEFORCES, 'from tle.util import handle_linking', False),
         (ICPC, 'from tle.kcpc.core.errors import ExternalServiceError', True),
         (ICPC, 'from tle.kcpc.bot.embeds import to_embed', False),
         ('tle.kcpc.features.a.cog', 'import discord', True),
@@ -424,9 +548,53 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{CONTESTS}.cog', 'from tle.kcpc.bot.admin import attach_admin_group', True),
         (f'{CONTESTS}.cog', f'from {WORKSHOPS}.settings import WORKSHOPS', False),
         (f'{WORKSHOPS}.cog', f'from {CONTESTS}.repo import ContestRepo', False),
+        # Account linking reaches TLE's handle table through the bridge alone.
+        (f'{ACCOUNTS}.cog', 'from tle.kcpc.bot import codeforces_links', True),
+        (f'{ACCOUNTS}.cog', f'from {ACCOUNTS}.service import AccountService', True),
+        (f'{ACCOUNTS}.views', 'from discord import ui', True),
+        (f'{ACCOUNTS}.views', 'from tle.kcpc.bot.views import KcpcView', True),
+        (
+            f'{ACCOUNTS}.service',
+            f'from {ATCODER}.profile import AtCoderProfileClient',
+            True,
+        ),
+        (f'{ACCOUNTS}.service', f'from {CODEFORCES} import fetch_user', True),
+        (f'{ACCOUNTS}.refresh', f'from {CODEFORCES} import fetch_users', True),
+        (f'{ACCOUNTS}.service', 'import discord', False),
+        (f'{ACCOUNTS}.refresh', 'import discord', False),
+        (f'{ACCOUNTS}.directory', 'import discord', False),
+        (f'{ACCOUNTS}.repo', 'import discord', False),
+        (f'{ACCOUNTS}.cog', 'from tle.util import handle_linking', False),
+        (f'{ACCOUNTS}.service', 'def f():\n    import tle.util.handle_linking', False),
+        (f'{ACCOUNTS}.cog', f'from {CONTESTS}.repo import ContestRepo', False),
+        (f'{CONTESTS}.cog', f'from {ACCOUNTS}.directory import linked_accounts', False),
         ('tle.kcpc.services', 'from tle.kcpc.bot.publisher import X', True),
         ('tle.kcpc.bootstrap', 'from tle.kcpc.features.admin import cog', True),
         ('tle.kcpc.bootstrap', f'from {CONTESTS}.settings import SPEC', True),
+        ('tle.kcpc.services', 'from tle.util import handle_linking', False),
+        (
+            'tle.kcpc.bootstrap',
+            'from tle.util.handle_linking import link_handle',
+            False,
+        ),
+        ('tle.kcpc.core.x', 'from tle.util import handle_linking', False),
+        # Nothing but the bridge reaches TLE's user database, even where TLE's
+        # other modules may be imported.
+        (
+            f'{ACCOUNTS}.cog',
+            'from tle.util import codeforces_common as cf_common',
+            False,
+        ),
+        (f'{ACCOUNTS}.service', 'from tle.util import db', False),
+        (f'{ACCOUNTS}.cog', 'from tle.cogs.handles import Handles', False),
+        ('tle.kcpc.features.a.cog', 'def f():\n    import tle.cogs.handles', False),
+        ('tle.kcpc.services', 'from tle.util import codeforces_common', False),
+        (
+            'tle.kcpc.bootstrap',
+            'from tle.util.db.user_db_conn import UserDbConn',
+            False,
+        ),
+        ('tle.kcpc.bootstrap', 'import tle.cogs', False),
         ('tle.kcpc.core.x', 'from . import db', False),
         ('tle.kcpc.bootstrap', 'from .services import KcpcServices', False),
     ],
