@@ -138,7 +138,8 @@ which lists the contests of many sites, once `CLIST_USERNAME` and
 <https://clist.by/api/v4/doc/>, which shows your username and API key. The
 World Finals count as `icpc` contests. Without the key, the `codechef`,
 `leetcode` and `topcoder` platforms have no contests; admins can narrow a
-server's platforms with `/kcpc contests platforms`.
+server's platforms with `/kcpc contests platforms`. CodeChef's events that
+aren't contests, such as its Placement Prep Weekends, are left out.
 
 ICPC contests come from icpc.global: those in `ICPC_CONTEST_CODES` (see §3).
 icpc.global gives only the dates of their events, so each is listed by its

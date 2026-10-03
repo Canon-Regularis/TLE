@@ -14,11 +14,14 @@ Each source is a ``ContestSource`` over a platform adapter
 - CodeChef, LeetCode, TopCoder and the ICPC World Finals: clist.by's lists of
   those sites' contests, read with the bot's clist.by account (see
   ``clist_sources``). The first three are complete. The World Finals are ICPC
-  contests, which the ICPC source lists too, so theirs are not.
+  contests, which the ICPC source lists too, so theirs are not. CodeChef's
+  list has events that aren't contests as well, which are left out
+  (``CODECHEF_NOT_CONTESTS``).
 """
 
 import logging
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Iterable, Sequence
 
 from tle.kcpc.core.clock import Clock
 from tle.kcpc.core.errors import ExternalServiceError
@@ -34,6 +37,22 @@ logger = logging.getLogger(__name__)
 CachedContests = Sequence[cf.Contest]
 
 _CODEFORCES_NOT_LOADED = "TLE hasn't loaded Codeforces' contest list yet."
+
+# The events that clist.by lists for CodeChef but that aren't contests, as
+# patterns searched for in their names, ignoring case (see ``is_contest``).
+# Each names a series, so that no contest is left out by mistake: an event
+# that none of them matches counts as a contest, however long it lasts. These
+# events take a weekend, and CodeChef's contests in 2026 (Starters and Monday
+# Munch - DSA Challenge) take 2 or 3 hours, but its Long Challenges took 10
+# days.
+CODECHEF_NOT_CONTESTS = (
+    # Practice for job interviews, every weekend since 31 July 2026, from
+    # Friday evening to Sunday evening: 'Placement Prep Weekends - 10'.
+    r'\bplacement\s+prep',
+    # Software projects, every weekend until July 2026, from Friday evening to
+    # Sunday evening: 'Weekend Dev Challenge 60: LLD Projects'.
+    r'\bdev\s+challenge',
+)
 
 
 class CodeforcesSource:
@@ -186,7 +205,10 @@ class ClistSource:
 
     ``resource`` is the site on clist.by, by its host ('codechef.com'), and
     ``event_regex`` keeps only its contests whose name matches, ignoring case.
-    ``name`` is the source's own name, which its sync job and state go by, and
+    ``not_contests`` has patterns of the names of the site's events that
+    aren't contests, which clist.by lists with them: those events are left
+    out (see ``is_contest``), so they are never stored or announced. ``name``
+    is the source's own name, which its sync job and state go by, and
     ``platform`` the platform of its contests. Its snapshots are ``complete``
     unless another source lists contests of that platform too: a contest that
     this one doesn't list may be one of those.
@@ -201,6 +223,7 @@ class ClistSource:
         resource: str,
         complete: bool,
         event_regex: str | None = None,
+        not_contests: Sequence[str] = (),
     ) -> None:
         self._client = client
         self._name = name
@@ -208,6 +231,7 @@ class ClistSource:
         self._resource = resource
         self._complete = complete
         self._event_regex = event_regex
+        self._not_contests = tuple(not_contests)
 
     @property
     def name(self) -> str:
@@ -221,8 +245,17 @@ class ClistSource:
         listed = await self._client.upcoming(
             self._resource, event_regex=self._event_regex
         )
-        return SourceSnapshot(
-            [
+        contests: list[ContestInfo] = []
+        for contest in listed:
+            if not is_contest(contest.name, self._not_contests):
+                logger.debug(
+                    'Skipping %s event %r (clist.by ID %d), which is not a contest',
+                    self._resource,
+                    contest.name,
+                    contest.clist_id,
+                )
+                continue
+            contests.append(
                 ContestInfo(
                     platform=self._platform,
                     external_id=f'clist-{contest.clist_id}',
@@ -232,20 +265,28 @@ class ClistSource:
                     end=contest.end,
                     url=contest.url,
                 )
-                for contest in listed
-            ],
-            complete=self._complete,
-        )
+            )
+        return SourceSnapshot(contests, complete=self._complete)
+
+
+def is_contest(name: str, not_contests: Iterable[str]) -> bool:
+    """Whether a site's event called ``name`` is a contest, given patterns of
+    the names of its events that aren't (such as ``CODECHEF_NOT_CONTESTS``).
+
+    It is unless one of the patterns is found in ``name``, ignoring case.
+    """
+    return not any(re.search(pattern, name, re.IGNORECASE) for pattern in not_contests)
 
 
 def clist_sources(client: clist.ClistClient) -> tuple[ClistSource, ...]:
     """The sources read through clist.by: CodeChef, LeetCode, TopCoder and the
     ICPC World Finals.
 
-    The World Finals are ICPC contests, which ``IcpcSource`` lists too, so
-    their snapshots are incomplete: a complete one would count the contests of
-    ``IcpcSource`` as missing. The regionals, such as UKIEPC and NWERC, stay
-    with ``IcpcSource``.
+    CodeChef's events that aren't contests are left out
+    (``CODECHEF_NOT_CONTESTS``). The World Finals are ICPC contests, which
+    ``IcpcSource`` lists too, so their snapshots are incomplete: a complete
+    one would count the contests of ``IcpcSource`` as missing. The regionals,
+    such as UKIEPC and NWERC, stay with ``IcpcSource``.
     """
     return (
         ClistSource(
@@ -254,6 +295,7 @@ def clist_sources(client: clist.ClistClient) -> tuple[ClistSource, ...]:
             platform='codechef',
             resource='codechef.com',
             complete=True,
+            not_contests=CODECHEF_NOT_CONTESTS,
         ),
         ClistSource(
             client,

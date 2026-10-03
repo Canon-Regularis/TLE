@@ -65,6 +65,7 @@ UKIEPC_NAME = 'The 2026 ICPC UK & Ireland Programming Contest'
 # Real seconds a healthy teardown needs, many times over.
 TEARDOWN_TIMEOUT = 10
 SYNCED = '0 updated, 0 moved, 0 cancelled, 0 reinstated.'
+SOURCES_LOGGER = 'tle.kcpc.features.contests.sources'
 
 # Codeforces lists every past contest, so TLE's cache always has some.
 FINISHED = cf.Contest(
@@ -87,6 +88,19 @@ def starters(start: datetime) -> ClistContest:
         start=start,
         end=start + 2 * HOUR,
         url='https://www.codechef.com/START210',
+    )
+
+
+def placement_prep(start: datetime) -> ClistContest:
+    """CodeChef's weekend of practice for job interviews: not a contest,
+    although clist.by lists it as one."""
+    return ClistContest(
+        clist_id=70831805,
+        resource='codechef.com',
+        name='Placement Prep Weekends - 10',
+        start=start,
+        end=start + 50 * HOUR,
+        url='https://www.codechef.com/PLACEPREP10',
     )
 
 
@@ -323,6 +337,45 @@ async def test_a_clist_source_lists_its_contests_by_their_clist_ids(
     assert sites.asked == [('codechef.com', None)]
 
 
+async def test_codechefs_events_that_are_not_contests_are_left_out(
+    sites: FakeSites, caplog: pytest.LogCaptureFixture
+) -> None:
+    sites.clist['codechef.com'] = [placement_prep(NOW - HOUR), starters(NOW + DAY)]
+    codechef = clist_sources(cast(ClistClient, sites))[0]
+
+    with caplog.at_level(logging.DEBUG, logger=SOURCES_LOGGER):
+        snapshot = await codechef.fetch()
+
+    assert [info.name for info in snapshot.contests] == ['Starters 210 (Rated)']
+    assert snapshot.complete
+    # At DEBUG: every sync skips it again, and a warning would reach the
+    # Discord log channel every 30 minutes.
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == SOURCES_LOGGER
+    ] == [
+        (
+            logging.DEBUG,
+            "Skipping codechef.com event 'Placement Prep Weekends - 10' (clist.by ID "
+            '70831805), which is not a contest',
+        )
+    ]
+
+
+async def test_a_codechef_list_of_events_that_are_not_contests_syncs_none(
+    db: Database, clock: FakeClock, repo: ContestRepo, sites: FakeSites
+) -> None:
+    # It is a list of no contests, not one that can't be read.
+    sites.clist['codechef.com'] = [placement_prep(NOW + HOUR)]
+    codechef = clist_sources(cast(ClistClient, sites))[0]
+
+    report = await ContestSync(db, repo, clock).sync(codechef)
+
+    assert report == SyncReport('codechef', ok=True)
+    assert await repo.source_records('codechef') == []
+
+
 @pytest.mark.parametrize(
     'error',
     [
@@ -456,6 +509,36 @@ async def test_a_codechef_contest_gets_a_reminder(
     assert post.message.url == 'https://www.codechef.com/START210'
     assert post.message.description is not None
     assert post.message.description.splitlines()[0] == '**Platform:** CodeChef'
+
+
+async def test_a_codechef_event_that_is_not_a_contest_is_never_stored_or_announced(
+    bot: KcpcBot,
+    services: KcpcServices,
+    clock: FakeClock,
+    sites: FakeSites,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+    repo: ContestRepo,
+) -> None:
+    await follow(guild_settings)
+    await guild_settings.update(GUILD, CONTESTS, start_posts=True)
+    sites.clist['codechef.com'] = [
+        placement_prep(NOW + 70 * MINUTE),
+        starters(NOW + 90 * MINUTE),
+    ]
+
+    await services.scheduler.run_slot(sync_job_name('codechef'))
+    # Every 10 minutes, past both reminders and both starts.
+    for _ in range(9):
+        await clock.advance(10 * MINUTE)
+        await services.reminders.tick()
+
+    (record,) = await repo.source_records('codechef')
+    assert record.reported.name == 'Starters 210 (Rated)'
+    assert [post.message.title for post in publisher.posts] == [
+        'Starting soon: Starters 210 (Rated)',
+        'Starting now: Starters 210 (Rated)',
+    ]
 
 
 async def test_the_world_finals_and_icpc_global_never_cancel_each_others_contests(
