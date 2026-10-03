@@ -1,4 +1,4 @@
-"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 3."""
+"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 4."""
 
 import contextlib
 import sqlite3
@@ -19,6 +19,7 @@ from tle.kcpc.core.migrations import (
 
 CORE = ALL_MIGRATIONS[0]
 UP_TO_WORKSHOPS = ALL_MIGRATIONS[:2]
+UP_TO_CONTESTS = ALL_MIGRATIONS[:3]
 
 
 async def _create_extra_table(db: Database) -> None:
@@ -60,7 +61,7 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
     path = tmp_path / 'kcpc.db'
     db = await open_database(path)
     try:
-        assert await schema_version(db) == 3
+        assert await schema_version(db) == 4
         assert await table_names(db) == {
             'schema_version',
             'guild_settings',
@@ -71,6 +72,9 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
             'contest',
             'contest_override',
             'contest_source_state',
+            'linked_account',
+            'link_challenge',
+            'account_snapshot',
         }
         assert await migrate(db, ALL_MIGRATIONS, backup_dir=tmp_path) == []
     finally:
@@ -224,7 +228,7 @@ async def test_a_version_2_database_upgrades_to_version_3(tmp_path: Path) -> Non
     await db.execute(INSERT_EVENT, ('cal-a', 'evt-1'))
     await db.close()
 
-    db = await open_database(path)
+    db = await open_database(path, UP_TO_CONTESTS)
     try:
         assert await schema_version(db) == 3
         rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
@@ -249,6 +253,38 @@ async def test_a_version_2_database_upgrades_to_version_3(tmp_path: Path) -> Non
             2,
         )
         assert conn.execute('SELECT luma_id FROM event').fetchall() == [('evt-1',)]
+
+
+async def test_a_version_3_database_upgrades_to_version_4(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, UP_TO_CONTESTS)
+    await db.execute(INSERT_CONTEST, ('atcoder', 'abc478', 0, None))
+    await db.close()
+
+    db = await open_database(path)
+    try:
+        assert await schema_version(db) == 4
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [
+            (1, 'core'),
+            (2, 'workshops'),
+            (3, 'contests'),
+            (4, 'accounts'),
+        ]
+        assert set(ACCOUNT_COLUMNS) <= await table_names(db)
+        assert await db.fetchval('SELECT external_id FROM contest') == 'abc478'
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v3.bak'
+    assert tables_in_file(backup).isdisjoint(ACCOUNT_COLUMNS)
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            3,
+        )
+        assert conn.execute('SELECT external_id FROM contest').fetchall() == [
+            ('abc478',)
+        ]
 
 
 async def test_no_backup_when_disabled(tmp_path: Path) -> None:
@@ -526,3 +562,91 @@ async def test_contests_schema(db: Database) -> None:
     await db.execute("INSERT INTO contest_source_state (source) VALUES ('atcoder')")
     row = await db.fetchone('SELECT * FROM contest_source_state')
     assert tuple(row or ()) == ('atcoder', None, None, None, 0, None)
+
+
+ACCOUNT_COLUMNS = {
+    'linked_account': [
+        'guild_id',
+        'user_id',
+        'platform',
+        'handle',
+        'method',
+        'verified_at',
+    ],
+    'link_challenge': [
+        'guild_id',
+        'user_id',
+        'platform',
+        'handle',
+        'token',
+        'created_at',
+        'expires_at',
+    ],
+    'account_snapshot': [
+        'platform',
+        'handle',
+        'rating',
+        'max_rating',
+        'rank',
+        'rated_matches',
+        'fetched_at',
+    ],
+}
+ACCOUNT_NOT_NULL = {
+    'linked_account': set(ACCOUNT_COLUMNS['linked_account']),
+    'link_challenge': set(ACCOUNT_COLUMNS['link_challenge']),
+    'account_snapshot': {'platform', 'handle', 'fetched_at'},
+}
+ACCOUNT_KEYS = {
+    'linked_account': ['guild_id', 'user_id', 'platform'],
+    'link_challenge': ['guild_id', 'user_id', 'platform'],
+    'account_snapshot': ['platform', 'handle'],
+}
+INSERT_LINK = (
+    'INSERT INTO linked_account (guild_id, user_id, platform, handle, method, '
+    "verified_at) VALUES (?, ?, ?, ?, 'affiliation-token', 0)"
+)
+INSERT_CHALLENGE = (
+    'INSERT INTO link_challenge (guild_id, user_id, platform, handle, token, '
+    "created_at, expires_at) VALUES (?, ?, ?, 'Amber_Owl', 'kcpc-0a1b2c', 0, 600)"
+)
+INSERT_SNAPSHOT = (
+    'INSERT INTO account_snapshot (platform, handle, fetched_at) VALUES (?, ?, 0)'
+)
+
+
+async def test_accounts_schema(db: Database) -> None:
+    for table, expected in ACCOUNT_COLUMNS.items():
+        columns = await db.fetchall(f'PRAGMA table_info({table})')
+        assert [column['name'] for column in columns] == expected, table
+        not_null = {column['name'] for column in columns if column['notnull']}
+        assert not_null == ACCOUNT_NOT_NULL[table], table
+        key = sorted((column['pk'], column['name']) for column in columns)
+        assert [name for pk, name in key if pk] == ACCOUNT_KEYS[table], table
+
+    # A member links one handle per platform in a guild, and a handle is linked
+    # to one member of a guild, whatever its case.
+    await db.execute(INSERT_LINK, ('1', '10', 'atcoder', 'Amber_Owl'))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_LINK, ('1', '10', 'atcoder', 'Brisk_Heron'))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_LINK, ('1', '11', 'atcoder', 'aMBER_oWL'))
+    await db.execute(INSERT_LINK, ('2', '11', 'atcoder', 'amber_owl'))
+    await db.execute(INSERT_LINK, ('1', '11', 'codeforces', 'amber_owl'))
+
+    # A member has one challenge per platform in a guild.
+    await db.execute(INSERT_CHALLENGE, ('1', '10', 'atcoder'))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_CHALLENGE, ('1', '10', 'atcoder'))
+    await db.execute(INSERT_CHALLENGE, ('1', '10', 'codeforces'))
+
+    # A handle has one snapshot per platform, whatever its case, and only its
+    # ratings may be unknown.
+    await db.execute(INSERT_SNAPSHOT, ('atcoder', 'Amber_Owl'))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_SNAPSHOT, ('atcoder', 'AMBER_OWL'))
+    await db.execute(INSERT_SNAPSHOT, ('codeforces', 'amber_owl'))
+    row = await db.fetchone(
+        'SELECT rating, max_rating, rank, rated_matches FROM account_snapshot'
+    )
+    assert tuple(row or ()) == (None, None, None, None)
