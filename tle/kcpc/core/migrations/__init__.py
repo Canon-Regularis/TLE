@@ -15,7 +15,7 @@ from pathlib import Path
 
 from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import MigrationError
-from tle.kcpc.core.migrations import m0001_core, m0002_workshops
+from tle.kcpc.core.migrations import m0001_core, m0002_workshops, m0003_contests
 from tle.kcpc.core.migrations.base import Migration
 
 __all__ = [
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 ALL_MIGRATIONS: tuple[Migration, ...] = (
     m0001_core.MIGRATION,
     m0002_workshops.MIGRATION,
+    m0003_contests.MIGRATION,
 )
 
 _CREATE_SCHEMA_VERSION = """

@@ -1,4 +1,4 @@
-"""Tests for the kcpc.db migrations and the schemas of migrations 1 and 2."""
+"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 3."""
 
 import contextlib
 import sqlite3
@@ -18,6 +18,7 @@ from tle.kcpc.core.migrations import (
 )
 
 CORE = ALL_MIGRATIONS[0]
+UP_TO_WORKSHOPS = ALL_MIGRATIONS[:2]
 
 
 async def _create_extra_table(db: Database) -> None:
@@ -59,7 +60,7 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
     path = tmp_path / 'kcpc.db'
     db = await open_database(path)
     try:
-        assert await schema_version(db) == 2
+        assert await schema_version(db) == 3
         assert await table_names(db) == {
             'schema_version',
             'guild_settings',
@@ -67,6 +68,9 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
             'job_state',
             'event',
             'calendar_state',
+            'contest',
+            'contest_override',
+            'contest_source_state',
         }
         assert await migrate(db, ALL_MIGRATIONS, backup_dir=tmp_path) == []
     finally:
@@ -189,7 +193,7 @@ async def test_a_version_1_database_upgrades_to_version_2(tmp_path: Path) -> Non
     )
     await db.close()
 
-    db = await open_database(path)
+    db = await open_database(path, UP_TO_WORKSHOPS)
     try:
         assert await schema_version(db) == 2
         rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
@@ -212,6 +216,39 @@ async def test_a_version_1_database_upgrades_to_version_2(tmp_path: Path) -> Non
         assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
             1,
         )
+
+
+async def test_a_version_2_database_upgrades_to_version_3(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, UP_TO_WORKSHOPS)
+    await db.execute(INSERT_EVENT, ('cal-a', 'evt-1'))
+    await db.close()
+
+    db = await open_database(path)
+    try:
+        assert await schema_version(db) == 3
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [
+            (1, 'core'),
+            (2, 'workshops'),
+            (3, 'contests'),
+        ]
+        assert {
+            'contest',
+            'contest_override',
+            'contest_source_state',
+        } <= await table_names(db)
+        assert await db.fetchval('SELECT luma_id FROM event') == 'evt-1'
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v2.bak'
+    assert 'contest' not in tables_in_file(backup)
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            2,
+        )
+        assert conn.execute('SELECT luma_id FROM event').fetchall() == [('evt-1',)]
 
 
 async def test_no_backup_when_disabled(tmp_path: Path) -> None:
@@ -392,3 +429,100 @@ async def test_workshops_schema(db: Database) -> None:
     await db.execute("INSERT INTO calendar_state (calendar_id) VALUES ('cal-a')")
     row = await db.fetchone('SELECT * FROM calendar_state')
     assert tuple(row or ()) == ('cal-a', None, None, None, 0, None)
+
+
+CONTEST_COLUMNS = {
+    'contest': [
+        'contest_id',
+        'platform',
+        'external_id',
+        'name',
+        'start_time',
+        'start_date',
+        'end_time',
+        'url',
+        'status',
+        'revision',
+        'fingerprint',
+        'miss_count',
+        'first_seen',
+        'last_synced',
+    ],
+    'contest_override': [
+        'platform',
+        'external_id',
+        'start_time',
+        'end_time',
+        'set_by',
+        'set_at',
+    ],
+    'contest_source_state': [
+        'source',
+        'last_attempt',
+        'last_ok',
+        'last_future_count',
+        'consecutive_failures',
+        'last_error',
+    ],
+}
+CONTEST_NOT_NULL = {
+    'contest': {
+        'platform',
+        'external_id',
+        'name',
+        'status',
+        'revision',
+        'fingerprint',
+        'miss_count',
+        'first_seen',
+        'last_synced',
+    },
+    'contest_override': {'platform', 'external_id', 'set_by', 'set_at'},
+    'contest_source_state': {'source', 'consecutive_failures'},
+}
+INSERT_CONTEST = (
+    'INSERT INTO contest (contest_id, platform, external_id, name, start_time, '
+    'start_date, fingerprint, first_seen, last_synced) '
+    "VALUES (NULL, ?, ?, 'ABC 478', ?, ?, 'f', 0, 0)"
+)
+INSERT_OVERRIDE = (
+    'INSERT INTO contest_override (platform, external_id, start_time, set_by, '
+    "set_at) VALUES ('icpc', '9584', 0, 'admin', 0)"
+)
+
+
+async def test_contests_schema(db: Database) -> None:
+    for table, expected in CONTEST_COLUMNS.items():
+        columns = await db.fetchall(f'PRAGMA table_info({table})')
+        assert [column['name'] for column in columns] == expected, table
+        not_null = {column['name'] for column in columns if column['notnull']}
+        assert not_null == CONTEST_NOT_NULL[table], table
+    index = await db.fetchall('PRAGMA index_info(ix_contest_start)')
+    assert [row['name'] for row in index] == ['start_time']
+
+    # contest_id is the rowid, so even an explicit NULL gets an id.
+    await db.execute(INSERT_CONTEST, ('atcoder', 'abc478', 0, None))
+    row = await db.fetchone(
+        'SELECT contest_id, status, revision, miss_count, start_date, end_time, url '
+        'FROM contest'
+    )
+    assert tuple(row or ()) == (1, 'scheduled', 0, 0, None, None, None)
+
+    # A platform stores a contest once, and every contest has a start or a date.
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_CONTEST, ('atcoder', 'abc478', 0, None))
+    await db.execute(INSERT_CONTEST, ('codeforces', 'abc478', 0, None))
+    await db.execute(INSERT_CONTEST, ('icpc', '9584', None, '2026-10-17'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_CONTEST, ('icpc', '9585', None, None))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute("UPDATE contest SET status = 'deleted'")
+
+    # A contest has one override at most.
+    await db.execute(INSERT_OVERRIDE)
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_OVERRIDE)
+
+    await db.execute("INSERT INTO contest_source_state (source) VALUES ('atcoder')")
+    row = await db.fetchone('SELECT * FROM contest_source_state')
+    assert tuple(row or ()) == ('atcoder', None, None, None, 0, None)
