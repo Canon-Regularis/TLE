@@ -9,7 +9,7 @@ import aiohttp
 import jwt
 from aiohttp import web
 
-from tle.util import codeforces_api as cf
+from tle.util import codeforces_api as cf, handle_linking
 
 logger = logging.getLogger(__name__)
 
@@ -225,11 +225,7 @@ class OAuthServer:
             if member is None:
                 raise ValueError('Member not found in guild')
 
-            handles_cog = self.bot.get_cog('Handles')
-            if handles_cog is None:
-                raise ValueError('Handles cog not loaded')
-
-            await handles_cog._set_from_oauth(guild, member, user)
+            await handle_linking.link_handle(self.bot.user_db, guild, member, user)
 
             if channel:
                 from tle.cogs.handles import _make_profile_embed
