@@ -26,8 +26,10 @@ everything.
 ### KCPC club features
 
 The bot also runs the KCPC club's own features (in `tle/kcpc`), added in
-phases. So far it reminds members of the club's workshops on Luma; contest
-reminders, account linking and a weekly problem are to follow.
+phases. So far it reminds members of the club's workshops on Luma and of
+contests: Codeforces, AtCoder, ICPC and the club's own, and with a clist.by
+account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. Account
+linking and a weekly problem are to follow.
 `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps its data
 in its own database, `data/db/kcpc.db`, and doesn't run when the bot is
 started with `--nodb`.
@@ -35,7 +37,8 @@ started with `--nodb`.
 Every extension, TLE's or KCPC's, can be switched off with
 `DISABLED_EXTENSIONS`: e.g. `tle.duel,tle.graphs,tle.starboard`, or `kcpc`
 for all of KCPC. KCPC's extensions are `kcpc.admin` (`/kcpc`),
-`kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`) and
+`kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`),
+`kcpc.contests` (contest reminders, `/contests` and `/kcpc contests`) and
 `kcpc.notify` (`/notify`). KCPC's own settings are all optional:
 `KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`,
 `ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and
@@ -55,7 +58,7 @@ under Server Settings → Integrations.
 ```
 
 The features are `algo`, `contests`, `weekly` and `workshops`; so far only
-`workshops` posts anything.
+`contests` and `workshops` post anything.
 
 #### Workshop reminders
 
@@ -96,6 +99,88 @@ role must be just for pings, and `/notify` refuses any other: a role with a
 permission that @everyone lacks, one that changes what members can do in a
 channel (such as a member or verified role), or one of TLE's roles (admin,
 moderator, trusted or purgatory).
+
+#### Contest reminders
+
+To have the bot remind a server of upcoming contests:
+
+```text
+/kcpc channel contests #contests                 where the reminders go
+/kcpc role contests @Contests                    a pings-only role they mention
+/kcpc contests platforms codeforces atcoder      which platforms (all by default)
+/kcpc contests start-posts on                    also post as each contest starts
+/kcpc enable contests                            start reminding
+```
+
+The platforms are `codeforces`, `atcoder`, `codechef`, `leetcode`,
+`topcoder`, `icpc` and `manual` (the club's own contests, see below); a server
+follows all of them until it picks some with `/kcpc contests platforms`. The
+bot reads Codeforces every 5 minutes (from TLE's own copy of its contest
+list), AtCoder every 30 minutes, icpc.global every 6 hours and clist.by (see
+below) every 30 minutes; `/kcpc contests sync` reads them all at once. It
+reminds members an hour before each contest, with one message for contests
+that start together, such as a Div. 1 and a Div. 2 round, and with start posts
+on, it posts again as they start. If a contest they were reminded of moves, is
+cancelled or comes back, it tells them. A Codeforces, AtCoder, CodeChef,
+LeetCode or TopCoder contest that drops off its site's list before it starts
+counts as cancelled once three reads in a row have missed it, the last at least
+20 minutes after it was last listed. One that has started never does: AtCoder
+drops contests from its list as they start. ICPC contests, the regionals and
+the World Finals, are never cancelled this way, because the bot reads only some
+ICPC contests; an admin can still move one with `/kcpc contests settime`.
+
+CodeChef, LeetCode, TopCoder and the ICPC World Finals come from clist.by,
+which lists the contests of many sites, once `CLIST_USERNAME` and
+`CLIST_API_KEY` are set (see §3). To get a key, sign up for a free account at
+[clist.by](https://clist.by), then open its API documentation page,
+<https://clist.by/api/v4/doc/>, which shows your username and API key. The
+World Finals count as `icpc` contests. Without the key, the `codechef`,
+`leetcode` and `topcoder` platforms have no contests; admins can narrow a
+server's platforms with `/kcpc contests platforms`.
+
+ICPC contests come from icpc.global: those in `ICPC_CONTEST_CODES` (see §3).
+icpc.global gives only the dates of their events, so each is listed by its
+event's first day, as "time TBA", and gets no reminders until an admin sets
+the contest's own time with `/kcpc contests settime`. Until then, a contest
+whose event lasts several days, such as NWERC (27-29 November 2026), drops out
+of `/contests upcoming` from that first day. Admins can also add the club's
+own contests:
+
+```text
+/kcpc contests settime <contest> <start> [duration]  set a contest's time
+/kcpc contests add <name> <start> <duration> [url]   add a club contest
+/kcpc contests remove <contest>                      remove a contest added with add
+```
+
+A start is in the club's time zone (`KCPC_TIMEZONE`), as
+`YYYY-MM-DD HH:MM` (in quotes with `;kcpc contests add`), and a duration is
+like `2h`, `90m` or `1h30m`. As you type the contest, `settime` suggests
+upcoming contests. It works for any contest that isn't cancelled, and the time
+it sets stays, whatever the site says later (if the site later moves the
+contest away from that time, the bot posts a warning to the log channel,
+`LOGGING_COG_CHANNEL_ID`, and `settime` can change the time again); without a
+duration the contest keeps the one it has. If a contest members were reminded
+of moves or is removed, they are told.
+
+KCPC is built for one club, so all the servers the bot is in share its
+contests. A club contest, or a time set with `settime`, reaches every server
+that follows the contest's platform (`manual` for club contests, which servers
+follow unless they pick platforms without it). So an admin of any server the
+bot is in can add, retime or remove contests in all of them. Keep the bot in
+the club's own servers only (in the Discord Developer Portal, under Bot, turn
+off Public Bot), and try these commands with a separate test bot.
+
+Members can use:
+
+```text
+/contests upcoming [platform]   the next 10 contests (also plain ;contests)
+/contests live                  the contests running now
+/notify contests on|off         get the contest pings, or stop them
+```
+
+TLE's own contest reminders (`;remind`) also ping for Codeforces rounds. In a
+server that uses KCPC's contest reminders, a TLE admin should switch TLE's off
+with `;remind clear`, or members are pinged twice for each round.
 
 ---
 
@@ -145,8 +230,8 @@ docker compose up -d           # recreate the container on the new image
 | `KCPC_DB_PATH` | ❌ | `data/db/kcpc.db` | where the KCPC database lives |
 | `HTTP_USER_AGENT` | ❌ | `KCPC-bot (+https://…)` | User-Agent of KCPC's requests to other sites |
 | `LUMA_CALENDAR_ID` | ❌ | `cal-…` | default Luma calendar (its ID), for servers that haven't set one |
-| `ICPC_CONTEST_CODES` | ❌ | `UKIEPC,Northwestern-Europe-2027` | icpc.global contests to track |
-| `CLIST_USERNAME`, `CLIST_API_KEY` | ❌ | | clist.by account, an optional extra contest source |
+| `ICPC_CONTEST_CODES` | ❌ | `UKIEPC,Northwestern-Europe-2027` | icpc.global contests to track, by abbreviation; icpc.global gives their dates, admins set their times (`/kcpc contests settime`) |
+| `CLIST_USERNAME`, `CLIST_API_KEY` | ❌ | | clist.by username and API key; with both set, the bot also tracks CodeChef, LeetCode, TopCoder and the ICPC World Finals (see §1) |
 
 Feel free to add any extra variables your cogs consume; Compose passes
 every key in `.env` to the container. Run without Docker, the bot reads
@@ -160,8 +245,9 @@ every key in `.env` to the container. Run without Docker, the bot reads
 
 * `db/user.db`: TLE's server data, such as linked handles, duels, reminder
   settings and starboards.
-* `db/kcpc.db`: each server's KCPC settings, the workshops read from Luma, the
-  progress of KCPC's scheduled jobs, and the delivery ledger, which records
+* `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
+  bot has read (and the contests and times admins have set), the progress of
+  KCPC's scheduled jobs, and the delivery ledger, which records
   KCPC's automatic posts so that none goes out twice. Before each upgrade of
   its database the bot copies it to `kcpc.db.v<N>.bak`, next to it. If you set
   `KCPC_DB_PATH`, these files are there instead; under Docker, keep that path
