@@ -179,6 +179,26 @@ def http_log_levels(caplog: pytest.LogCaptureFixture) -> list[int]:
     return [record.levelno for record in caplog.records if record.name == HTTP_LOGGER]
 
 
+def time_out(monkeypatch: pytest.MonkeyPatch, client: HttpClient, *calls: int) -> None:
+    """Make these attempts of ``client``'s, counted from 1, time out at once
+    without reaching the site; the others go ahead.
+
+    A real timeout would race: under load, an attempt meant to go ahead could
+    time out too.
+    """
+    send = client._send
+    made = 0
+
+    async def send_or_time_out(*args: Any, **kwargs: Any) -> HttpResponse:
+        nonlocal made
+        made += 1
+        if made in calls:
+            raise asyncio.TimeoutError()
+        return await send(*args, **kwargs)
+
+    monkeypatch.setattr(client, '_send', send_or_time_out)
+
+
 class TestGet:
     async def test_sends_the_user_agent(
         self, site: FakeSite, make_client: ClientFactory
@@ -379,12 +399,27 @@ class TestRetries:
         assert len(site.requests) == 3
         assert len(instant_clock.sleeps) == 2  # no wait after the final attempt
 
-    async def test_timeout_is_retried(
-        self, site: FakeSite, make_client: ClientFactory, instant_clock: InstantClock
+    async def test_a_request_that_takes_too_long_times_out(
+        self, site: FakeSite, make_client: ClientFactory
     ) -> None:
-        site.script(stall, 'ok')
-        assert await make_client(timeout=0.1).get_text(site.url()) == 'ok'
-        assert len(site.requests) == 2
+        site.script(stall)
+        client = make_client(HostPolicy(max_attempts=1), timeout=0.1)
+        with pytest.raises(ExternalServiceError) as caught:
+            await client.get(site.url())
+        assert caught.value.status is None
+
+    async def test_timeout_is_retried(
+        self,
+        site: FakeSite,
+        make_client: ClientFactory,
+        instant_clock: InstantClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        site.script('ok')
+        client = make_client()
+        time_out(monkeypatch, client, 1)
+        assert await client.get_text(site.url()) == 'ok'
+        assert len(site.requests) == 1
         assert len(instant_clock.sleeps) == 1
 
     async def test_dropped_connection_is_retried(
@@ -395,16 +430,18 @@ class TestRetries:
         assert len(site.requests) == 2
 
     async def test_status_is_none_when_the_final_attempt_got_no_response(
-        self, site: FakeSite, make_client: ClientFactory
+        self,
+        site: FakeSite,
+        make_client: ClientFactory,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # A stall rather than a dropped connection: aiohttp itself retries a
-        # request once when a reused keep-alive connection is dropped.
-        site.script(503, stall)
-        client = make_client(HostPolicy(max_attempts=2), timeout=0.1)
+        site.script(503)
+        client = make_client(HostPolicy(max_attempts=2))
+        time_out(monkeypatch, client, 2)
         with pytest.raises(ExternalServiceError) as caught:
             await client.get(site.url())
         assert caught.value.status is None
-        assert len(site.requests) == 2
+        assert len(site.requests) == 1
 
 
 class TestPacing:
