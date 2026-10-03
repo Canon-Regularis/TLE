@@ -32,6 +32,8 @@ from tle.kcpc import bootstrap
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.core.errors import MigrationError
 from tle.kcpc.core.scheduler import ScheduledJob, Scheduler
+from tle.kcpc.core.settings import FeatureSettings
+from tle.kcpc.features.contests.settings import ContestSettings
 from tle.kcpc.features.workshops.settings import WorkshopSettings
 from tle.kcpc.services import KcpcServices
 
@@ -68,16 +70,49 @@ ADMIN = KcpcExtension('kcpc.admin', 'tle.kcpc.features.admin.cog', 'KcpcAdmin', 
 WORKSHOPS = KcpcExtension(
     'kcpc.workshops', 'tle.kcpc.features.workshops.cog', 'KcpcWorkshops', 'event'
 )
+CONTESTS = KcpcExtension(
+    'kcpc.contests', 'tle.kcpc.features.contests.cog', 'KcpcContests', 'contests'
+)
 NOTIFY = KcpcExtension(
     'kcpc.notify', 'tle.kcpc.features.notify.cog', 'KcpcNotify', 'notify'
 )
-KCPC = (ADMIN, WORKSHOPS, NOTIFY)  # in load order
+KCPC = (ADMIN, WORKSHOPS, CONTESTS, NOTIFY)  # in load order
 KCPC_BY_NAME = {extension.name: extension for extension in KCPC}
-# What kcpc.workshops starts besides its commands: a sync job, a reminder
-# source, and admin commands in the /kcpc group (if kcpc.admin is loaded).
-WORKSHOPS_SYNC_JOB = 'workshops.sync'
-WORKSHOPS_FEATURE = 'workshops'
 CORE_JOBS = [bootstrap.RECONCILE_JOB, bootstrap.REMINDERS_JOB]
+
+
+@dataclass(frozen=True)
+class KcpcFeature:
+    """What a feature's extension starts besides its commands.
+
+    Its sync jobs, its reminder source, and its admin commands in /kcpc <name>
+    (if kcpc.admin is loaded). Its settings are registered by bootstrap, so
+    they decode as their own type whether or not the extension loads.
+    """
+
+    extension: KcpcExtension
+    name: str  # as the settings, the reminder engine and /kcpc name it
+    settings: type[FeatureSettings]
+    jobs: tuple[str, ...]  # in the order the cog adds them
+    admin_commands: frozenset[str]  # the subcommands of /kcpc <name>
+
+
+WORKSHOPS_FEATURE = KcpcFeature(
+    WORKSHOPS,
+    'workshops',
+    WorkshopSettings,
+    ('workshops.sync',),
+    frozenset({'calendar', 'sync'}),
+)
+CONTESTS_FEATURE = KcpcFeature(
+    CONTESTS,
+    'contests',
+    ContestSettings,
+    ('contests.sync.codeforces', 'contests.sync.atcoder', 'contests.sync.icpc'),
+    frozenset({'add', 'settime', 'remove', 'platforms', 'start-posts', 'sync'}),
+)
+FEATURES = (WORKSHOPS_FEATURE, CONTESTS_FEATURE)
+FEATURE_BY_EXTENSION = {feature.extension.name: feature for feature in FEATURES}
 
 
 @dataclass(frozen=True)
@@ -192,24 +227,37 @@ def assert_features_started(
 ) -> None:
     """What the ``loaded`` KCPC extensions started: jobs, reminders, admin commands.
 
-    Only kcpc.workshops starts anything. Its admin commands join /kcpc when
-    kcpc.admin is loaded, and are never added at the top level.
+    Only the features (``FEATURES``) start anything. Their admin commands join
+    /kcpc when kcpc.admin is loaded, and are never added at the top level.
     """
-    workshops = WORKSHOPS in loaded
-    feature_jobs = [WORKSHOPS_SYNC_JOB] if workshops else []
+    started = [feature for feature in FEATURES if feature.extension in loaded]
+    feature_jobs = [job for feature in started for job in feature.jobs]
     assert [job.name for job in services.scheduler.status()] == sorted(
         CORE_JOBS + feature_jobs
     )
-    assert services.reminders.features == ([WORKSHOPS_FEATURE] if workshops else [])
-    in_kcpc = workshops and ADMIN in loaded
-    assert (bot.get_command('kcpc workshops') is not None) is in_kcpc
+    assert services.reminders.features == sorted(feature.name for feature in started)
     kcpc_group = bot.tree.get_command('kcpc')
     slash_children = (
         [] if not isinstance(kcpc_group, app_commands.Group) else kcpc_group.commands
     )
-    assert ('workshops' in [child.name for child in slash_children]) is in_kcpc
-    assert bot.get_command('workshops') is None
-    assert bot.tree.get_command('workshops') is None
+    for feature in FEATURES:
+        in_kcpc = feature in started and ADMIN in loaded
+        assert (bot.get_command(f'kcpc {feature.name}') is not None) is in_kcpc
+        assert (feature.name in [child.name for child in slash_children]) is in_kcpc
+        # At the top level the feature's name is free (workshops) or names its
+        # member commands (contests), never its admin commands.
+        for top_level in (
+            bot.get_command(feature.name),
+            bot.tree.get_command(feature.name),
+        ):
+            assert feature.admin_commands.isdisjoint(subcommand_names(top_level))
+
+
+def subcommand_names(command: object) -> set[str]:
+    """The names of a prefix or slash group's subcommands; none for a command."""
+    if isinstance(command, (commands.Group, app_commands.Group)):
+        return {child.name for child in command.commands}
+    return set()
 
 
 def fail_cog_load(monkeypatch: pytest.MonkeyPatch, cog_name: str) -> None:
@@ -271,11 +319,17 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
             TLE_MODULES - {'tle.cogs.duel', 'tle.cogs.graphs', 'tle.cogs.starboard'},
             KCPC,
         ),
-        ('kcpc.admin', False, TLE_MODULES, (WORKSHOPS, NOTIFY)),
-        ('kcpc.workshops', False, TLE_MODULES, (ADMIN, NOTIFY)),
-        ('kcpc.notify', False, TLE_MODULES, (ADMIN, WORKSHOPS)),
+        ('kcpc.admin', False, TLE_MODULES, (WORKSHOPS, CONTESTS, NOTIFY)),
+        ('kcpc.workshops', False, TLE_MODULES, (ADMIN, CONTESTS, NOTIFY)),
+        ('kcpc.contests', False, TLE_MODULES, (ADMIN, WORKSHOPS, NOTIFY)),
+        ('kcpc.notify', False, TLE_MODULES, (ADMIN, WORKSHOPS, CONTESTS)),
         ('kcpc', False, TLE_MODULES, ()),
-        ('kcpc.admin,kcpc.workshops,kcpc.notify', False, TLE_MODULES, ()),
+        (
+            'kcpc.admin,kcpc.workshops,kcpc.contests,kcpc.notify',
+            False,
+            TLE_MODULES,
+            (),
+        ),
         # The whole TLE family, tle.logging included.
         ('tle', False, frozenset(), KCPC),
         ('', True, TLE_MODULES, ()),
@@ -285,6 +339,7 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
         'some TLE cogs disabled',
         'kcpc.admin',
         'kcpc.workshops',
+        'kcpc.contests',
         'kcpc.notify',
         'kcpc',
         'every kcpc extension by name',
@@ -310,10 +365,11 @@ async def test_the_bot_boots_with_the_enabled_extensions(
             assert isinstance(services, KcpcServices)
             assert services.scheduler.running
             assert_features_started(bot, services, kcpc)
-            # /kcpc shows the workshop settings, whether or not kcpc.workshops
-            # is loaded.
-            spec = services.features.get(WORKSHOPS_FEATURE)
-            assert spec.settings_type is WorkshopSettings
+            # /kcpc shows each feature's settings, whether or not its
+            # extension is loaded.
+            for feature in FEATURES:
+                spec = services.features.get(feature.name)
+                assert spec.settings_type is feature.settings
         else:
             assert services is None
         # Where KCPC doesn't run, it doesn't even create its database.
@@ -335,7 +391,7 @@ async def test_the_bot_boots_with_the_enabled_extensions(
     assert errors_logged(caplog) == []
 
 
-async def test_kcpc_adds_three_commands_and_puts_its_admin_commands_in_kcpc(
+async def test_kcpc_adds_four_commands_and_puts_its_admin_commands_in_kcpc(
     db_path: Path,
 ) -> None:
     def from_kcpc(module: str | None) -> bool:
@@ -348,25 +404,20 @@ async def test_kcpc_adds_three_commands_and_puts_its_admin_commands_in_kcpc(
             for command in bot.tree.get_commands()
             if from_kcpc(command.module)
         }
-        assert prefix == slash == {'kcpc', 'event', 'notify'}
+        assert prefix == slash == {'kcpc', 'event', 'contests', 'notify'}
 
         kcpc_group = bot.get_command('kcpc')
         assert isinstance(kcpc_group, commands.HybridGroup)
-        workshops = kcpc_group.get_command('workshops')
-        assert isinstance(workshops, commands.HybridGroup)
-        assert workshops.cog is bot.get_cog(WORKSHOPS.cog)
-        assert {command.name for command in workshops.commands} == {
-            'calendar',
-            'sync',
-        }
         kcpc_slash = bot.tree.get_command('kcpc')
         assert isinstance(kcpc_slash, app_commands.Group)
-        workshops_slash = kcpc_slash.get_command('workshops')
-        assert isinstance(workshops_slash, app_commands.Group)
-        assert {command.name for command in workshops_slash.commands} == {
-            'calendar',
-            'sync',
-        }
+        for feature in FEATURES:
+            admin = kcpc_group.get_command(feature.name)
+            assert isinstance(admin, commands.HybridGroup)
+            assert admin.cog is bot.get_cog(feature.extension.cog)
+            assert subcommand_names(admin) == feature.admin_commands
+            admin_slash = kcpc_slash.get_command(feature.name)
+            assert isinstance(admin_slash, app_commands.Group)
+            assert subcommand_names(admin_slash) == feature.admin_commands
 
 
 async def test_setup_hook_starts_things_in_order(
@@ -437,8 +488,10 @@ async def test_tle_boots_when_kcpc_fails_to_start(
     ('failing', 'cause'),
     [
         ('kcpc.admin', 'cog_load raises'),
-        # Its sync job is added last, so the steps before it must be undone.
-        ('kcpc.workshops', 'its job cannot be added'),
+        # A feature adds its sync jobs last, so the steps before its last job
+        # must be undone, the other jobs among them.
+        ('kcpc.workshops', 'its last job cannot be added'),
+        ('kcpc.contests', 'its last job cannot be added'),
         ('kcpc.notify', 'cog_load raises'),
         ('kcpc.missing', 'package missing'),
     ],
@@ -454,8 +507,8 @@ async def test_the_bot_boots_without_a_kcpc_extension_that_fails_to_load(
     error: type[Exception] = commands.ExtensionFailed
     if cause == 'cog_load raises':
         fail_cog_load(monkeypatch, KCPC_BY_NAME[failing].cog)
-    elif cause == 'its job cannot be added':
-        fail_to_add_job(monkeypatch, WORKSHOPS_SYNC_JOB)
+    elif cause == 'its last job cannot be added':
+        fail_to_add_job(monkeypatch, FEATURE_BY_EXTENSION[failing].jobs[-1])
     else:
         # Its package doesn't exist either, so load_extension raises the import
         # error itself rather than an ExtensionError. It comes first, and the

@@ -19,6 +19,7 @@ from tle.kcpc.core.reminders import ReminderEngine
 from tle.kcpc.core.schedule import Every
 from tle.kcpc.core.scheduler import ScheduledJob, Scheduler
 from tle.kcpc.core.settings import GuildSettingsRepo, default_registry
+from tle.kcpc.features.contests.settings import SPEC as CONTESTS_SPEC
 from tle.kcpc.features.workshops.settings import SPEC as WORKSHOPS_SPEC
 from tle.kcpc.services import KcpcServices
 
@@ -63,9 +64,10 @@ def _assemble(
 ) -> KcpcServices:
     """The services, wired together but not started."""
     features = default_registry()
-    # Here rather than in the workshops extension, so that the settings decode
+    # Here rather than in the features' extensions, so that the settings decode
     # as their own type whichever extensions load: /kcpc shows them typed, and
-    # the extension never sees the base settings.
+    # an extension never sees the base settings.
+    features.register(CONTESTS_SPEC, replace=True)
     features.register(WORKSHOPS_SPEC, replace=True)
     guild_settings = GuildSettingsRepo(db, clock, features)
     ledger = DeliveryLedger(db, clock)

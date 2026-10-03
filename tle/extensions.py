@@ -20,6 +20,7 @@ LOGGING_EXTENSION = 'tle.logging'
 KCPC_EXTENSIONS: tuple[tuple[str, str], ...] = (
     ('kcpc.admin', 'tle.kcpc.features.admin.cog'),
     ('kcpc.workshops', 'tle.kcpc.features.workshops.cog'),
+    ('kcpc.contests', 'tle.kcpc.features.contests.cog'),
     ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
 )
 

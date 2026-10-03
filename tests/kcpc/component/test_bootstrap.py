@@ -34,6 +34,11 @@ from tle.kcpc.core.reminders import (
 )
 from tle.kcpc.core.scheduler import Scheduler
 from tle.kcpc.core.settings import FeatureSettings
+from tle.kcpc.features.contests.settings import (
+    CONTESTS,
+    SPEC as CONTESTS_SPEC,
+    ContestSettings,
+)
 from tle.kcpc.features.workshops.settings import (
     SPEC as WORKSHOPS_SPEC,
     WORKSHOPS,
@@ -162,6 +167,21 @@ async def test_workshop_settings_are_typed_whichever_extensions_load(
 
     assert await services.guild_settings.get(GUILD_ID, WORKSHOPS) == WorkshopSettings(
         enabled=True, calendar_id='cal-ClubWorkshops01'
+    )
+
+
+async def test_contest_settings_are_typed_whichever_extensions_load(
+    services: KcpcServices,
+) -> None:
+    # As for workshops: typed before the contests extension loads, if it does.
+    assert services.features.get(CONTESTS) is CONTESTS_SPEC
+
+    await services.guild_settings.update(
+        GUILD_ID, CONTESTS, enabled=True, platforms=('atcoder',), start_posts=True
+    )
+
+    assert await services.guild_settings.get(GUILD_ID, CONTESTS) == ContestSettings(
+        enabled=True, platforms=('atcoder',), start_posts=True
     )
 
 

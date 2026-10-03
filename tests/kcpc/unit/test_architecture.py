@@ -32,6 +32,10 @@ KCPC_DIR = REPO_ROOT / 'tle' / 'kcpc'
 STDLIB = frozenset(sys.stdlib_module_names)
 NOTIFY = 'tle.kcpc.features.notify'
 WORKSHOPS = 'tle.kcpc.features.workshops'
+CONTESTS = 'tle.kcpc.features.contests'
+CODEFORCES = 'tle.kcpc.platforms.codeforces'
+ATCODER = 'tle.kcpc.platforms.atcoder'
+ICPC = 'tle.kcpc.platforms.icpc'
 
 
 @dataclass(frozen=True)
@@ -223,9 +227,15 @@ def test_the_rules_are_checked_on_real_modules() -> None:
         'tle.kcpc.core.reminders',
         'tle.kcpc.bot.cog',
         'tle.kcpc.platforms.luma',
+        CODEFORCES,
+        ATCODER,
+        f'{ATCODER}.contests',
+        ICPC,
         'tle.kcpc.features.admin.cog',
         f'{WORKSHOPS}.sync',
         f'{WORKSHOPS}.cog',
+        f'{CONTESTS}.sources',
+        f'{CONTESTS}.cog',
         f'{NOTIFY}.cog',
         'tle.kcpc.services',
         'tle.kcpc.bootstrap',
@@ -244,9 +254,10 @@ def test_no_kcpc_module_breaks_the_layering_rules() -> None:
     assert problems == []
 
 
-def test_notify_never_imports_workshops() -> None:
+def test_notify_never_imports_the_features_it_serves() -> None:
     # /notify serves every feature through the settings registry alone, so it
-    # keeps working with kcpc.workshops disabled, or failing to load.
+    # keeps working with kcpc.workshops or kcpc.contests disabled, or failing
+    # to load.
     refs = [
         ref
         for module, path in kcpc_modules()
@@ -255,7 +266,7 @@ def test_notify_never_imports_workshops() -> None:
     ]
 
     assert refs, 'the notify package has imports to check'
-    assert [str(ref) for ref in refs if _under(ref.target, WORKSHOPS)] == []
+    assert [str(ref) for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS)] == []
 
 
 def test_imports_anywhere_in_a_module_are_found() -> None:
@@ -372,6 +383,16 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         ('tle.kcpc.platforms.x', 'from tle.kcpc import services', False),
         ('tle.kcpc.platforms.luma', 'from icalendar import Calendar', True),
         ('tle.kcpc.platforms.luma', 'from tle.kcpc.core.http import HttpClient', True),
+        # The Codeforces adapter reads TLE's cached contests, but nothing that
+        # reaches TLE's database or Discord.
+        (CODEFORCES, 'from tle.util import codeforces_api as cf', True),
+        (CODEFORCES, 'from tle.util import codeforces_common', False),
+        (CODEFORCES, f'from {CONTESTS}.repo import ContestInfo', False),
+        (f'{ATCODER}.contests', 'from html.parser import HTMLParser', True),
+        (f'{ATCODER}.contests', 'from tle.kcpc.core.http import HttpClient', True),
+        (f'{ATCODER}.contests', 'import discord', False),
+        (ICPC, 'from tle.kcpc.core.errors import ExternalServiceError', True),
+        (ICPC, 'from tle.kcpc.bot.embeds import to_embed', False),
         ('tle.kcpc.features.a.cog', 'import discord', True),
         ('tle.kcpc.features.a.views', 'from discord import ui', True),
         ('tle.kcpc.features.a.service', 'import discord', False),
@@ -392,8 +413,20 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{NOTIFY}.cog', f'from {WORKSHOPS}.settings import WORKSHOPS', False),
         (f'{NOTIFY}.cog', f'def f():\n    from {WORKSHOPS} import cog', False),
         (f'{NOTIFY}.cog', f'import {WORKSHOPS}.settings', False),
+        (f'{NOTIFY}.cog', f'from {CONTESTS}.settings import CONTESTS', False),
+        (f'{CONTESTS}.sources', 'from tle.kcpc.platforms.icpc import IcpcClient', True),
+        (f'{CONTESTS}.sources', 'from tle.util import codeforces_api', True),
+        (f'{CONTESTS}.sync', 'from tle.kcpc.core.db import Database', True),
+        (f'{CONTESTS}.sync', 'import discord', False),
+        (f'{CONTESTS}.reminders', 'from tle.kcpc.core.reminders import Notice', True),
+        (f'{CONTESTS}.reminders', 'import discord', False),
+        (f'{CONTESTS}.cog', f'from {CONTESTS}.sync import ContestSync', True),
+        (f'{CONTESTS}.cog', 'from tle.kcpc.bot.admin import attach_admin_group', True),
+        (f'{CONTESTS}.cog', f'from {WORKSHOPS}.settings import WORKSHOPS', False),
+        (f'{WORKSHOPS}.cog', f'from {CONTESTS}.repo import ContestRepo', False),
         ('tle.kcpc.services', 'from tle.kcpc.bot.publisher import X', True),
         ('tle.kcpc.bootstrap', 'from tle.kcpc.features.admin import cog', True),
+        ('tle.kcpc.bootstrap', f'from {CONTESTS}.settings import SPEC', True),
         ('tle.kcpc.core.x', 'from . import db', False),
         ('tle.kcpc.bootstrap', 'from .services import KcpcServices', False),
     ],

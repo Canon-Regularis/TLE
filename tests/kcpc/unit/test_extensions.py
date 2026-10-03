@@ -19,9 +19,10 @@ REPO_COGS_DIR = Path(__file__).resolve().parents[3] / 'tle' / 'cogs'
 
 KCPC_ADMIN = Extension('kcpc.admin', 'tle.kcpc.features.admin.cog', 'kcpc')
 KCPC_WORKSHOPS = Extension('kcpc.workshops', 'tle.kcpc.features.workshops.cog', 'kcpc')
+KCPC_CONTESTS = Extension('kcpc.contests', 'tle.kcpc.features.contests.cog', 'kcpc')
 KCPC_NOTIFY = Extension('kcpc.notify', 'tle.kcpc.features.notify.cog', 'kcpc')
 # The real KCPC extensions, in load order.
-KCPC = [KCPC_ADMIN, KCPC_WORKSHOPS, KCPC_NOTIFY]
+KCPC = [KCPC_ADMIN, KCPC_WORKSHOPS, KCPC_CONTESTS, KCPC_NOTIFY]
 
 # Made-up extensions, listed out of order.
 ZETA = Extension('tle.zeta', 'tle.cogs.zeta', 'tle')
@@ -62,6 +63,7 @@ def test_kcpc_extensions_are_listed_in_order() -> None:
     assert KCPC_EXTENSIONS == (
         ('kcpc.admin', 'tle.kcpc.features.admin.cog'),
         ('kcpc.workshops', 'tle.kcpc.features.workshops.cog'),
+        ('kcpc.contests', 'tle.kcpc.features.contests.cog'),
         ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
     )
     kcpc = [extension for extension in discover() if extension.family == 'kcpc']
