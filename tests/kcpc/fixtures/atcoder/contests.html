@@ -1,0 +1,313 @@
+
+
+
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Present Contests - AtCoder</title>
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+	<meta http-equiv="Content-Language" content="en">
+	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+	<meta name="format-detection" content="telephone=no">
+	<meta name="robots" content="noai, noimageai">
+
+	
+	<meta name="description" content="AtCoder is a programming contest site for anyone from beginners to experts.">
+	<meta name="author" content="AtCoder Inc.">
+
+	<meta property="og:site_name" content="AtCoder">
+	
+	<meta property="og:title" content="Present Contests - AtCoder" />
+	<meta property="og:type" content="website" />
+	<meta property="og:url" content="https://atcoder.jp/contests/?lang=en" />
+
+	<script src="//img.atcoder.jp/public/7e7ac38/js/lib/jquery-1.9.1.min.js"></script>
+	<script src="//img.atcoder.jp/public/7e7ac38/js/lib/bootstrap.min.js"></script>
+	
+	<script src="//img.atcoder.jp/public/7e7ac38/js/base.js"></script>
+</head>
+
+<body>
+
+
+<div id="main-div" class="float-container">
+
+
+
+	<div id="main-container" class="container"
+		 	style="">
+		
+
+
+<div class="row">
+	<div class="col-sm-12">
+		<ul class="nav nav-tabs mb-2">
+			<li class="active"><a href='/contests/'>Present Contests</a></li>
+			<li><a href='/contests/archive'>Past Contests</a></li>
+		</ul>
+	</div>
+	<div class="col-lg-3 col-md-4">
+		<div class="panel panel-default">
+	<div class="panel-heading collapse-heading" data-toggle="collapse" data-target="#collapse-search">
+		<h3 class="panel-title">
+			Search in Archive
+			<span class="glyphicon pull-right"></span>
+		</h3>
+	</div>
+	<div id="collapse-search" class="panel-body panel-collapse collapse in">
+		<form name="contestSearchForm" action="/contests/archive">
+			<p class="filter-body-heading">Rated Range </p>
+			<input type="hidden" name="ratedType" value="0">
+			<div id="rated-type-btn-group" class="btn-group-vertical btn-group-sm col-xs-12">
+				<button type="button" class="btn btn-default" data-rated-type="1"><small class="pull-left">ABC Class <span class="grey">(Rated for ~1999)</span></small></button>
+				<button type="button" class="btn btn-default" data-rated-type="4"><small class="pull-left">AHC Class</small></button>
+			</div>
+			<button type="submit" class="btn btn-primary btn-sm">Search</button>
+			
+		</form>
+	</div>
+</div>
+<script>
+	$(function() {
+		$('#rated-type-btn-group button').click(function() {
+			$('#collapse-search input[name="ratedType"]').val($(this).data('rated-type'));
+			contestSearchForm.submit();
+		});
+	});
+</script>
+	</div>
+	<div class="col-lg-9 col-md-8">
+		
+			<div id="contest-table-action">
+				<h3>Ongoing Contests</h3>
+				
+				
+				<div class="panel panel-default"><div class="table-responsive">
+	<table class="table table-default table-striped table-hover table-condensed table-bordered small">
+		<thead>
+			<tr>
+				<th width="18%" class="text-center">Start Time<small> (local time)</small></th>
+				<th class="text-center">Contest Name</th>
+				<th width="7%" class="text-center">Duration</th>
+				<th width="12%" class="text-center">Rated Range</th>
+			</tr>
+		</thead>
+		<tbody>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20260925T1910&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-09-25 19:10:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Heuristic">Ⓗ</span><span class="">◉</span> <a href="/contests/ahc072">Example Programming Contest 2026 September（AtCoder Heuristic Contest 072）</a></td>
+				<td class="text-center">239:50</td>
+				<td class="text-center">All</td>
+			</tr>
+		
+		</tbody>
+	</table>
+</div></div>
+			</div>
+		
+		
+			<hr>
+			<div id="contest-table-permanent">
+				<h3>Permanent Contests</h3>
+				
+				
+				<div class="panel panel-default"><div class="table-responsive">
+	<table class="table table-default table-striped table-hover table-condensed table-bordered small">
+		<thead>
+			<tr>
+				
+				<th class="text-center">Contest Name</th>
+				
+				<th width="12%" class="text-center">Rated Range</th>
+			</tr>
+		</thead>
+		<tbody>
+		
+			<tr>
+				
+				<td style="padding-left:10px;"><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="">◉</span> <a href="/contests/practice">practice contest</a></td>
+				
+				<td class="text-center">-</td>
+			</tr>
+		
+			<tr>
+				
+				<td style="padding-left:10px;"><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="">◉</span> <a href="/contests/practice2">AtCoder Library Practice Contest</a></td>
+				
+				<td class="text-center">-</td>
+			</tr>
+		
+		</tbody>
+	</table>
+</div></div>
+			</div>
+		
+		
+			<hr>
+			<div id="contest-table-upcoming">
+				<h3>Upcoming Contests</h3>
+				
+				
+				<div class="panel panel-default"><div class="table-responsive">
+	<table class="table table-default table-striped table-hover table-condensed table-bordered small">
+		<thead>
+			<tr>
+				<th width="18%" class="text-center">Start Time<small> (local time)</small></th>
+				<th class="text-center">Contest Name</th>
+				<th width="7%" class="text-center">Duration</th>
+				<th width="12%" class="text-center">Rated Range</th>
+			</tr>
+		</thead>
+		<tbody>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261003T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-03 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-blue">◉</span> <a href="/contests/abc478">AtCoder Beginner Contest 478</a></td>
+				<td class="text-center">01:40</td>
+				<td class="text-center"> - 1999</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261004T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-04 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-orange">◉</span> <a href="/contests/arc231">AtCoder Regular Contest 231</a></td>
+				<td class="text-center">02:00</td>
+				<td class="text-center">1200 - 2799</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261010T1500&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-10 15:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Heuristic">Ⓗ</span><span class="">◉</span> <a href="/contests/ahc073">AtCoder Heuristic Contest 073</a></td>
+				<td class="text-center">04:00</td>
+				<td class="text-center">All</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261011T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-11 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-blue">◉</span> <a href="/contests/abc479">Example &amp; Co. Programming Contest 2026（AtCoder Beginner Contest 479）</a></td>
+				<td class="text-center">01:40</td>
+				<td class="text-center"> - 1999</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261018T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-18 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-red">◉</span> <a href="/contests/agc075">AtCoder Grand Contest 075</a></td>
+				<td class="text-center">03:00</td>
+				<td class="text-center">1200 - </td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261024T1300&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-24 13:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="">◉</span> <a href="/contests/example-univ-2026">Example University Programming Contest 2026 (unrated)</a></td>
+				<td class="text-center">05:00</td>
+				<td class="text-center">-</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261030T1900&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-30 19:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Heuristic">Ⓗ</span><span class="">◉</span> <a href="/contests/ahc074">Example Heuristic Challenge 2027 (AtCoder Heuristic Contest 074)</a></td>
+				<td class="text-center">240:00</td>
+				<td class="text-center">All</td>
+			</tr>
+		
+		</tbody>
+	</table>
+</div></div>
+			</div>
+		
+		
+			<hr>
+			<div id="contest-table-daily">
+				<h3>Daily Contests</h3>
+				
+				
+				<div class="panel panel-default"><div class="table-responsive">
+	<table class="table table-default table-striped table-hover table-condensed table-bordered small">
+		<thead>
+			<tr>
+				<th width="18%" class="text-center">Start Time<small> (local time)</small></th>
+				<th class="text-center">Contest Name</th>
+				<th width="7%" class="text-center">Duration</th>
+				<th width="12%" class="text-center">Rated Range</th>
+			</tr>
+		</thead>
+		<tbody>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20261005T2000&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-10-05 20:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="">◉</span> <a href="/contests/awc0172">AtCoder Weekday Contest 0172 Beta</a></td>
+				<td class="text-center">01:00</td>
+				<td class="text-center">-</td>
+			</tr>
+		
+		</tbody>
+	</table>
+</div></div>
+			</div>
+		
+		
+			<hr>
+			<div id="contest-table-recent">
+				<h3>Recent Contests</h3>
+				
+				
+				<div class="panel panel-default"><div class="table-responsive">
+	<table class="table table-default table-striped table-hover table-condensed table-bordered small">
+		<thead>
+			<tr>
+				<th width="18%" class="text-center">Start Time<small> (local time)</small></th>
+				<th class="text-center">Contest Name</th>
+				<th width="7%" class="text-center">Duration</th>
+				<th width="12%" class="text-center">Rated Range</th>
+			</tr>
+		</thead>
+		<tbody>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20260926T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-09-26 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-blue">◉</span> <a href="/contests/abc477">AtCoder Beginner Contest 477</a></td>
+				<td class="text-center">01:40</td>
+				<td class="text-center"> - 1999</td>
+			</tr>
+		
+			<tr>
+				<td class="text-center"><a href='http://www.timeanddate.com/worldclock/fixedtime.html?iso=20260920T2100&p1=248' target='blank'><time class='fixtime fixtime-full'>2026-09-20 21:00:00+0900</time></a></td>
+				<td ><span aria-hidden='true' data-toggle='tooltip' data-placement='top' title="Algorithm">Ⓐ</span><span class="user-orange">◉</span> <a href="/contests/arc230">AtCoder Regular Contest 230</a></td>
+				<td class="text-center">02:00</td>
+				<td class="text-center">1200 - 2799</td>
+			</tr>
+		
+		</tbody>
+	</table>
+</div></div>
+				<p class="text-center"><a class="btn-text" href="/contests/archive">More...</a></p>
+			</div>
+		
+		
+	</div> 
+	<hr>
+</div> 
+
+	<div class="container" style="margin-bottom: 80px;">
+			<footer class="footer">
+			
+			<ul>
+				<li><a href="/tos">Terms of Use</a></li>
+				<li><a href="/privacy">Privacy Policy</a></li>
+				<li><a href="/faq">FAQ</a></li>
+				<li><a href="/contact">Contact</a></li>
+				
+			</ul>
+			<div class="text-center">
+					<small id="copyright">Copyright Since 2012 &copy;<a href="http://atcoder.co.jp">AtCoder Inc.</a> All rights reserved.</small>
+			</div>
+			</footer>
+	</div>
+	<p id="fixed-server-timer" ></p>
+	<div id="scroll-page-top" style="display:none;"><span class="glyphicon glyphicon-arrow-up" aria-hidden="true"></span> Page Top</div>
+
+</body>
+</html>
+
+
+

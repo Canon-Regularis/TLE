@@ -11,7 +11,14 @@ services:
     volumes:
       - ./data:/bot/data
 
-    restart: no
+    restart: unless-stopped
+
+    # Python runs as PID 1 here with no SIGTERM handler, so it ignores Docker's
+    # default stop signal until the SIGKILL at the end of the grace period.
+    # SIGINT makes asyncio cancel the bot's main task, so TLEBot.close() runs:
+    # KCPC shuts down, then TLE's databases, then the gateway connection.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
 
     logging:
       driver: json-file

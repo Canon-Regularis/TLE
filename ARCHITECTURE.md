@@ -75,6 +75,7 @@ TLE/
 │       ├── discord_common.py    # Embed helpers, error handler, presence system
 │       ├── events.py            # Pub/sub event system for inter-component communication
 │       ├── graph_common.py      # matplotlib setup, BytesIO plotting, rating backgrounds
+│       ├── handle_linking.py    # Links handles: TLE's table, rank roles, Purgatory/Trusted (;handle set, OAuth, /link)
 │       ├── handledict.py        # Case-insensitive handle dictionary
 │       ├── oauth.py             # Codeforces OAuth (OIDC) state store, token handling, callback server
 │       ├── paginator.py         # Discord message pagination with reactions
@@ -272,7 +273,7 @@ User runs ;handle identify
   -> OAuthServer exchanges code for ID token at CF token endpoint
   -> Decodes ID token (HS256) -> extracts handle
   -> Fetches full CF user info via cf.user.info()
-  -> Calls handles_cog._set_from_oauth(guild, member, user)
+  -> Calls handle_linking.link_handle(bot.user_db, guild, member, user), which finds the rank role before writing anything
   -> Sends confirmation embed to Discord channel
   -> Returns success HTML to browser
 ```

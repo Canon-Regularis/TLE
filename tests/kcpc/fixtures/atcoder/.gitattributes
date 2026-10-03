@@ -1,0 +1,3 @@
+# AtCoder's contest list is kept with LF line endings: keep them on every
+# checkout, so that the tests read the page as AtCoder sends it.
+*.html text eol=lf
