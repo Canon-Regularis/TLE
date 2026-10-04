@@ -1,0 +1,9 @@
+[
+{"id":37190,"epoch_second":1344004808,"problem_id":"tenka1_2012_qualA_4","contest_id":"tenka1-2012-qualA","user_id":"fake_user","language":"C# (Mono 2.10.8.1)","point":100.0,"length":2594,"result":"AC","execution_time":181},
+{"id":37709,"epoch_second":1344512948,"problem_id":"arc001_2","contest_id":"arc001","user_id":"fake_user","language":"C# (Mono 2.10.8.1)","point":0.0,"length":743,"result":"WA","execution_time":143},
+{"id":57571,"epoch_second":1354424215,"problem_id":"utpc2012_05","contest_id":"utpc2012","user_id":"fake_user","language":"C# (Mono 2.10.8.1)","point":50.0,"length":3136,"result":"TLE","execution_time":2030},
+{"id":119935,"epoch_second":1386245020,"problem_id":"tricky_1","contest_id":"tricky","user_id":"fake_user","language":"C# (Mono 2.10.8.1)","point":0.0,"length":1233,"result":"CE","execution_time":null},
+{"id":70292381,"epoch_second":1760873378,"problem_id":"ahc055_a","contest_id":"ahc055","user_id":"fake_user","language":"C# 11.0 AOT (.NET 7.0.7)","point":8019094.0,"length":9637,"result":"AC","execution_time":1728},
+{"id":70902531,"epoch_second":1763026818,"problem_id":"abc351_a","contest_id":"adt_all_20251113_2","user_id":"fake_user","language":"C# 13.0 (.NET Native AOT 9.0.8)","point":100.0,"length":2115,"result":"AC","execution_time":1},
+{"id":74534717,"epoch_second":1774800218,"problem_id":"agc077_a","contest_id":"agc077","user_id":"fake_user","language":"C# 13.0 (.NET Native AOT 9.0.8)","point":800.0,"length":5476,"result":"AC","execution_time":476}
+]
