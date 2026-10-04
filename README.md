@@ -30,7 +30,9 @@ phases. So far it reminds members of the club's workshops on Luma and of
 contests: Codeforces, AtCoder, ICPC and the club's own, and with a clist.by
 account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. Members can
 also link their Codeforces and AtCoder accounts, for profiles and server
-leaderboards. A weekly problem is to follow.
+leaderboards. Each Friday it posts a problem from Codeforces or AtCoder, with
+its solution the Friday after, and `/randproblem` gives members a random
+problem by topic and difficulty.
 `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps its data
 in its own database, `data/db/kcpc.db`, and doesn't run when the bot is
 started with `--nodb`.
@@ -41,8 +43,9 @@ for all of KCPC. KCPC's extensions are `kcpc.admin` (`/kcpc`),
 `kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`),
 `kcpc.contests` (contest reminders, `/contests` and `/kcpc contests`),
 `kcpc.accounts` (account linking, `/link`, `/unlink`, `/profile`, `/rank` and
-`/kcpc accounts`) and `kcpc.notify` (`/notify`). KCPC's own settings are all
-optional: `KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`,
+`/kcpc accounts`), `kcpc.problems` (the weekly problem, `/randproblem`,
+`/weekly` and `/kcpc weekly`) and `kcpc.notify` (`/notify`). KCPC's own
+settings are all optional: `KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`,
 `LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY`
 (see §3 and `.env.example`).
 
@@ -59,8 +62,8 @@ under Server Settings → Integrations.
 /kcpc status                        database, jobs, post counts and recent skips
 ```
 
-The features are `algo`, `contests`, `weekly` and `workshops`; so far only
-`contests` and `workshops` post anything.
+The features are `algo`, `contests`, `weekly` and `workshops`; so far, only
+`algo` doesn't post anything.
 
 #### Workshop reminders
 
@@ -243,6 +246,124 @@ back, so nobody else can link it until it is removed. Where Codeforces OAuth is
 set up, TLE's `;handle identify` links a Codeforces account too. AtCoder links
 are KCPC's own, and TLE's features don't use them.
 
+#### Weekly problem and /randproblem
+
+To have the bot post a weekly problem in a server:
+
+```text
+/kcpc channel weekly #weekly-problem   where the problems and solutions go
+/kcpc role weekly @Weekly              a pings-only role each problem mentions
+/kcpc enable weekly                    start posting
+```
+
+`/randproblem` needs none of this: it works in every server where the
+`kcpc.problems` extension is loaded, whether or not the weekly problem is on.
+
+Every Friday at 12:00 in the club's time zone (`KCPC_TIMEZONE`), the bot posts
+the solution of last week's problem, then a new problem; only the problem
+mentions the role. The first problem comes the next Friday, unless an admin
+posts this week's at once with `/kcpc weekly post-now`: the first time the bot
+starts with this feature, it posts nothing, even on a Friday afternoon. If the
+bot is down at noon, it posts when it is back, up to 6 hours late; any later
+and it skips that week, though `post-now` can still post it until the next
+Friday.
+
+A week's problem is the oldest in the server's queue, or else a random one as
+the server's rotation says: a cycle of entries, one a week, each a platform, a
+band and a topic. The bands go by Codeforces' ratings: easy is below 1200,
+medium 1200 to 1599, hard 1600 to 1999 and expert 2000 and up. AtCoder's
+difficulties (AtCoder Problems' estimates) are converted to Codeforces' scale,
+so an AtCoder 1376 counts as a Codeforces 1752. The default rotation is
+Codeforces easy, AtCoder medium, Codeforces medium, AtCoder hard, all on any
+topic. Weeks take a rotation's entries in turn by the calendar, so a week
+without a problem doesn't shift the cycle. If the entry's platform has nothing
+to give, the problem comes from the other platform, in the same band on any
+topic. A server never gets the same problem twice.
+
+The bot reads the lists of problems from Codeforces' API (through TLE's
+client) every 6 hours and from AtCoder Problems (kenkoooo.com) every day.
+Random picks, for the weekly problem and `/randproblem`, take Codeforces'
+rated problems of standard rounds, leaving out April Fools, Kotlin Heroes and
+other special contests as TLE does, and AtCoder's ABC, ARC and AGC problems
+that AtCoder Problems gives a difficulty that isn't experimental: ABC from 042
+and ARC from 058 on, and every AGC. The rotation takes Codeforces
+problems only from contest 1000 on (mid-2018), as nearly all of those have an
+English editorial.
+
+The bot reads nothing from Codeforces but its API, which can't find a
+contest's editorial, so a Codeforces problem's solution post gives the link an
+admin set, or else the contest's page, where Codeforces lists the editorial
+under "Contest materials". On AtCoder, the bot finds the editorials itself, on
+atcoder.jp: the rotation picks only problems with an official editorial, and
+the solution post links the best one (English text first, or an admin's link
+instead) and the task's page of all its editorials.
+
+Admins can choose the problems and see what comes next:
+
+```text
+/kcpc weekly queue <problem> [solution]   queue a problem, and its solution link
+/kcpc weekly unqueue <problem>            take a problem out of the queue
+/kcpc weekly solution <url> [week]        set a problem's solution link
+/kcpc weekly rotation [entries]           show the rotation, or set it
+/kcpc weekly preview                      what the next Friday will post
+/kcpc weekly post-now                     post this week's problem now
+```
+
+A problem is a Codeforces problem, as `1520D` or its link, or an AtCoder one,
+as `abc300_d` or its link. The queue holds up to 25 problems, which go out
+oldest first, and refuses one the server has had, unless its post never went
+out and its week is over. For an AtCoder problem queued without a link, the
+bot looks up its editorials and says which one the solution post will link. A
+solution link is a full http(s) URL of up to 300 characters. `solution` sets
+the link of the problem for the Friday `week` (`YYYY-MM-DD`, as
+`/weekly history` shows it), or without `week`, of the latest problem whose
+solution hasn't been posted. A posted solution's link can't change, and a problem whose
+post never went out, or more than 4 weeks old by the next post, gets no
+solution post, so it takes no link.
+
+A rotation has 1 to 52 entries, separated by commas or semicolons, each a
+platform (`cf` or `codeforces`, `ac` or `atcoder`), a band and a topic (`any`
+if left out), as in `cf easy, ac medium, cf medium graphs, ac hard`. Topics
+are those of `/randproblem` (below); an AtCoder entry's can only be `any`.
+`/kcpc weekly rotation default` goes back to the default rotation, and
+without entries the command shows the rotation, marking the entry of the next
+post. `preview` shows when and where the next problem posts (or why it won't),
+what it will be (the queued problem, or the rotation's entry), this week's
+problem and where its solution link comes from, the queue and the rotation.
+`post-now` posts any solution that is due and this week's problem, or says
+that they are out already, or that Discord refused this week's problem
+earlier, so that it can't go out again that week.
+
+Members can use:
+
+```text
+/randproblem <topic> <difficulty> [platform]  a random problem
+/weekly current                               the latest weekly problem
+/weekly history                               the weekly problems so far
+/notify weekly on|off                         get the weekly pings, or stop them
+```
+
+`/weekly current` (also plain `;weekly`) and `/weekly history` (newest first)
+link each problem's solution once it is out. `/randproblem` picks from
+Codeforces unless `platform` is `atcoder`. Its topic is `any`, a Codeforces
+tag such as `dp` or `greedy`, or a group of tags: `graphs`, `math`,
+`number-theory`, `strings`, `data-structures`, `searching`, `brute-force` or
+`constructive`. Its difficulty is a band or a rating from 800 to 3500, on
+Codeforces' scale on both platforms. Both are suggested as you type (with
+`;randproblem`, put a topic of several words in quotes). A rating takes the
+problems rated at or near it, looking up to 200 away if none is closer, and
+the reply says when it had to. The reply hides the problem's tags behind a
+spoiler.
+
+AtCoder's problems have no topics, so with `platform: atcoder` the topic must
+be `any`. For a member with linked accounts, `/randproblem` leaves out the
+problems they have solved: on Codeforces by the handle TLE has for them (which
+`/link codeforces` sets), and on AtCoder by the account linked with
+`/link atcoder`. It checks for up to 10 seconds; if a site is slow or down, it
+gives a problem anyway and says it couldn't check them all. Until the bot has
+read the problems after a restart, `/randproblem` and `/kcpc weekly queue` ask
+to try again in a few minutes.
+
 ---
 
 ## 2 · Quick start (production)
@@ -310,12 +431,12 @@ every key in `.env` to the container. Run without Docker, the bot reads
 * `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
   bot has read (and the contests and times admins have set), members' AtCoder
   links and the links waiting to be verified, the ratings last read for
-  `/profile` and `/rank`, the progress of KCPC's scheduled jobs, and the
-  delivery ledger, which records KCPC's automatic posts so that none goes out
-  twice. Before each upgrade of its database the bot copies it to
-  `kcpc.db.v<N>.bak`, next to it. If you set `KCPC_DB_PATH`, these files are
-  there instead; under Docker, keep that path inside `data/`, or they are lost
-  when the container is recreated.
+  `/profile` and `/rank`, each server's weekly problems and queue, the
+  progress of KCPC's scheduled jobs, and the delivery ledger, which records
+  KCPC's automatic posts so that none goes out twice. Before each upgrade of
+  its database the bot copies it to `kcpc.db.v<N>.bak`, next to it. If you set
+  `KCPC_DB_PATH`, these files are there instead; under Docker, keep that path
+  inside `data/`, or they are lost when the container is recreated.
 * `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
   but an admin has to refill the rating changes and problemsets with
   `;cache ratingchanges all` and `;cache problemsets all`.
