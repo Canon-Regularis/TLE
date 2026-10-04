@@ -15,6 +15,9 @@ FIRST_MESSAGE_ID = 1_300_000_000_000_000_001
 
 # The outcomes that FakePublisher.fail_next can stage, besides an exception.
 _FAILURE_OUTCOMES = (PublishOutcome.PENDING, PublishOutcome.SKIPPED)
+# The reason FakePublisher.undeliverable_next gives unless told another: the
+# guild's channels aren't known yet, as just after the bot reconnects.
+GUILD_UNAVAILABLE = 'guild-unavailable'
 
 
 @dataclass(frozen=True)
@@ -39,7 +42,7 @@ class FakePublisher:
     recording nothing, while the feature is disabled or has no channel. Then it
     claims the deliveries, returning ALREADY_HANDLED if none is new, records
     the post, confirms it in the ledger and returns SENT. ``fail_next`` makes
-    posts fail instead.
+    posts fail instead, and ``undeliverable_next`` makes them UNDELIVERABLE.
     """
 
     def __init__(
@@ -49,6 +52,7 @@ class FakePublisher:
         self._settings = guild_settings
         self._ledger = ledger
         self._failures: deque[PublishOutcome | Exception] = deque()
+        self._undeliverable: deque[str] = deque()
         self._message_ids = itertools.count(FIRST_MESSAGE_ID)
 
     def fail_next(self, *failures: PublishOutcome | Exception) -> None:
@@ -67,6 +71,19 @@ class FakePublisher:
                 raise ValueError(f'FakePublisher cannot fail with {failure}')
         self._failures.extend(failures)
 
+    def undeliverable_next(
+        self, count: int = 1, *, reason: str = GUILD_UNAVAILABLE
+    ) -> None:
+        """Make the next ``count`` posts for a configured feature UNDELIVERABLE.
+
+        Each returns ``reason`` before claiming anything, as DiscordPublisher
+        does while a guild is unavailable ('guild-unavailable') or when its
+        channel is gone ('channel-missing'). So nothing is recorded, and the
+        same deliveries can be posted later. Every key being handled already
+        doesn't stop it: the channel is checked before the claim.
+        """
+        self._undeliverable.extend([reason] * count)
+
     async def publish(
         self, deliveries: Sequence[Delivery], message: OutgoingMessage
     ) -> PublishResult:
@@ -77,6 +94,9 @@ class FakePublisher:
             return PublishResult(PublishOutcome.NOT_CONFIGURED, reason='disabled')
         if config.channel_id is None:
             return PublishResult(PublishOutcome.NOT_CONFIGURED, reason='no-channel')
+        if self._undeliverable:
+            reason = self._undeliverable.popleft()
+            return PublishResult(PublishOutcome.UNDELIVERABLE, reason=reason)
         claimed, batch = await self._ledger.claim(
             deliveries, channel_id=config.channel_id, message=message
         )
