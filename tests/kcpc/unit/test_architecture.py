@@ -45,10 +45,12 @@ NOTIFY = 'tle.kcpc.features.notify'
 WORKSHOPS = 'tle.kcpc.features.workshops'
 CONTESTS = 'tle.kcpc.features.contests'
 ACCOUNTS = 'tle.kcpc.features.accounts'
+PROBLEMS = 'tle.kcpc.features.problems'
 CODEFORCES = 'tle.kcpc.platforms.codeforces'
 ATCODER = 'tle.kcpc.platforms.atcoder'
 ICPC = 'tle.kcpc.platforms.icpc'
 CODEFORCES_LINKS = 'tle.kcpc.bot.codeforces_links'
+HANDLES = 'tle.kcpc.core.handles'
 HANDLE_LINKING = 'tle.util.handle_linking'
 TLE_CODEFORCES = 'tle.util.codeforces_api'
 # What reaches TLE's user database, besides the bridge's handle linking.
@@ -257,13 +259,17 @@ def test_the_rules_are_checked_on_real_modules() -> None:
     for expected in (
         'tle.kcpc.core.db',
         'tle.kcpc.core.reminders',
+        HANDLES,
         'tle.kcpc.bot.cog',
         CODEFORCES_LINKS,
         'tle.kcpc.platforms.luma',
+        'tle.kcpc.platforms.difficulty',
         CODEFORCES,
         ATCODER,
         f'{ATCODER}.contests',
         f'{ATCODER}.profile',
+        f'{ATCODER}.problems',
+        f'{ATCODER}.editorials',
         ICPC,
         'tle.kcpc.features.admin.cog',
         f'{WORKSHOPS}.sync',
@@ -274,6 +280,17 @@ def test_the_rules_are_checked_on_real_modules() -> None:
         f'{ACCOUNTS}.service',
         f'{ACCOUNTS}.views',
         f'{ACCOUNTS}.cog',
+        f'{PROBLEMS}.settings',
+        f'{PROBLEMS}.repo',
+        f'{PROBLEMS}.topics',
+        f'{PROBLEMS}.rotation',
+        f'{PROBLEMS}.catalog',
+        f'{PROBLEMS}.randomizer',
+        f'{PROBLEMS}.solved',
+        f'{PROBLEMS}.editorials',
+        f'{PROBLEMS}.markdown',
+        f'{PROBLEMS}.weekly',
+        f'{PROBLEMS}.cog',
         f'{NOTIFY}.cog',
         'tle.kcpc.services',
         'tle.kcpc.bootstrap',
@@ -344,12 +361,24 @@ def test_uses_of_tles_user_db_are_found(source: str) -> None:
 
 def test_notify_never_imports_the_features_it_serves() -> None:
     # /notify serves every feature through the settings registry alone, so it
-    # keeps working with kcpc.workshops or kcpc.contests disabled, or failing
-    # to load.
+    # keeps working with kcpc.workshops, kcpc.contests or kcpc.problems
+    # disabled, or failing to load.
     refs = [ref for ref in kcpc_imports() if _under(ref.module, NOTIFY)]
 
     assert refs, 'the notify package has imports to check'
-    assert [str(ref) for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS)] == []
+    served = [ref for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS, PROBLEMS)]
+    assert [str(ref) for ref in served] == []
+
+
+def test_problems_never_imports_accounts() -> None:
+    # /randproblem reads members' AtCoder handles through KcpcServices.handles,
+    # where the accounts cog registers its service, so it keeps working, if
+    # without leaving solved AtCoder problems out, with kcpc.accounts disabled
+    # or failing to load.
+    refs = [ref for ref in kcpc_imports() if _under(ref.module, PROBLEMS)]
+
+    assert refs, 'the problems package has imports to check'
+    assert [str(ref) for ref in refs if _under(ref.target, ACCOUNTS)] == []
 
 
 def test_tles_cogs_import_kcpc_only_lazily() -> None:
@@ -568,9 +597,33 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{ACCOUNTS}.service', 'def f():\n    import tle.util.handle_linking', False),
         (f'{ACCOUNTS}.cog', f'from {CONTESTS}.repo import ContestRepo', False),
         (f'{CONTESTS}.cog', f'from {ACCOUNTS}.directory import linked_accounts', False),
+        # Members' handles reach the problems feature through the bridge to
+        # TLE's handle table and through core's handle registry, never from
+        # the accounts feature itself; the features know nothing of each other.
+        (f'{PROBLEMS}.cog', 'from tle.kcpc.bot import codeforces_links', True),
+        (f'{PROBLEMS}.cog', f'from {HANDLES} import HandleRegistry', True),
+        (f'{PROBLEMS}.cog', f'from {PROBLEMS}.weekly import WeeklyService', True),
+        (f'{PROBLEMS}.cog', f'from {ATCODER}.editorials import ID_RE', True),
+        (f'{PROBLEMS}.catalog', f'from {CODEFORCES} import fetch_problems', True),
+        (f'{PROBLEMS}.solved', f'from {ATCODER} import problems', True),
+        (f'{PROBLEMS}.weekly', 'from tle.kcpc.core.publishing import Publisher', True),
+        (f'{PROBLEMS}.weekly', 'import discord', False),
+        (f'{PROBLEMS}.catalog', 'import discord', False),
+        (f'{PROBLEMS}.repo', 'import discord', False),
+        (f'{PROBLEMS}.cog', f'from {ACCOUNTS}.service import AccountService', False),
+        (f'{PROBLEMS}.cog', f'def f():\n    from {ACCOUNTS} import cog', False),
+        (f'{PROBLEMS}.weekly', f'from {CONTESTS}.repo import ContestRepo', False),
+        (f'{PROBLEMS}.cog', f'from {CONTESTS}.settings import CONTESTS', False),
+        (f'{ACCOUNTS}.cog', f'from {PROBLEMS}.solved import SolvedProblems', False),
+        (f'{CONTESTS}.cog', f'from {PROBLEMS}.settings import WEEKLY', False),
+        (f'{NOTIFY}.cog', f'from {PROBLEMS}.settings import WEEKLY', False),
+        (HANDLES, 'from typing import Protocol', True),
+        (HANDLES, 'import discord', False),
+        (HANDLES, f'from {ACCOUNTS}.service import AccountService', False),
         ('tle.kcpc.services', 'from tle.kcpc.bot.publisher import X', True),
         ('tle.kcpc.bootstrap', 'from tle.kcpc.features.admin import cog', True),
         ('tle.kcpc.bootstrap', f'from {CONTESTS}.settings import SPEC', True),
+        ('tle.kcpc.bootstrap', f'from {PROBLEMS}.settings import SPEC', True),
         ('tle.kcpc.services', 'from tle.util import handle_linking', False),
         (
             'tle.kcpc.bootstrap',

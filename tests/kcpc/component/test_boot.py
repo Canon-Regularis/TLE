@@ -34,6 +34,7 @@ from tle.kcpc.core.errors import MigrationError
 from tle.kcpc.core.scheduler import ScheduledJob, Scheduler
 from tle.kcpc.core.settings import FeatureSettings
 from tle.kcpc.features.contests.settings import ContestSettings
+from tle.kcpc.features.problems.settings import WeeklySettings
 from tle.kcpc.features.workshops.settings import WorkshopSettings
 from tle.kcpc.services import KcpcServices
 
@@ -81,10 +82,16 @@ ACCOUNTS = KcpcExtension(
     'KcpcAccounts',
     ('link', 'unlink', 'profile', 'rank'),
 )
+PROBLEMS = KcpcExtension(
+    'kcpc.problems',
+    'tle.kcpc.features.problems.cog',
+    'KcpcProblems',
+    ('randproblem', 'weekly'),
+)
 NOTIFY = KcpcExtension(
     'kcpc.notify', 'tle.kcpc.features.notify.cog', 'KcpcNotify', ('notify',)
 )
-KCPC = (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, NOTIFY)  # in load order
+KCPC = (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY)  # in load order
 KCPC_BY_NAME = {extension.name: extension for extension in KCPC}
 CORE_JOBS = [bootstrap.RECONCILE_JOB, bootstrap.REMINDERS_JOB]
 
@@ -93,10 +100,10 @@ CORE_JOBS = [bootstrap.RECONCILE_JOB, bootstrap.REMINDERS_JOB]
 class KcpcFeature:
     """What a feature's extension starts besides its top-level commands.
 
-    Its jobs, and if it posts reminders, its reminder source and its admin
-    commands in /kcpc <name> (if kcpc.admin is loaded). A reminder feature's
-    settings are registered by bootstrap, so they decode as their own type
-    whether or not the extension loads.
+    Its jobs, its reminder source if it posts reminders, and its admin
+    commands in /kcpc <name> (if kcpc.admin is loaded). A feature's settings
+    are registered by bootstrap, so they decode as their own type whether or
+    not the extension loads.
     """
 
     extension: KcpcExtension
@@ -133,7 +140,19 @@ ACCOUNTS_FEATURE = KcpcFeature(
     ('accounts.refresh', 'accounts.purge-challenges'),
     admin_commands=frozenset({'unlink'}),
 )
-FEATURES = (WORKSHOPS_FEATURE, CONTESTS_FEATURE, ACCOUNTS_FEATURE)
+# /randproblem and the weekly problem, which posts at its own slots rather
+# than through the reminder engine. Its settings, /kcpc weekly and
+# /notify weekly go by the feature's name, not the extension's.
+PROBLEMS_FEATURE = KcpcFeature(
+    PROBLEMS,
+    'weekly',
+    ('problems.refresh', 'weekly.post'),
+    settings=WeeklySettings,
+    admin_commands=frozenset(
+        {'queue', 'unqueue', 'solution', 'rotation', 'preview', 'post-now'}
+    ),
+)
+FEATURES = (WORKSHOPS_FEATURE, CONTESTS_FEATURE, ACCOUNTS_FEATURE, PROBLEMS_FEATURE)
 FEATURE_BY_EXTENSION = {feature.extension.name: feature for feature in FEATURES}
 
 
@@ -345,14 +364,46 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
             TLE_MODULES - {'tle.cogs.duel', 'tle.cogs.graphs', 'tle.cogs.starboard'},
             KCPC,
         ),
-        ('kcpc.admin', False, TLE_MODULES, (WORKSHOPS, CONTESTS, ACCOUNTS, NOTIFY)),
-        ('kcpc.workshops', False, TLE_MODULES, (ADMIN, CONTESTS, ACCOUNTS, NOTIFY)),
-        ('kcpc.contests', False, TLE_MODULES, (ADMIN, WORKSHOPS, ACCOUNTS, NOTIFY)),
-        ('kcpc.accounts', False, TLE_MODULES, (ADMIN, WORKSHOPS, CONTESTS, NOTIFY)),
-        ('kcpc.notify', False, TLE_MODULES, (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS)),
+        (
+            'kcpc.admin',
+            False,
+            TLE_MODULES,
+            (WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY),
+        ),
+        (
+            'kcpc.workshops',
+            False,
+            TLE_MODULES,
+            (ADMIN, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY),
+        ),
+        (
+            'kcpc.contests',
+            False,
+            TLE_MODULES,
+            (ADMIN, WORKSHOPS, ACCOUNTS, PROBLEMS, NOTIFY),
+        ),
+        (
+            'kcpc.accounts',
+            False,
+            TLE_MODULES,
+            (ADMIN, WORKSHOPS, CONTESTS, PROBLEMS, NOTIFY),
+        ),
+        (
+            'kcpc.problems',
+            False,
+            TLE_MODULES,
+            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, NOTIFY),
+        ),
+        (
+            'kcpc.notify',
+            False,
+            TLE_MODULES,
+            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS),
+        ),
         ('kcpc', False, TLE_MODULES, ()),
         (
-            'kcpc.admin,kcpc.workshops,kcpc.contests,kcpc.accounts,kcpc.notify',
+            'kcpc.admin,kcpc.workshops,kcpc.contests,kcpc.accounts,kcpc.problems,'
+            'kcpc.notify',
             False,
             TLE_MODULES,
             (),
@@ -368,6 +419,7 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
         'kcpc.workshops',
         'kcpc.contests',
         'kcpc.accounts',
+        'kcpc.problems',
         'kcpc.notify',
         'kcpc',
         'every kcpc extension by name',
@@ -529,6 +581,7 @@ async def test_tle_boots_when_kcpc_fails_to_start(
         ('kcpc.workshops', 'its last job cannot be added'),
         ('kcpc.contests', 'its last job cannot be added'),
         ('kcpc.accounts', 'its last job cannot be added'),
+        ('kcpc.problems', 'its last job cannot be added'),
         ('kcpc.notify', 'cog_load raises'),
         ('kcpc.missing', 'package missing'),
     ],
