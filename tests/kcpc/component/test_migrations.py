@@ -1,4 +1,4 @@
-"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 4."""
+"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 5."""
 
 import contextlib
 import sqlite3
@@ -20,6 +20,7 @@ from tle.kcpc.core.migrations import (
 CORE = ALL_MIGRATIONS[0]
 UP_TO_WORKSHOPS = ALL_MIGRATIONS[:2]
 UP_TO_CONTESTS = ALL_MIGRATIONS[:3]
+UP_TO_ACCOUNTS = ALL_MIGRATIONS[:4]
 
 
 async def _create_extra_table(db: Database) -> None:
@@ -61,7 +62,7 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
     path = tmp_path / 'kcpc.db'
     db = await open_database(path)
     try:
-        assert await schema_version(db) == 4
+        assert await schema_version(db) == 5
         assert await table_names(db) == {
             'schema_version',
             'guild_settings',
@@ -75,6 +76,8 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
             'linked_account',
             'link_challenge',
             'account_snapshot',
+            'weekly_problem',
+            'weekly_queue',
         }
         assert await migrate(db, ALL_MIGRATIONS, backup_dir=tmp_path) == []
     finally:
@@ -261,7 +264,7 @@ async def test_a_version_3_database_upgrades_to_version_4(tmp_path: Path) -> Non
     await db.execute(INSERT_CONTEST, ('atcoder', 'abc478', 0, None))
     await db.close()
 
-    db = await open_database(path)
+    db = await open_database(path, UP_TO_ACCOUNTS)
     try:
         assert await schema_version(db) == 4
         rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
@@ -284,6 +287,39 @@ async def test_a_version_3_database_upgrades_to_version_4(tmp_path: Path) -> Non
         )
         assert conn.execute('SELECT external_id FROM contest').fetchall() == [
             ('abc478',)
+        ]
+
+
+async def test_a_version_4_database_upgrades_to_version_5(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, UP_TO_ACCOUNTS)
+    await db.execute(INSERT_LINK, ('1', '10', 'atcoder', 'Amber_Owl'))
+    await db.close()
+
+    db = await open_database(path)
+    try:
+        assert await schema_version(db) == 5
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [
+            (1, 'core'),
+            (2, 'workshops'),
+            (3, 'contests'),
+            (4, 'accounts'),
+            (5, 'problems'),
+        ]
+        assert set(PROBLEM_COLUMNS) <= await table_names(db)
+        assert await db.fetchval('SELECT handle FROM linked_account') == 'Amber_Owl'
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v4.bak'
+    assert tables_in_file(backup).isdisjoint(PROBLEM_COLUMNS)
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            4,
+        )
+        assert conn.execute('SELECT handle FROM linked_account').fetchall() == [
+            ('Amber_Owl',)
         ]
 
 
@@ -650,3 +686,139 @@ async def test_accounts_schema(db: Database) -> None:
         'SELECT rating, max_rating, rank, rated_matches FROM account_snapshot'
     )
     assert tuple(row or ()) == (None, None, None, None)
+
+
+PROBLEM_COLUMNS = {
+    'weekly_problem': [
+        'weekly_id',
+        'guild_id',
+        'slot',
+        'week',
+        'source',
+        'problem_id',
+        'contest_id',
+        'problem_index',
+        'name',
+        'url',
+        'topic',
+        'difficulty',
+        'band',
+        'selection',
+        'date_selected',
+        'solution_url',
+        'solution_set_by',
+        'solution_posted',
+        'solution_posted_at',
+    ],
+    'weekly_queue': [
+        'queue_id',
+        'guild_id',
+        'source',
+        'problem_id',
+        'contest_id',
+        'problem_index',
+        'name',
+        'url',
+        'difficulty',
+        'band',
+        'solution_url',
+        'queued_by',
+        'queued_at',
+    ],
+}
+PROBLEM_NOT_NULL = {
+    'weekly_problem': {
+        'guild_id',
+        'slot',
+        'week',
+        'source',
+        'problem_id',
+        'contest_id',
+        'problem_index',
+        'name',
+        'url',
+        'selection',
+        'date_selected',
+        'solution_posted',
+    },
+    'weekly_queue': {
+        'guild_id',
+        'source',
+        'problem_id',
+        'contest_id',
+        'problem_index',
+        'name',
+        'url',
+        'queued_by',
+        'queued_at',
+    },
+}
+PROBLEM_KEYS = {'weekly_problem': ['weekly_id'], 'weekly_queue': ['queue_id']}
+INSERT_WEEKLY = (
+    'INSERT INTO weekly_problem (weekly_id, guild_id, slot, week, source, '
+    'problem_id, contest_id, problem_index, name, url, selection, date_selected) '
+    "VALUES (NULL, ?, ?, ?, ?, ?, '1520', 'D', 'Same Differences', "
+    "'https://codeforces.com/contest/1520/problem/D', ?, 0)"
+)
+INSERT_QUEUED = (
+    'INSERT INTO weekly_queue (queue_id, guild_id, source, problem_id, '
+    'contest_id, problem_index, name, url, queued_by, queued_at) '
+    "VALUES (NULL, ?, ?, ?, 'abc300', 'D', 'AABCC', "
+    "'https://atcoder.jp/contests/abc300/tasks/abc300_d', '13', 0)"
+)
+
+
+async def test_problems_schema(db: Database) -> None:
+    for table, expected in PROBLEM_COLUMNS.items():
+        columns = await db.fetchall(f'PRAGMA table_info({table})')
+        assert [column['name'] for column in columns] == expected, table
+        not_null = {column['name'] for column in columns if column['notnull']}
+        assert not_null == PROBLEM_NOT_NULL[table], table
+        key = sorted((column['pk'], column['name']) for column in columns)
+        assert [name for pk, name in key if pk] == PROBLEM_KEYS[table], table
+    index = await db.fetchall('PRAGMA index_info(ix_weekly_queue_guild)')
+    assert [row['name'] for row in index] == ['guild_id', 'queue_id']
+    index = await db.fetchall('PRAGMA index_info(ix_weekly_problem_guild_slot)')
+    assert [row['name'] for row in index] == ['guild_id', 'slot']
+
+    # weekly_id is the rowid, so even an explicit NULL gets an id, and only
+    # what the bot may not know is NULL.
+    week, other_week = '2026-10-09', '2026-10-16'
+    await db.execute(INSERT_WEEKLY, ('1', 100, week, 'codeforces', '1520D', 'auto'))
+    row = await db.fetchone(
+        'SELECT weekly_id, topic, difficulty, band, solution_url, solution_set_by, '
+        'solution_posted, solution_posted_at FROM weekly_problem'
+    )
+    assert tuple(row or ()) == (1, None, None, None, None, None, 0, None)
+
+    # A server has one problem a week, whatever its slot, and never the same
+    # one twice.
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_WEEKLY, ('1', 90, week, 'atcoder', 'abc300_d', 'auto'))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(
+            INSERT_WEEKLY, ('1', 200, other_week, 'codeforces', '1520D', 'queued')
+        )
+    await db.execute(INSERT_WEEKLY, ('2', 100, week, 'codeforces', '1520D', 'auto'))
+    await db.execute(
+        INSERT_WEEKLY, ('1', 200, other_week, 'atcoder', '1520D', 'queued')
+    )
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_WEEKLY, ('1', 300, '3', 'leetcode', '1', 'auto'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_WEEKLY, ('1', 300, '3', 'codeforces', '1', 'picked'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute('UPDATE weekly_problem SET solution_posted = 2')
+
+    # A server queues a problem once.
+    await db.execute(INSERT_QUEUED, ('1', 'atcoder', 'abc300_d'))
+    row = await db.fetchone(
+        'SELECT queue_id, difficulty, band, solution_url FROM weekly_queue'
+    )
+    assert tuple(row or ()) == (1, None, None, None)
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_QUEUED, ('1', 'atcoder', 'abc300_d'))
+    await db.execute(INSERT_QUEUED, ('2', 'atcoder', 'abc300_d'))
+    await db.execute(INSERT_QUEUED, ('1', 'codeforces', 'abc300_d'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_QUEUED, ('1', 'leetcode', 'abc300_d'))

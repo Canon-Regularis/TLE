@@ -39,6 +39,11 @@ from tle.kcpc.features.contests.settings import (
     SPEC as CONTESTS_SPEC,
     ContestSettings,
 )
+from tle.kcpc.features.problems.settings import (
+    SPEC as WEEKLY_SPEC,
+    WEEKLY,
+    WeeklySettings,
+)
 from tle.kcpc.features.workshops.settings import (
     SPEC as WORKSHOPS_SPEC,
     WORKSHOPS,
@@ -136,6 +141,7 @@ async def test_build_services_wires_the_services_together(
     assert services.features.keys() == ['algo', 'contests', 'weekly', 'workshops']
     assert services.guild_settings.registry is services.features
     assert services.reminders.features == []  # features register their sources
+    assert services.handles.platforms == []  # so do the features keeping handles
 
     # The settings repository and the ledger both use the services' database.
     await services.guild_settings.update(
@@ -182,6 +188,21 @@ async def test_contest_settings_are_typed_whichever_extensions_load(
 
     assert await services.guild_settings.get(GUILD_ID, CONTESTS) == ContestSettings(
         enabled=True, platforms=('atcoder',), start_posts=True
+    )
+
+
+async def test_weekly_settings_are_typed_whichever_extensions_load(
+    services: KcpcServices,
+) -> None:
+    # As for workshops: typed before the problems extension loads, if it does.
+    assert services.features.get(WEEKLY) is WEEKLY_SPEC
+
+    await services.guild_settings.update(
+        GUILD_ID, WEEKLY, enabled=True, rotation=('codeforces:hard:graphs',)
+    )
+
+    assert await services.guild_settings.get(GUILD_ID, WEEKLY) == WeeklySettings(
+        enabled=True, rotation=('codeforces:hard:graphs',)
     )
 
 

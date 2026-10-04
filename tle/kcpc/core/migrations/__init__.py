@@ -20,6 +20,7 @@ from tle.kcpc.core.migrations import (
     m0002_workshops,
     m0003_contests,
     m0004_accounts,
+    m0005_problems,
 )
 from tle.kcpc.core.migrations.base import Migration
 
@@ -38,6 +39,7 @@ ALL_MIGRATIONS: tuple[Migration, ...] = (
     m0002_workshops.MIGRATION,
     m0003_contests.MIGRATION,
     m0004_accounts.MIGRATION,
+    m0005_problems.MIGRATION,
 )
 
 _CREATE_SCHEMA_VERSION = """
