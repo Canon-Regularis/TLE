@@ -825,6 +825,20 @@ async def test_linked_handles_are_the_guilds_links_on_the_platform(
     assert await service.linked_handles(OTHER_GUILD, ATCODER) == []
 
 
+async def test_linked_handle_is_the_members_link_on_the_platform(
+    service: AccountService, repo: AccountRepo
+) -> None:
+    # What other features read through KcpcServices.handles.
+    await repo.link(atcoder_link('FakeAtCoder', MEMBER))
+    await repo.link(atcoder_link('anotherone', OTHER_MEMBER))
+
+    assert await service.linked_handle(GUILD, MEMBER, ATCODER) == 'FakeAtCoder'
+    assert await service.linked_handle(GUILD, OTHER_MEMBER, ATCODER) == 'anotherone'
+    assert await service.linked_handle(OTHER_GUILD, MEMBER, ATCODER) is None
+    # Codeforces handles are in TLE's table, not kcpc.db.
+    assert await service.linked_handle(GUILD, MEMBER, CODEFORCES) is None
+
+
 def test_only_codeforces_and_atcoder_can_be_linked() -> None:
     assert link_platform(ATCODER).url_for('x_y') == 'https://atcoder.jp/users/x_y'
     with pytest.raises(ValueError, match="cannot be linked on 'leetcode'"):

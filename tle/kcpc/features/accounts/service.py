@@ -426,6 +426,18 @@ class AccountService:
             for platform, handle in accounts
         ]
 
+    async def linked_handle(
+        self, guild_id: int, user_id: int, platform: str
+    ) -> str | None:
+        """The member's handle on ``platform`` as linked in kcpc.db, or None.
+
+        The cog registers the service as the ``HandleSource`` of AtCoder
+        handles (see ``tle.kcpc.core.handles``), which other features read
+        through it. Codeforces handles are in TLE's table instead.
+        """
+        link = await self._repo.get_link(guild_id, user_id, platform)
+        return None if link is None else link.handle
+
     async def linked_handles(
         self, guild_id: int, platform: str
     ) -> list[tuple[int, str]]:

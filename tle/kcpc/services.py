@@ -6,13 +6,14 @@
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tle.config import Settings
 from tle.kcpc.bot.publisher import DiscordPublisher
 from tle.kcpc.core.clock import Clock
 from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import KcpcDisabledError
+from tle.kcpc.core.handles import HandleRegistry
 from tle.kcpc.core.http import HttpClient
 from tle.kcpc.core.ledger import DeliveryLedger
 from tle.kcpc.core.reminders import ReminderEngine
@@ -34,7 +35,9 @@ class KcpcServices:
     sent (see ``tle.kcpc.core.ledger``).
 
     A feature that reminds members of upcoming occurrences registers a source
-    with ``reminders``, which posts through ``publisher`` every minute.
+    with ``reminders``, which posts through ``publisher`` every minute. A
+    feature that keeps members' handles on a platform registers a source with
+    ``handles``, through which the other features read them.
     """
 
     settings: Settings
@@ -47,6 +50,8 @@ class KcpcServices:
     publisher: DiscordPublisher
     reminders: ReminderEngine
     scheduler: Scheduler
+    # Empty until the features that keep handles load.
+    handles: HandleRegistry = field(default_factory=HandleRegistry)
 
     async def shutdown(self) -> None:
         """Stop the jobs, then close the HTTP client, then the database.

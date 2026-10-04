@@ -489,6 +489,8 @@ async def test_loading_adds_the_commands_the_verify_button_and_the_jobs(
         (job.name, job.description, job.persistent)
         for job in services.scheduler.status()
     ] == [(PURGE_JOB, 'every 1h', False), (REFRESH_JOB, 'every 6h', False)]
+    # Other features read members' AtCoder handles through the services.
+    assert services.handles.platforms == ['atcoder']
 
 
 async def test_the_jobs_wait_for_their_slots_when_the_bot_starts(
@@ -539,12 +541,14 @@ async def test_removing_the_cog_undoes_everything_loading_did(
     assert registered_items(bot) == []
     assert set(bot.all_commands) == {'help'}
     assert bot.tree.get_commands() == []
+    assert services.handles.platforms == []
 
     # So the extension can be loaded again.
     again = await load_accounts(bot)
     assert command_named(bot, 'link verify').cog is again
     assert registered_items(bot) == [VerifyLinkButton]
     assert len(services.scheduler.status()) == 2
+    assert services.handles.platforms == ['atcoder']
 
 
 async def test_a_load_that_cannot_add_every_job_is_undone(
@@ -565,6 +569,36 @@ async def test_a_load_that_cannot_add_every_job_is_undone(
         assert [job.name for job in services.scheduler.status()] == [PURGE_JOB]
         assert registered_items(bot) == []
         assert set(bot.all_commands) == {'help'}
+        assert services.handles.platforms == []
+    finally:
+        await bot.close()
+
+
+class OtherHandles:
+    """A handle source that another feature registered for AtCoder."""
+
+    async def linked_handle(
+        self, guild_id: int, user_id: int, platform: str
+    ) -> str | None:
+        return 'Someone_Else'
+
+
+async def test_a_load_whose_handle_source_is_refused_changes_nothing(
+    services: KcpcServices, user_db: UserDbConn, atcoder: FakeAtCoder
+) -> None:
+    services.handles.register('atcoder', OtherHandles())
+    bot = await make_bot(services, user_db)
+    try:
+        with pytest.raises(ValueError, match="for 'atcoder' is already registered"):
+            await load_accounts(bot)
+
+        assert bot.get_cog('KcpcAccounts') is None
+        assert services.scheduler.status() == []
+        assert registered_items(bot) == []
+        assert set(bot.all_commands) == {'help'}
+        # The other source stays.
+        handle = await services.handles.linked_handle(GUILD, MEMBER, 'atcoder')
+        assert handle == 'Someone_Else'
     finally:
         await bot.close()
 
@@ -1030,6 +1064,35 @@ async def test_verify_codeforces_links_the_handle_for_tle_too(
     assert await repo.snapshot('codeforces', 'FakeCoder') == AccountSnapshot(
         'codeforces', 'FakeCoder', 1700, 1800, 'expert', None, NOW
     )
+
+
+async def test_other_features_read_a_verified_atcoder_handle_until_it_is_unlinked(
+    bot: KcpcBot,
+    ctx: MagicMock,
+    server: Server,
+    member: MagicMock,
+    services: KcpcServices,
+    user_db: UserDbConn,
+    atcoder: FakeAtCoder,
+) -> None:
+    handles = services.handles
+    atcoder.add('FakeAtCoder')
+    await start_linking(bot, server, member, 'atcoder', 'fakeatcoder')
+    atcoder.add('FakeAtCoder', affiliation=f'KCPC {TOKEN}')
+    assert await handles.linked_handle(GUILD, MEMBER, 'atcoder') is None
+
+    await run(bot, 'link verify', ctx, 'atcoder')
+
+    # In AtCoder's case, whatever case the member typed.
+    assert await handles.linked_handle(GUILD, MEMBER, 'atcoder') == 'FakeAtCoder'
+    assert await handles.linked_handle(OTHER_GUILD, MEMBER, 'atcoder') is None
+    # Codeforces handles are TLE's, which features read through the bridge.
+    await user_db.set_handle(MEMBER, GUILD, 'FakeCoder')
+    assert await handles.linked_handle(GUILD, MEMBER, 'codeforces') is None
+
+    await run(bot, 'unlink', make_ctx(server, member), 'atcoder')
+
+    assert await handles.linked_handle(GUILD, MEMBER, 'atcoder') is None
 
 
 async def test_verify_with_the_token_missing_links_nothing(

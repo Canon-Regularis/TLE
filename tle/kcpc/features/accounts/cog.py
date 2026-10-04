@@ -8,6 +8,9 @@
   ``;handle set``, through ``tle.kcpc.bot.codeforces_links``. TLE's commands
   share them, so moderators unlink them, with ``/handle remove``. AtCoder
   accounts are linked in kcpc.db, and ``/unlink atcoder`` unlinks them.
+- While the cog is loaded, other features read members' AtCoder handles
+  through ``KcpcServices.handles`` (see ``tle.kcpc.core.handles``), where the
+  cog registers its service.
 - Links stay when members leave the server, for if they come back, but
   whoever proves an AtCoder account that a member who left had linked takes
   the link over (see ``_is_member`` for who has left). A Codeforces handle
@@ -150,9 +153,11 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         atcoder = AtCoderProfileClient(services.http)
         self._service = AccountService(repo, atcoder, services.clock)
         self._refresher = RatingRefresher(repo, atcoder, services.clock)
-        self.bot.add_dynamic_items(VerifyLinkButton)
+        # Other features read members' AtCoder handles from the service.
+        services.handles.register(ATCODER, self._service)
         added: list[str] = []
         try:
+            self.bot.add_dynamic_items(VerifyLinkButton)
             if not attach_admin_group(self.bot, self.accounts_admin):
                 withhold_admin_group(self, self.accounts_admin)
             for job in self._jobs():
@@ -161,17 +166,23 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         except BaseException:
             for name in added:
                 await services.scheduler.remove(name)
-            # Detaching a group that isn't attached does nothing.
+            # Detaching a group that isn't attached does nothing, nor does
+            # removing an item that wasn't added.
             detach_admin_group(self.bot, self.accounts_admin)
             self.bot.remove_dynamic_items(VerifyLinkButton)
+            services.handles.unregister(ATCODER)
             raise
 
     async def cog_unload(self) -> None:
-        """Stop the jobs, take the admin commands away, and stop answering Verify."""
+        """Stop the jobs, take the admin commands away, and stop answering Verify.
+
+        Other features stop getting members' AtCoder handles too.
+        """
         for name in (REFRESH_JOB, PURGE_JOB):
             await self.services.scheduler.remove(name)
         detach_admin_group(self.bot, self.accounts_admin)
         self.bot.remove_dynamic_items(VerifyLinkButton)
+        self.services.handles.unregister(ATCODER)
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
