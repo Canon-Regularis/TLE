@@ -1,4 +1,4 @@
-"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 5."""
+"""Tests for the kcpc.db migrations and the schemas of migrations 1 to 7."""
 
 import contextlib
 import sqlite3
@@ -21,6 +21,8 @@ CORE = ALL_MIGRATIONS[0]
 UP_TO_WORKSHOPS = ALL_MIGRATIONS[:2]
 UP_TO_CONTESTS = ALL_MIGRATIONS[:3]
 UP_TO_ACCOUNTS = ALL_MIGRATIONS[:4]
+UP_TO_PROBLEMS = ALL_MIGRATIONS[:5]
+UP_TO_ALGO = ALL_MIGRATIONS[:6]
 
 
 async def _create_extra_table(db: Database) -> None:
@@ -62,7 +64,7 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
     path = tmp_path / 'kcpc.db'
     db = await open_database(path)
     try:
-        assert await schema_version(db) == 5
+        assert await schema_version(db) == 7
         assert await table_names(db) == {
             'schema_version',
             'guild_settings',
@@ -78,6 +80,10 @@ async def test_fresh_file_database_is_migrated_to_the_latest_version(
             'account_snapshot',
             'weekly_problem',
             'weekly_queue',
+            'algo_pick',
+            'contest_result',
+            'contest_result_entry',
+            'contest_result_start',
         }
         assert await migrate(db, ALL_MIGRATIONS, backup_dir=tmp_path) == []
     finally:
@@ -296,7 +302,7 @@ async def test_a_version_4_database_upgrades_to_version_5(tmp_path: Path) -> Non
     await db.execute(INSERT_LINK, ('1', '10', 'atcoder', 'Amber_Owl'))
     await db.close()
 
-    db = await open_database(path)
+    db = await open_database(path, UP_TO_PROBLEMS)
     try:
         assert await schema_version(db) == 5
         rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
@@ -320,6 +326,75 @@ async def test_a_version_4_database_upgrades_to_version_5(tmp_path: Path) -> Non
         )
         assert conn.execute('SELECT handle FROM linked_account').fetchall() == [
             ('Amber_Owl',)
+        ]
+
+
+async def test_a_version_5_database_upgrades_to_version_6(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, UP_TO_PROBLEMS)
+    await db.execute(INSERT_QUEUED, ('1', 'atcoder', 'abc300_d'))
+    await db.close()
+
+    db = await open_database(path, UP_TO_ALGO)
+    try:
+        assert await schema_version(db) == 6
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [
+            (1, 'core'),
+            (2, 'workshops'),
+            (3, 'contests'),
+            (4, 'accounts'),
+            (5, 'problems'),
+            (6, 'algo'),
+        ]
+        assert 'algo_pick' in await table_names(db)
+        assert await db.fetchval('SELECT problem_id FROM weekly_queue') == 'abc300_d'
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v5.bak'
+    assert 'algo_pick' not in tables_in_file(backup)
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            5,
+        )
+        assert conn.execute('SELECT problem_id FROM weekly_queue').fetchall() == [
+            ('abc300_d',)
+        ]
+
+
+async def test_a_version_6_database_upgrades_to_version_7(tmp_path: Path) -> None:
+    path = tmp_path / 'kcpc.db'
+    db = await open_database(path, UP_TO_ALGO)
+    await db.execute(INSERT_PICK, ('1', '2026-10', 'segment-tree'))
+    await db.close()
+
+    db = await open_database(path)
+    try:
+        assert await schema_version(db) == 7
+        rows = await db.fetchall('SELECT version, name FROM schema_version ORDER BY 1')
+        assert [tuple(row) for row in rows] == [
+            (1, 'core'),
+            (2, 'workshops'),
+            (3, 'contests'),
+            (4, 'accounts'),
+            (5, 'problems'),
+            (6, 'algo'),
+            (7, 'contest_results'),
+        ]
+        assert set(RESULT_COLUMNS) <= await table_names(db)
+        assert await db.fetchval('SELECT slug FROM algo_pick') == 'segment-tree'
+    finally:
+        await db.close()
+
+    backup = tmp_path / 'kcpc.db.v6.bak'
+    assert tables_in_file(backup).isdisjoint(RESULT_COLUMNS)
+    with contextlib.closing(sqlite3.connect(backup)) as conn:
+        assert conn.execute('SELECT MAX(version) FROM schema_version').fetchone() == (
+            6,
+        )
+        assert conn.execute('SELECT slug FROM algo_pick').fetchall() == [
+            ('segment-tree',)
         ]
 
 
@@ -822,3 +897,158 @@ async def test_problems_schema(db: Database) -> None:
     await db.execute(INSERT_QUEUED, ('1', 'codeforces', 'abc300_d'))
     with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
         await db.execute(INSERT_QUEUED, ('1', 'leetcode', 'abc300_d'))
+
+
+ALGO_COLUMNS = ['guild_id', 'month', 'slot', 'slug', 'revision', 'picked_at']
+INSERT_PICK = (
+    'INSERT INTO algo_pick (guild_id, month, slot, slug, picked_at) '
+    'VALUES (?, ?, 100, ?, 100)'
+)
+INSERT_REVISION = (
+    'INSERT INTO algo_pick (guild_id, month, slot, slug, revision, picked_at) '
+    'VALUES (?, ?, 100, ?, ?, 100)'
+)
+
+
+async def test_algo_schema(db: Database) -> None:
+    columns = await db.fetchall('PRAGMA table_info(algo_pick)')
+    assert [column['name'] for column in columns] == ALGO_COLUMNS
+    assert {column['name'] for column in columns if column['notnull']} == set(
+        ALGO_COLUMNS
+    )
+    key = sorted((column['pk'], column['name']) for column in columns)
+    assert [name for pk, name in key if pk] == ['guild_id', 'month', 'revision']
+
+    # A pick starts at revision 0.
+    await db.execute(INSERT_PICK, ('1', '2026-10', 'segment-tree'))
+    assert await db.fetchval('SELECT revision FROM algo_pick') == 0
+
+    # A server's month has a row for each revision of its topic, and the
+    # server may have a topic again in another month, as another server may
+    # in the same one.
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_PICK, ('1', '2026-10', 'trie'))
+    await db.execute(INSERT_REVISION, ('1', '2026-10', 'trie', 1))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_REVISION, ('1', '2026-10', 'knapsack', 1))
+    await db.execute(INSERT_PICK, ('1', '2026-11', 'segment-tree'))
+    await db.execute(INSERT_PICK, ('2', '2026-10', 'segment-tree'))
+    with pytest.raises(sqlite3.IntegrityError, match='NOT NULL'):
+        await db.execute(INSERT_PICK, ('1', '2026-12', None))
+
+
+RESULT_COLUMNS = {
+    'contest_result': [
+        'platform',
+        'external_id',
+        'name',
+        'url',
+        'end_time',
+        'status',
+        'checks',
+        'next_check',
+        'found_at',
+        'outcome',
+        'updated_at',
+    ],
+    'contest_result_entry': [
+        'platform',
+        'external_id',
+        'handle',
+        'old_rating',
+        'new_rating',
+        'place',
+        'old_matches',
+        'new_matches',
+        'old_highest',
+        'noted_at',
+        'changed_at',
+    ],
+    'contest_result_start': ['id', 'started_at'],
+}
+RESULT_NOT_NULL = {
+    'contest_result': {
+        'platform',
+        'external_id',
+        'name',
+        'end_time',
+        'status',
+        'checks',
+        'updated_at',
+    },
+    'contest_result_entry': {'platform', 'external_id', 'handle', 'noted_at'},
+    'contest_result_start': {'id', 'started_at'},
+}
+RESULT_KEYS = {
+    'contest_result': ['platform', 'external_id'],
+    'contest_result_entry': ['platform', 'external_id', 'handle'],
+    'contest_result_start': ['id'],
+}
+INSERT_RESULT = (
+    'INSERT INTO contest_result (platform, external_id, name, end_time, status, '
+    'outcome, updated_at) VALUES (?, ?, ?, 100, ?, ?, 100)'
+)
+INSERT_RESULT_ENTRY = (
+    'INSERT INTO contest_result_entry (platform, external_id, handle, noted_at) '
+    'VALUES (?, ?, ?, 100)'
+)
+INSERT_START = 'INSERT INTO contest_result_start (id, started_at) VALUES (?, ?)'
+
+
+async def test_contest_results_schema(db: Database) -> None:
+    for table, expected in RESULT_COLUMNS.items():
+        columns = await db.fetchall(f'PRAGMA table_info({table})')
+        assert [column['name'] for column in columns] == expected, table
+        not_null = {column['name'] for column in columns if column['notnull']}
+        assert not_null == RESULT_NOT_NULL[table], table
+        key = sorted((column['pk'], column['name']) for column in columns)
+        assert [name for pk, name in key if pk] == RESULT_KEYS[table], table
+    index = await db.fetchall('PRAGMA index_info(ix_contest_result_due)')
+    assert [row['name'] for row in index] == ['status', 'next_check']
+    references = await db.fetchall('PRAGMA foreign_key_list(contest_result_entry)')
+    assert [(row['table'], row['from'], row['to']) for row in references] == [
+        ('contest_result', 'platform', 'platform'),
+        ('contest_result', 'external_id', 'external_id'),
+    ]
+
+    # A contest starts with no checks, and only what the bot may not know is
+    # NULL.
+    await db.execute(INSERT_RESULT, ('atcoder', 'abc478', 'ABC 478', 'watching', None))
+    row = await db.fetchone(
+        'SELECT url, checks, next_check, found_at, outcome FROM contest_result'
+    )
+    assert tuple(row or ()) == (None, 0, None, None, None)
+
+    # A contest is stored once, from a platform and in a state the bot knows.
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_RESULT, ('atcoder', 'abc478', 'ABC', 'done', 'posted'))
+    await db.execute(INSERT_RESULT, ('codeforces', 'abc478', 'Round', 'done', 'nobody'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_RESULT, ('leetcode', '1', 'Weekly', 'done', 'posted'))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_RESULT, ('atcoder', 'abc479', 'ABC', 'waiting', None))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_RESULT, ('atcoder', 'abc479', 'ABC', 'done', 'lost'))
+
+    # An entry belongs to a stored contest, and a handle has one per contest,
+    # whatever its case.
+    await db.execute(INSERT_RESULT_ENTRY, ('atcoder', 'abc478', 'Amber_Owl'))
+    row = await db.fetchone(
+        'SELECT old_rating, new_rating, place, old_matches, new_matches, '
+        'old_highest, changed_at FROM contest_result_entry'
+    )
+    assert tuple(row or ()) == (None,) * 7
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_RESULT_ENTRY, ('atcoder', 'abc478', 'amber_owl'))
+    await db.execute(INSERT_RESULT_ENTRY, ('codeforces', 'abc478', 'Amber_Owl'))
+    with pytest.raises(sqlite3.IntegrityError, match='FOREIGN KEY'):
+        await db.execute(INSERT_RESULT_ENTRY, ('atcoder', 'abc479', 'Amber_Owl'))
+
+    # Contest results start once per install: one row, and no other.
+    with pytest.raises(sqlite3.IntegrityError, match='NOT NULL'):
+        await db.execute(INSERT_START, (1, None))
+    await db.execute(INSERT_START, (1, 100))
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        await db.execute(INSERT_START, (1, 200))
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        await db.execute(INSERT_START, (2, 200))
