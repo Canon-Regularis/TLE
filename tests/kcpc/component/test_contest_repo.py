@@ -899,6 +899,8 @@ class TestContestSettings:
             'manual',
         )
         assert (settings.reminder_minutes, settings.start_posts) == ((60,), False)
+        # Results don't ping anyone, and come only when members took part.
+        assert settings.results_posts
         assert SPEC == FeatureSpec(
             CONTESTS,
             'Contests',
@@ -927,10 +929,14 @@ class TestContestSettings:
             platforms=('atcoder', 'icpc'),
             reminder_minutes=(30, 10),
             start_posts=True,
+            results_posts=False,
         )
 
         assert await guild_settings.get_typed(
             1234, CONTESTS, ContestSettings
         ) == ContestSettings(
-            platforms=('atcoder', 'icpc'), reminder_minutes=(30, 10), start_posts=True
+            platforms=('atcoder', 'icpc'),
+            reminder_minutes=(30, 10),
+            start_posts=True,
+            results_posts=False,
         )
