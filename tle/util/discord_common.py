@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands
 
 from tle import constants
-from tle.util import codeforces_api as cf, db, tasks
+from tle.util import codeforces_api as cf, db
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,12 @@ async def bot_error_handler(ctx: commands.Context, exception: Exception) -> None
         await ctx.send(embed=embed_alert('Sorry, this command is temporarily disabled'))
     elif isinstance(exception, (cf.CodeforcesApiError, commands.UserInputError)):
         await ctx.send(embed=embed_alert(exception))
+    elif isinstance(exception, commands.CommandNotFound):
+        logger.debug('Ignoring unknown command %r', ctx.invoked_with)
+    elif isinstance(exception, commands.CheckFailure):
+        # MissingRole, MissingPermissions and the like say what is missing.
+        message = str(exception) or "You can't use this command here."
+        await ctx.send(embed=embed_alert(message), ephemeral=True)
     else:
         msg = 'Ignoring exception in command {}:'.format(ctx.command)
         exc_info = type(exception), exception, exception.__traceback__
@@ -132,6 +138,11 @@ def once(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 async def presence(bot: Any) -> None:
+    # Imported here: at module level, importing this module before
+    # codeforces_common fails on the import cycle tasks -> codeforces_common
+    # -> cache -> tasks.
+    from tle.util import tasks
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening, name='your commands'

@@ -1,0 +1,3 @@
+# AtCoder Problems' files are kept with LF line endings: keep them on every
+# checkout, so that the tests read them as kenkoooo.com sends them.
+*.json text eol=lf

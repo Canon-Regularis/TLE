@@ -17,9 +17,9 @@ from tle.util import (
     ansi,
     codeforces_api as cf,
     codeforces_common as cf_common,
-    db,
     discord_common,
     events,
+    handle_linking,
     oauth,
     paginator,
     table,
@@ -241,6 +241,11 @@ def _make_pages(
     return pages
 
 
+def _linked_handle_line(platform: str, handle: str, url: str) -> str:
+    """'**Platform:** handle', the handle linked to its profile."""
+    return f'**{platform}:** [{discord.utils.escape_markdown(handle)}]({url})'
+
+
 class Handles(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot: commands.Bot = bot
@@ -323,74 +328,87 @@ class Handles(commands.Cog):
         )
         self.logger.info(f'All guilds updated for contest {contest.id}.')
 
-    @commands.hybrid_group(
-        brief='Commands that have to do with handles', fallback='show'
-    )
-    async def handle(self, ctx: commands.Context) -> None:
-        """Change or collect information about specific handles on Codeforces"""
-        await ctx.send_help(ctx.command)
+    @commands.hybrid_group(brief='Commands that have to do with handles')
+    async def handle(
+        self, ctx: commands.Context, member: discord.Member | None = None
+    ) -> None:
+        """Change or collect information about specific handles on Codeforces
+
+        On its own, it shows the handles a member has linked: yours, if you
+        name no one.
+        """
+        await self._show_handles(ctx, member)
+
+    # /handle show and ;handle show are one hybrid subcommand, which Discord's
+    # picker describes with its own brief. A group fallback would get the
+    # group's brief instead, and couldn't sit beside a prefix-only show: as
+    # discord.py makes the cog, it re-adds each subcommand to its group, first
+    # removing the slash command of that name, which would drop the fallback.
+    @handle.command(name='show', brief="Show a member's linked handles")
+    @discord.app_commands.describe(member='Whose handles to show; yours if left out')
+    async def show(
+        self, ctx: commands.Context, member: discord.Member | None = None
+    ) -> None:
+        """Show the handles a member has linked: yours, if you name no one.
+
+        That is their Codeforces handle, and the accounts they linked with
+        /link, such as AtCoder.
+        """
+        await self._show_handles(ctx, member)
+
+    async def _show_handles(
+        self, ctx: commands.Context, member: discord.Member | None
+    ) -> None:
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        member = member or ctx.author
+        lines = []
+        handle = await self.bot.user_db.get_handle(member.id, ctx.guild.id)
+        if handle:
+            url = f'{cf.PROFILE_BASE_URL}{handle}'
+            lines.append(_linked_handle_line('Codeforces', handle, url))
+        lines += await self._kcpc_handle_lines(ctx.guild.id, member)
+        if not lines:
+            raise HandleCogError(f'{member.mention} has not linked any handles.')
+        embed = discord_common.embed_neutral('\n'.join(lines))
+        name = discord.utils.escape_markdown(member.display_name)
+        embed.title = f'Handles of {name}'
+        await ctx.send(embed=embed)
+
+    async def _kcpc_handle_lines(
+        self, guild_id: int, member: discord.Member
+    ) -> list[str]:
+        """The accounts the member linked with KCPC's /link, if KCPC is running."""
+        kcpc = getattr(self.bot, 'kcpc', None)
+        if kcpc is None:
+            return []
+        try:
+            # Imported here, as KCPC is optional: a KCPC module that fails to
+            # import must not stop this cog from loading.
+            from tle.kcpc.features.accounts import directory
+
+            accounts = await directory.linked_accounts(kcpc, guild_id, member.id)
+            return [
+                _linked_handle_line(
+                    directory.platform_name(platform),
+                    linked,
+                    directory.profile_url(platform, linked),
+                )
+                for platform, linked in accounts
+            ]
+        except Exception:
+            # The member's Codeforces handle is still worth showing.
+            self.logger.exception(f'Could not list the KCPC accounts of {member}')
+            return []
 
     async def maybe_add_trusted_role(self, member: discord.Member) -> None:
         """Add trusted role for eligible users.
 
-        Condition: `member` has been 1900+ for any amount of time before o1 release.
+        See `handle_linking.maybe_add_trusted_role`.
         """
-        handle = await self.bot.user_db.get_handle(member.id, member.guild.id)
-        if not handle:
-            self.logger.warning(
-                'WARN: handle not found in guild'
-                f' {member.guild.name} ({member.guild.id})'
-            )
-            return
-        trusted_role = discord.utils.get(member.guild.roles, name=constants.TLE_TRUSTED)
-        if not trusted_role:
-            self.logger.warning(
-                "WARN: 'Trusted' role not found in guild"
-                f' {member.guild.name} ({member.guild.id})'
-            )
-            return
-
-        if trusted_role not in member.roles:
-            # o1 released sept 12 2024
-            cutoff_timestamp = dt.datetime(
-                2024, 9, 11, tzinfo=dt.timezone.utc
-            ).timestamp()
-            try:
-                rating_changes = await cf.user.rating(handle=handle)
-            except cf.HandleNotFoundError:
-                # User rating info not found via API, ignore for trusted check
-                self.logger.info(
-                    'INFO: Rating history not found for'
-                    f' handle {handle} during trusted check.'
-                )
-                return
-            except cf.CodeforcesApiError as e:
-                # Log API errors appropriately in a real scenario
-                self.logger.warning(
-                    f'WARN: API Error fetching rating for {handle}'
-                    f' during trusted check: {e}'
-                )
-                return
-
-            if any(
-                change.newRating >= 1900
-                and change.ratingUpdateTimeSeconds < cutoff_timestamp
-                for change in rating_changes
-            ):
-                try:
-                    await member.add_roles(
-                        trusted_role, reason='Historical rating >= 1900 before Aug 2024'
-                    )
-                except discord.Forbidden:
-                    self.logger.warning(
-                        f'WARN: Missing permissions to add Trusted role to'
-                        f' {member.display_name} in {member.guild.name}'
-                    )
-                except discord.HTTPException as e:
-                    self.logger.warning(
-                        f'WARN: Failed to add Trusted role to'
-                        f' {member.display_name} in {member.guild.name}: {e}'
-                    )
+        await handle_linking.maybe_add_trusted_role(
+            member, user_db=self.bot.user_db, log=self.logger
+        )
 
     async def update_member_rank_role(
         self,
@@ -401,28 +419,15 @@ class Handles(commands.Cog):
     ) -> None:
         """Sets the `member` to only have the rank role of `role_to_assign`.
 
-        All other rank roles on the member, if any, will be removed. If
-        `role_to_assign` is None all existing rank roles on the member will be
-        removed.
+        See `handle_linking.update_member_rank_role`.
         """
-        role_names_to_remove = {rank.title for rank in cf.RATED_RANKS}
-        should_remove_purgatory = False
-        if role_to_assign is not None:
-            role_names_to_remove.discard(role_to_assign.name)
-            if role_to_assign.name not in ['Newbie', 'Pupil', 'Specialist', 'Expert']:
-                should_remove_purgatory = True
-                await self.maybe_add_trusted_role(member)
-        to_remove = [role for role in member.roles if role.name in role_names_to_remove]
-        if should_remove_purgatory and discord_common.has_role(
-            member, constants.TLE_PURGATORY
-        ):
-            purg_role = discord_common.get_role(member.guild, constants.TLE_PURGATORY)
-            if purg_role:
-                to_remove.append(purg_role)
-        if to_remove:
-            await member.remove_roles(*to_remove, reason=reason)
-        if role_to_assign is not None and role_to_assign not in member.roles:
-            await member.add_roles(role_to_assign, reason=reason)
+        await handle_linking.update_member_rank_role(
+            member,
+            role_to_assign,
+            reason=reason,
+            user_db=self.bot.user_db,
+            log=self.logger,
+        )
 
     @handle.command(brief='Set Codeforces handle of a user', aliases=['link'])
     @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
@@ -439,28 +444,15 @@ class Handles(commands.Cog):
     async def _set_from_oauth(
         self, guild: discord.Guild, member: discord.Member, user: cf.User
     ) -> None:
-        handle = user.handle
+        """Link `member` to `user`; see `handle_linking.link_handle`."""
         try:
-            await self.bot.user_db.set_handle(member.id, guild.id, handle)
-        except db.UniqueConstraintFailed:
-            raise HandleCogError(
-                f'When setting handle for {member}: '
-                f'The handle `{handle}` is already associated with another user.'
+            await handle_linking.link_handle(
+                self.bot.user_db, guild, member, user, log=self.logger
             )
-        await self.bot.user_db.cache_cf_user(user)
-
-        if user.rank == cf.UNRATED_RANK:
-            role_to_assign = None
-        else:
-            roles = [role for role in guild.roles if role.name == user.rank.title]
-            if not roles:
-                raise HandleCogError(
-                    f'Role for rank `{user.rank.title}` not present in the server'
-                )
-            role_to_assign = roles[0]
-        await self.update_member_rank_role(
-            member, role_to_assign, reason='New handle set for user'
-        )
+        except handle_linking.HandleTakenError as e:
+            raise HandleCogError(f'When setting handle for {member}: {e}')
+        except handle_linking.HandleLinkError as e:
+            raise HandleCogError(str(e))
 
     async def _set(
         self, ctx: commands.Context, member: discord.Member, user: cf.User
@@ -559,9 +551,11 @@ class Handles(commands.Cog):
 
         await self.bot.user_db.remove_handle(handle, ctx.guild.id)
         member = ctx.guild.get_member(user_id)
-        await self.update_member_rank_role(
-            member, role_to_assign=None, reason='Handle unlinked'
-        )
+        # A member who left the server (TLE keeps their handle) has no roles here.
+        if member is not None:
+            await self.update_member_rank_role(
+                member, role_to_assign=None, reason='Handle unlinked'
+            )
         embed = discord_common.embed_success(f'Removed {handle} from database')
         await ctx.send(embed=embed)
 

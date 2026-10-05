@@ -24,6 +24,7 @@ Discord Gateway
        +--- bot.event_sys        (EventSystem)
        +--- bot.oauth_server     (OAuthServer, optional)
        +--- bot.oauth_state_store (OAuthStateStore, optional)
+       +--- bot.kcpc             (KcpcServices, see §10)
        |
        v
 +------------------+     +-------------------+
@@ -58,6 +59,7 @@ TLE/
 │   ├── __init__.py
 │   ├── __main__.py              # Entry point: bot setup, cog loading, initialization
 │   ├── constants.py             # Paths, role names, env config, feature flags, OAuth config
+│   ├── kcpc/                    # KCPC club features (see §10)
 │   ├── cogs/                    # Discord command modules (Cog pattern)
 │   │   ├── cache_control.py     # Admin cache management commands
 │   │   ├── codeforces.py        # Problem recommendations, gitgud, upsolve, mashup
@@ -75,6 +77,7 @@ TLE/
 │       ├── discord_common.py    # Embed helpers, error handler, presence system
 │       ├── events.py            # Pub/sub event system for inter-component communication
 │       ├── graph_common.py      # matplotlib setup, BytesIO plotting, rating backgrounds
+│       ├── handle_linking.py    # Links handles: TLE's table, rank roles, Purgatory/Trusted (;handle set, OAuth, /link)
 │       ├── handledict.py        # Case-insensitive handle dictionary
 │       ├── oauth.py             # Codeforces OAuth (OIDC) state store, token handling, callback server
 │       ├── paginator.py         # Discord message pagination with reactions
@@ -272,7 +275,7 @@ User runs ;handle identify
   -> OAuthServer exchanges code for ID token at CF token endpoint
   -> Decodes ID token (HS256) -> extracts handle
   -> Fetches full CF user info via cf.user.info()
-  -> Calls handles_cog._set_from_oauth(guild, member, user)
+  -> Calls handle_linking.link_handle(bot.user_db, guild, member, user), which finds the rank role before writing anything
   -> Sends confirmation embed to Discord channel
   -> Returns success HTML to browser
 ```
@@ -290,6 +293,40 @@ Generates matplotlib/seaborn plots as Discord file attachments:
 - Speed analysis
 
 Plots are rendered to in-memory `BytesIO` buffers (not temp files on disk) and sent as Discord `File` attachments. Cairo/Pango is used for advanced text rendering (handle lists with rating colors). CJK fonts are installed as system packages in the Docker image (`fonts-noto-cjk`).
+
+### 10. KCPC Club Features (`tle/kcpc/`)
+
+The KCPC club's own features live in `tle/kcpc/`, apart from TLE's code. They load as extensions named `kcpc.<feature>` (`KCPC_EXTENSIONS` in `tle/extensions.py`), which `DISABLED_EXTENSIONS` switches off one by one, or all at once with `kcpc`. In `setup_hook`, after `cf_common.initialize()`, the bot builds KCPC's services with `tle.kcpc.bootstrap.build_services()`, attaches them as `bot.kcpc`, and then loads the extensions. A KCPC extension that fails to load is logged and left out, and the bot carries on without it; with `--nodb`, or if the services can't start, none loads.
+
+**Layers.** The package is layered, lowest first (`tle/kcpc/__init__.py` has the overview), and each layer imports only from the layers below it:
+- `core/`: infrastructure without Discord: an injectable clock (tests drive a `FakeClock`), schedules and the job scheduler, the database and its migrations, the delivery ledger, the reminder engine, per-server settings, the paced HTTP client, and the registry through which features read members' linked handles
+- `bot/`: the Discord toolkit that KCPC cogs share: the base cog `KcpcCog` (error replies, `self.services`), checks, embeds, views, pages, the plumbing that attaches each feature's admin commands under `/kcpc`, and `DiscordPublisher`. `bot/codeforces_links.py` is KCPC's only way to TLE's user database and handle linking, for members' Codeforces handles
+- `platforms/`: adapters for external sites: Luma, AtCoder (contests, profiles, editorials, AtCoder Problems), icpc.global, clist.by, and Codeforces through TLE's own client and caches
+- `features/`: one package per feature, a thin `cog.py` (and `views.py`) over services and repositories without Discord. Features never import each other
+
+`tests/kcpc/unit/test_architecture.py` enforces these rules by parsing every import in `tle/kcpc`, deferred ones included. It also checks that only `bot/codeforces_links.py` reaches TLE's user database, and only the contests feature TLE's event system.
+
+**Services.** `KcpcServices` (`services.py`) is one typed container: the settings, clock, database, HTTP client, feature registry and per-server settings, delivery ledger, publisher, reminder engine, scheduler and handle registry. On shutdown it stops the scheduler, then closes the HTTP client, then the database.
+
+**kcpc.db.** KCPC keeps its data in a database of its own, `data/db/kcpc.db` (`KCPC_DB_PATH`). `core/db.py` wraps one aiosqlite connection: every statement takes one lock, a transaction belongs to the task that opened it, and the database runs in WAL mode with `synchronous = FULL` and foreign keys on. Numbered migrations build its schema (`core/migrations/m0001_core.py` to `m0007_contest_results.py`), each in one transaction recorded in `schema_version`. The file is backed up as `kcpc.db.v<N>.bak` before an upgrade, and a database newer than the code is refused.
+
+**Scheduler.** `core/scheduler.py` runs each `ScheduledJob` at the slots of its schedule (`Every`, `Weekly`, `Monthly`), in a task of its own, once the bot is ready. A persistent job records its last slot in `job_state`: a fresh install skips its first slot, a restart catches up the latest missed slot within the job's grace, and a failed slot is retried. A non-persistent job, such as a sync, keeps its state in memory. An unexpected error is logged, and the job carries on. `/kcpc status` lists the jobs.
+
+**At-most-once posts.** Every automatic post goes through `services.publisher`, outside any database transaction, as an `OutgoingMessage` with one or more `Delivery` keys (one reminder in one server, say). The publisher checks that the feature is on and has a channel it can post in, claims the keys in `delivery_log` (`core/ledger.py`) in a transaction committed before it sends, then sends the post and confirms the claim. A key already in the ledger is never posted again. The `kcpc.reconcile` job settles every 2 minutes the claims whose send timed out or was cut short: it looks for the post in its channel, by the ref marker in its footer, and confirms it, sends it again or gives it up. A channel that is missing or lacks permissions is reported to the log channel, at most once a day.
+
+**Reminder engine.** `core/reminders.py` reminds members of upcoming occurrences for every feature that registers a `ReminderSource`: its occurrences in a time window, its policy from the server's settings (reminder offsets, a post at the start) and the look of each post. The `kcpc.reminders` job plans every server's posts each minute: the reminders that are due, with one post for occurrences that start together, and notices when one that members were told about moves, is cancelled or is back on.
+
+**Features** (in `features/`):
+
+| Extension | What it does | Jobs |
+|-----------|--------------|------|
+| `kcpc.admin` | `/kcpc`: each server's feature settings (on/off, channel, ping role) and `/kcpc status`; the group that features attach their admin commands to | |
+| `kcpc.workshops` | Reminders of the club's Luma workshops, `/event` | `workshops.sync` |
+| `kcpc.contests` | Contest reminders from Codeforces (TLE's cache), AtCoder, icpc.global and clist.by, plus the club's own contests; results posts of members' rating changes after Codeforces contests (TLE's `RatingChangesUpdate` event, with catch-up from TLE's cache) and AtCoder contests (profile reads); `/contests` | `contests.sync.<source>`, `contests.results` |
+| `kcpc.accounts` | Linking Codeforces and AtCoder accounts by a token on the profile, `/profile`, `/rank`; the source of AtCoder handles for other features | `accounts.refresh`, `accounts.purge-challenges` |
+| `kcpc.problems` | `/randproblem` and the Friday weekly problem with its solution | `problems.refresh`, `weekly.post` |
+| `kcpc.algo` | The algorithm of the month | `algo.post` |
+| `kcpc.notify` | `/notify`: members take or drop a feature's ping role | |
 
 ---
 

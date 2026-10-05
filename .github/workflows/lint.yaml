@@ -10,8 +10,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install Ruff
@@ -24,8 +24,8 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install system dependencies
@@ -34,6 +34,10 @@ jobs:
           sudo apt-get install -y libcairo2-dev gir1.2-pango-1.0 libgirepository-2.0-dev
       - name: Install project and pip-audit
         run: |
+          # pip-audit checks every installed package, including the pip and
+          # setuptools that come with the runner's Python. Upgrade them first,
+          # so an advisory against that tooling doesn't fail the audit.
+          python -m pip install --upgrade pip setuptools
           pip install .
           pip install pip-audit
       - name: Run pip-audit

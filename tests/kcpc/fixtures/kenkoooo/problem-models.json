@@ -1,0 +1,17 @@
+{
+"abc477_a":{"slope":-0.0008944095892278563,"intercept":6.09951065690156,"variance":1.0625240260932383,"difficulty":-870,"discrimination":0.004479398673070138,"irt_loglikelihood":-633.3336511187753,"irt_users":7515,"is_experimental":false},
+"abc477_g":{"difficulty":2226,"discrimination":0.004479398673070138,"irt_loglikelihood":-712.2366245747122,"irt_users":9186,"is_experimental":false},
+"abc300_a":{"slope":-0.000753412739593789,"intercept":5.599217659374225,"variance":0.3861652627688153,"difficulty":-1147,"discrimination":0.004479398673070138,"irt_loglikelihood":-95.35017775599165,"irt_users":5042,"is_experimental":false},
+"abc212_d":{"slope":-0.0009818450071341692,"intercept":8.043024572309317,"variance":0.558888386295464,"difficulty":775,"discrimination":0.004479398673070138,"irt_loglikelihood":-2496.836155364356,"irt_users":7241,"is_experimental":false},
+"arc058_a":{"slope":-0.0009567447067257116,"intercept":8.311525693337833,"variance":0.7853673530023945,"difficulty":1174,"discrimination":0.004479398673070138,"irt_loglikelihood":-216.66125421733,"irt_users":475,"is_experimental":false},
+"cf17_final_a":{"slope":-0.000818706794335797,"intercept":8.449132901960489,"variance":0.7673223781779563,"difficulty":439,"discrimination":0.004479398673070138,"irt_loglikelihood":-85.38728946454162,"irt_users":385,"is_experimental":false},
+"agc010_a":{"slope":-0.0008255460842586142,"intercept":7.348879446239194,"variance":0.6448861045919071,"difficulty":-10000,"discrimination":0.004479398673070138,"irt_loglikelihood":-2302.5850929940457,"irt_users":677,"is_experimental":false},
+"agc078_a":{"slope":-0.0006497367740284684,"intercept":10.610780035094901,"variance":0.16361702305663964,"difficulty":3423,"discrimination":0.004479398673070138,"irt_loglikelihood":-30.895750666558282,"irt_users":234,"is_experimental":false},
+"abc233_h":{"slope":-0.0008430365854587333,"intercept":9.33392585378375,"variance":0.38622570847854165,"difficulty":2530,"discrimination":0.004479398673070138,"irt_loglikelihood":-194.69105519000053,"irt_users":5819,"is_experimental":false},
+"abc001_1":{"slope":-0.0005235127675179603,"intercept":6.480188217901211,"variance":1.9830810089379265,"difficulty":-305,"discrimination":0.004479398673070138,"irt_loglikelihood":-13.275229960681347,"irt_users":222,"is_experimental":true},
+"abc007_3":{"slope":-0.0011428402135213044,"intercept":8.88583400546331,"variance":0.3554527863561391,"difficulty":1024,"discrimination":0.004479398673070138,"irt_loglikelihood":-134.464180088439,"irt_users":244,"is_experimental":true},
+"abc049_a":{"slope":-0.0008575738815120228,"intercept":6.73961406597115,"variance":0.9294140357838575,"is_experimental":false},
+"ahc055_a":{"difficulty":3884,"discrimination":0.004479398673070138,"irt_loglikelihood":-3.4371801169509597,"irt_users":731,"is_experimental":false},
+"cf16_exhibition_final_b":{"is_experimental":false},
+"bitflyer2018_qual_a":{"slope":-0.0008025980797939663,"intercept":6.119724030897577}
+}
