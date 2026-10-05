@@ -1,6 +1,7 @@
-"""Tests for tle.kcpc.platforms.codeforces: upcoming rounds from TLE's cache,
-users through TLE's user.info, and problems through its problemset.problems,
-contest.list and user.status, which the tests stand in for."""
+"""Tests for tle.kcpc.platforms.codeforces: upcoming rounds and rating changes
+from TLE's cache, users through TLE's user.info, and problems through its
+problemset.problems, contest.list and user.status, which the tests stand in
+for."""
 
 import asyncio
 import dataclasses
@@ -21,6 +22,7 @@ from tle.kcpc.platforms.codeforces import (
     SPECIAL_TAG,
     CodeforcesContest,
     CodeforcesProblem,
+    CodeforcesRatingChange,
     CodeforcesUser,
     SolvedProblems,
     fetch_problems,
@@ -28,6 +30,8 @@ from tle.kcpc.platforms.codeforces import (
     fetch_user,
     fetch_users,
     problem_catalog,
+    rank_name,
+    rating_changes,
     upcoming_contests,
 )
 from tle.util import codeforces_api as cf
@@ -1073,3 +1077,37 @@ class TestFetchSolved:
 
         assert (excinfo.value.service, excinfo.value.status) == ('Codeforces', None)
         assert excinfo.value.__cause__ is error
+
+
+class TestRatingChanges:
+    def test_tles_rating_changes_are_read_in_order(self) -> None:
+        changes = [
+            cf.RatingChange(2051, 'Codeforces Round 1050', 'tourist', 1, 0, 3700, 3750),
+            cf.RatingChange(2051, 'Codeforces Round 1050', 'kcpc_New', 900, 0, 0, 380),
+        ]
+
+        read = rating_changes(changes)
+
+        assert read == [
+            CodeforcesRatingChange('tourist', 1, 3700, 3750),
+            CodeforcesRatingChange('kcpc_New', 900, 0, 380),
+        ]
+        assert [change.first_rated for change in read] == [False, True]
+        assert read[0].url == 'https://codeforces.com/profile/tourist'
+
+    @pytest.mark.parametrize(
+        ('rating', 'name'),
+        [
+            (0, 'Newbie'),
+            (1199, 'Newbie'),
+            (1200, 'Pupil'),
+            (1899, 'Expert'),
+            (1900, 'Candidate Master'),
+            (2400, 'Grandmaster'),
+            (3000, 'Legendary Grandmaster'),
+        ],
+    )
+    def test_a_ratings_rank_is_named_as_codeforces_names_it(
+        self, rating: int, name: str
+    ) -> None:
+        assert rank_name(rating) == name

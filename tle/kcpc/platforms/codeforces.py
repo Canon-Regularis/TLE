@@ -1,10 +1,12 @@
-"""Upcoming Codeforces rounds from TLE's contest cache, Codeforces users, and
-Codeforces' problems.
+"""Upcoming Codeforces rounds from TLE's contest cache, rating changes, Codeforces
+users, and Codeforces' problems.
 
 TLE already polls Codeforces' contest list and caches it, so for contests this
 module asks Codeforces nothing itself: the caller passes the cached ``Contest``
 objects in. Codeforces gives a contest's start and duration in seconds, and its
-phase: BEFORE until it starts, CODING while it runs, then on to FINISHED.
+phase: BEFORE until it starts, CODING while it runs, then on to FINISHED. The
+same goes for a rated contest's rating changes, which TLE fetches and saves
+as Codeforces publishes them.
 
 Users are fetched with TLE's ``user.info`` call, which keeps to the limit on
 requests to the Codeforces API that TLE's own commands share. Problems, and
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 PLATFORM = 'codeforces'
 PROBLEM_URL = 'https://codeforces.com/contest/{contest_id}/problem/{index}'
 CONTEST_URL = 'https://codeforces.com/contest/{contest_id}'
+PROFILE_URL = 'https://codeforces.com/profile/{handle}'
 # Copied from tle.util.codeforces_common, which KCPC may not import. A
 # contest whose name, lowercased, holds one of these words isn't a standard
 # round: an April Fools contest, an ICPC mirror, a Kotlin Heroes round...
@@ -127,6 +130,49 @@ def upcoming_contests(
         )
     upcoming.sort(key=lambda contest: (contest.start, contest.contest_id))
     return upcoming
+
+
+@dataclass(frozen=True)
+class CodeforcesRatingChange:
+    """A user's rating change in a rated contest, as contest.ratingChanges has it."""
+
+    handle: str  # the user's handle now, in its canonical case
+    place: int  # their rank in the contest
+    old_rating: int  # 0 before their first rated contest
+    new_rating: int
+
+    @property
+    def first_rated(self) -> bool:
+        """Whether it was the user's first rated contest.
+
+        Codeforces gives their rating before it as 0.
+        """
+        return self.old_rating == 0
+
+    @property
+    def url(self) -> str:
+        """The user's profile page."""
+        return PROFILE_URL.format(handle=self.handle)
+
+
+def rating_changes(
+    changes: Iterable[cf.RatingChange],
+) -> list[CodeforcesRatingChange]:
+    """TLE's rating changes as ``CodeforcesRatingChange``s, in the order given."""
+    return [
+        CodeforcesRatingChange(
+            handle=change.handle,
+            place=change.rank,
+            old_rating=change.oldRating,
+            new_rating=change.newRating,
+        )
+        for change in changes
+    ]
+
+
+def rank_name(rating: int) -> str:
+    """The name of the Codeforces rank for ``rating``: 'Pupil', 'Expert'..."""
+    return cf.rating2rank(rating).title
 
 
 @dataclass(frozen=True)

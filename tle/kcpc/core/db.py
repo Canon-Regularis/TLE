@@ -84,6 +84,13 @@ class Database:
     def is_memory(self) -> bool:
         return self._path == MEMORY_PATH
 
+    @property
+    def closed(self) -> bool:
+        """Whether ``close`` has run: every use since raises
+        ``sqlite3.ProgrammingError``.
+        """
+        return self._closed
+
     async def close(self) -> None:
         """Wait for work in progress, then close the connection. Idempotent."""
         self._refuse_inside_own_transaction('close the database')

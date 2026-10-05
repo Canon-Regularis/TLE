@@ -502,8 +502,12 @@ async def test_backup_to_produces_a_readable_copy(
 
 
 async def test_close_is_idempotent_and_later_use_fails(database: Database) -> None:
+    assert not database.closed
+
     await database.close()
     await database.close()
+
+    assert database.closed
     with pytest.raises(sqlite3.ProgrammingError, match='closed'):
         await database.fetchval('SELECT 1')
     with pytest.raises(sqlite3.ProgrammingError, match='closed'):

@@ -582,6 +582,11 @@ class OtherHandles:
     ) -> str | None:
         return 'Someone_Else'
 
+    async def linked_handles(
+        self, guild_id: int, platform: str
+    ) -> list[tuple[int, str]]:
+        return [(MEMBER, 'Someone_Else')]
+
 
 async def test_a_load_whose_handle_source_is_refused_changes_nothing(
     services: KcpcServices, user_db: UserDbConn, atcoder: FakeAtCoder
@@ -1086,13 +1091,17 @@ async def test_other_features_read_a_verified_atcoder_handle_until_it_is_unlinke
     # In AtCoder's case, whatever case the member typed.
     assert await handles.linked_handle(GUILD, MEMBER, 'atcoder') == 'FakeAtCoder'
     assert await handles.linked_handle(OTHER_GUILD, MEMBER, 'atcoder') is None
+    assert await handles.linked_handles(GUILD, 'atcoder') == [(MEMBER, 'FakeAtCoder')]
+    assert await handles.linked_handles(OTHER_GUILD, 'atcoder') == []
     # Codeforces handles are TLE's, which features read through the bridge.
     await user_db.set_handle(MEMBER, GUILD, 'FakeCoder')
     assert await handles.linked_handle(GUILD, MEMBER, 'codeforces') is None
+    assert await handles.linked_handles(GUILD, 'codeforces') == []
 
     await run(bot, 'unlink', make_ctx(server, member), 'atcoder')
 
     assert await handles.linked_handle(GUILD, MEMBER, 'atcoder') is None
+    assert await handles.linked_handles(GUILD, 'atcoder') == []
 
 
 async def test_verify_with_the_token_missing_links_nothing(

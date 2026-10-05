@@ -401,6 +401,15 @@ class FakeHandles:
     ) -> str | None:
         return self.handles.get((guild_id, user_id))
 
+    async def linked_handles(
+        self, guild_id: int, platform: str
+    ) -> list[tuple[int, str]]:
+        return sorted(
+            (user_id, handle)
+            for (guild, user_id), handle in self.handles.items()
+            if guild == guild_id
+        )
+
 
 @pytest.fixture
 def feature_registry() -> FeatureRegistry:

@@ -441,7 +441,11 @@ class AccountService:
     async def linked_handles(
         self, guild_id: int, platform: str
     ) -> list[tuple[int, str]]:
-        """``(user_id, handle)`` of each link on ``platform`` stored in kcpc.db."""
+        """``(user_id, handle)`` of each link on ``platform`` stored in kcpc.db.
+
+        Links of members who left the guild are included. Other features read
+        them through ``tle.kcpc.core.handles``, as for ``linked_handle``.
+        """
         links = await self._repo.links_for_guild(guild_id, platform)
         return [(link.user_id, link.handle) for link in links]
 
