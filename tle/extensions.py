@@ -23,6 +23,7 @@ KCPC_EXTENSIONS: tuple[tuple[str, str], ...] = (
     ('kcpc.contests', 'tle.kcpc.features.contests.cog'),
     ('kcpc.accounts', 'tle.kcpc.features.accounts.cog'),
     ('kcpc.problems', 'tle.kcpc.features.problems.cog'),
+    ('kcpc.algo', 'tle.kcpc.features.algo.cog'),
     ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
 )
 

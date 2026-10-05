@@ -15,6 +15,9 @@ in tle/kcpc/__init__.py):
 - services.py and bootstrap.py, which assemble everything, may import anything
   but TLE's user database (below).
 
+The contests feature, and no other KCPC module, may import TLE's event system,
+tle.util.events, to hear when TLE has saved a contest's rating changes.
+
 There is one exception. tle.kcpc.bot.codeforces_links, KCPC's only way to the
 Codeforces handles in TLE's user database, may also import
 tle.util.handle_linking and tle.util.codeforces_api, and no other KCPC module
@@ -46,6 +49,7 @@ WORKSHOPS = 'tle.kcpc.features.workshops'
 CONTESTS = 'tle.kcpc.features.contests'
 ACCOUNTS = 'tle.kcpc.features.accounts'
 PROBLEMS = 'tle.kcpc.features.problems'
+ALGO = 'tle.kcpc.features.algo'
 CODEFORCES = 'tle.kcpc.platforms.codeforces'
 ATCODER = 'tle.kcpc.platforms.atcoder'
 ICPC = 'tle.kcpc.platforms.icpc'
@@ -53,6 +57,7 @@ CODEFORCES_LINKS = 'tle.kcpc.bot.codeforces_links'
 HANDLES = 'tle.kcpc.core.handles'
 HANDLE_LINKING = 'tle.util.handle_linking'
 TLE_CODEFORCES = 'tle.util.codeforces_api'
+TLE_EVENTS = 'tle.util.events'
 # What reaches TLE's user database, besides the bridge's handle linking.
 TLE_USER_DB = ('tle.util.db', 'tle.util.codeforces_common', 'tle.cogs')
 
@@ -168,6 +173,8 @@ def violation(ref: ImportRef) -> str | None:
         return f'only {CODEFORCES_LINKS} may import {HANDLE_LINKING}'
     if _under(ref.target, *TLE_USER_DB):
         return f"KCPC reaches TLE's user database only through {CODEFORCES_LINKS}"
+    if _under(ref.target, TLE_EVENTS) and not _under(ref.module, CONTESTS):
+        return f'only {CONTESTS} may import {TLE_EVENTS}'
     for layer, check in _LAYER_CHECKS:
         if _under(ref.module, layer):
             return check(ref)
@@ -275,6 +282,8 @@ def test_the_rules_are_checked_on_real_modules() -> None:
         f'{WORKSHOPS}.sync',
         f'{WORKSHOPS}.cog',
         f'{CONTESTS}.sources',
+        f'{CONTESTS}.results_repo',
+        f'{CONTESTS}.results',
         f'{CONTESTS}.cog',
         f'{ACCOUNTS}.repo',
         f'{ACCOUNTS}.service',
@@ -291,6 +300,13 @@ def test_the_rules_are_checked_on_real_modules() -> None:
         f'{PROBLEMS}.markdown',
         f'{PROBLEMS}.weekly',
         f'{PROBLEMS}.cog',
+        f'{ALGO}.catalog',
+        f'{ALGO}.markdown',
+        f'{ALGO}.repo',
+        f'{ALGO}.service',
+        f'{ALGO}.cog',
+        'tle.kcpc.core.migrations.m0006_algo',
+        'tle.kcpc.core.migrations.m0007_contest_results',
         f'{NOTIFY}.cog',
         'tle.kcpc.services',
         'tle.kcpc.bootstrap',
@@ -321,6 +337,13 @@ def test_only_the_bridge_uses_tles_handle_linking() -> None:
     }
 
     assert handle_linking == bot_codeforces == {CODEFORCES_LINKS}
+
+
+def test_only_the_contests_feature_uses_tles_events() -> None:
+    # Its cog listens for TLE's word that a contest's rating changes are saved.
+    users = {ref.module for ref in kcpc_imports() if _under(ref.target, TLE_EVENTS)}
+
+    assert users == {f'{CONTESTS}.cog'}
 
 
 def mentions_user_db(node: ast.AST) -> bool:
@@ -361,12 +384,14 @@ def test_uses_of_tles_user_db_are_found(source: str) -> None:
 
 def test_notify_never_imports_the_features_it_serves() -> None:
     # /notify serves every feature through the settings registry alone, so it
-    # keeps working with kcpc.workshops, kcpc.contests or kcpc.problems
-    # disabled, or failing to load.
+    # keeps working with kcpc.workshops, kcpc.contests, kcpc.problems or
+    # kcpc.algo disabled, or failing to load.
     refs = [ref for ref in kcpc_imports() if _under(ref.module, NOTIFY)]
 
     assert refs, 'the notify package has imports to check'
-    served = [ref for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS, PROBLEMS)]
+    served = [
+        ref for ref in refs if _under(ref.target, WORKSHOPS, CONTESTS, PROBLEMS, ALGO)
+    ]
     assert [str(ref) for ref in served] == []
 
 
@@ -379,6 +404,20 @@ def test_problems_never_imports_accounts() -> None:
 
     assert refs, 'the problems package has imports to check'
     assert [str(ref) for ref in refs if _under(ref.target, ACCOUNTS)] == []
+
+
+def test_algo_never_imports_another_feature() -> None:
+    # It copies the few helpers it shares with the problems feature, so that
+    # it loads, and works, whichever other features are disabled.
+    refs = [ref for ref in kcpc_imports() if _under(ref.module, ALGO)]
+
+    assert refs, 'the algo package has imports to check'
+    features = [
+        ref
+        for ref in refs
+        if _under(ref.target, 'tle.kcpc.features') and not _under(ref.target, ALGO)
+    ]
+    assert [str(ref) for ref in features] == []
 
 
 def test_tles_cogs_import_kcpc_only_lazily() -> None:
@@ -576,6 +615,24 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{CONTESTS}.cog', f'from {CONTESTS}.sync import ContestSync', True),
         (f'{CONTESTS}.cog', 'from tle.kcpc.bot.admin import attach_admin_group', True),
         (f'{CONTESTS}.cog', f'from {WORKSHOPS}.settings import WORKSHOPS', False),
+        # TLE's event system, which says when a contest's rating changes are
+        # saved, is the contests feature's alone.
+        (f'{CONTESTS}.cog', 'from tle.util import events', True),
+        (f'{CONTESTS}.cog', 'import tle.util.events', True),
+        (f'{CONTESTS}.results', 'from tle.util.events import Listener', True),
+        (f'{CONTESTS}.results', 'from tle.kcpc.bot import codeforces_links', True),
+        (f'{CONTESTS}.results', f'from {ATCODER}.profile import PROFILE_URL', True),
+        (f'{CONTESTS}.results', 'import discord', False),
+        (f'{CONTESTS}.results_repo', 'import discord', False),
+        (f'{CONTESTS}.results', f'from {ACCOUNTS}.service import X', False),
+        (f'{PROBLEMS}.cog', 'from tle.util import events', False),
+        (f'{ACCOUNTS}.cog', 'def f():\n    from tle.util import events', False),
+        ('tle.kcpc.features.a.cog', 'from tle.util.events import Listener', False),
+        ('tle.kcpc.bot.x', 'from tle.util import events', False),
+        ('tle.kcpc.platforms.x', 'from tle.util import events', False),
+        ('tle.kcpc.core.x', 'from tle.util import events', False),
+        ('tle.kcpc.services', 'import tle.util.events', False),
+        ('tle.kcpc.bootstrap', 'from tle.util import events', False),
         (f'{WORKSHOPS}.cog', f'from {CONTESTS}.repo import ContestRepo', False),
         # Account linking reaches TLE's handle table through the bridge alone.
         (f'{ACCOUNTS}.cog', 'from tle.kcpc.bot import codeforces_links', True),
@@ -617,6 +674,18 @@ def test_tles_discord_common_imports_on_its_own() -> None:
         (f'{ACCOUNTS}.cog', f'from {PROBLEMS}.solved import SolvedProblems', False),
         (f'{CONTESTS}.cog', f'from {PROBLEMS}.settings import WEEKLY', False),
         (f'{NOTIFY}.cog', f'from {PROBLEMS}.settings import WEEKLY', False),
+        # The algorithm of the month copies the problems feature's markdown
+        # helpers rather than import them.
+        (f'{ALGO}.cog', f'from {ALGO}.service import AlgoService', True),
+        (f'{ALGO}.service', 'from tle.kcpc.core.publishing import Publisher', True),
+        (f'{ALGO}.service', f'from {ALGO} import markdown', True),
+        (f'{ALGO}.service', f'from {PROBLEMS} import markdown', False),
+        (f'{ALGO}.cog', f'from {PROBLEMS}.markdown import link', False),
+        (f'{ALGO}.service', 'import discord', False),
+        (f'{ALGO}.catalog', 'import discord', False),
+        (f'{ALGO}.repo', 'import discord', False),
+        (f'{NOTIFY}.cog', f'from {ALGO}.service import ALGO', False),
+        (f'{PROBLEMS}.cog', f'from {ALGO}.catalog import topic', False),
         (HANDLES, 'from typing import Protocol', True),
         (HANDLES, 'import discord', False),
         (HANDLES, f'from {ACCOUNTS}.service import AccountService', False),

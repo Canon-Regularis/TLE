@@ -438,6 +438,7 @@ async def test_without_clist_credentials_there_are_no_clist_jobs(
     bot: KcpcBot, services: KcpcServices, sites: FakeSites
 ) -> None:
     assert [job.name for job in services.scheduler.status()] == [
+        'contests.results',
         'contests.sync.atcoder',
         'contests.sync.codeforces',
         'contests.sync.icpc',
@@ -451,6 +452,7 @@ async def test_with_clist_credentials_each_clist_source_has_a_job(
     jobs = [(job.name, job.description) for job in services.scheduler.status()]
 
     assert jobs == [
+        ('contests.results', 'every 5m'),
         ('contests.sync.atcoder', 'every 30m'),
         ('contests.sync.codechef', 'every 30m'),
         ('contests.sync.codeforces', 'every 5m'),

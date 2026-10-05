@@ -88,10 +88,12 @@ PROBLEMS = KcpcExtension(
     'KcpcProblems',
     ('randproblem', 'weekly'),
 )
+ALGO = KcpcExtension('kcpc.algo', 'tle.kcpc.features.algo.cog', 'KcpcAlgo', ('algo',))
 NOTIFY = KcpcExtension(
     'kcpc.notify', 'tle.kcpc.features.notify.cog', 'KcpcNotify', ('notify',)
 )
-KCPC = (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY)  # in load order
+# In load order.
+KCPC = (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, ALGO, NOTIFY)
 KCPC_BY_NAME = {extension.name: extension for extension in KCPC}
 CORE_JOBS = [bootstrap.RECONCILE_JOB, bootstrap.REMINDERS_JOB]
 
@@ -125,11 +127,16 @@ WORKSHOPS_FEATURE = KcpcFeature(
 CONTESTS_FEATURE = KcpcFeature(
     CONTESTS,
     'contests',
-    ('contests.sync.codeforces', 'contests.sync.atcoder', 'contests.sync.icpc'),
+    (
+        'contests.sync.codeforces',
+        'contests.sync.atcoder',
+        'contests.sync.icpc',
+        'contests.results',
+    ),
     settings=ContestSettings,
     reminders=True,
     admin_commands=frozenset(
-        {'add', 'settime', 'remove', 'platforms', 'start-posts', 'sync'}
+        {'add', 'settime', 'remove', 'platforms', 'start-posts', 'results', 'sync'}
     ),
 )
 # Account linking posts nothing and has no settings; admins unlink AtCoder
@@ -152,7 +159,22 @@ PROBLEMS_FEATURE = KcpcFeature(
         {'queue', 'unqueue', 'solution', 'rotation', 'preview', 'post-now'}
     ),
 )
-FEATURES = (WORKSHOPS_FEATURE, CONTESTS_FEATURE, ACCOUNTS_FEATURE, PROBLEMS_FEATURE)
+# The algorithm of the month posts at its own slots too. Its settings are the
+# base ones, which default_registry() has.
+ALGO_FEATURE = KcpcFeature(
+    ALGO,
+    'algo',
+    ('algo.post',),
+    settings=FeatureSettings,
+    admin_commands=frozenset({'reroll', 'post-now', 'preview'}),
+)
+FEATURES = (
+    WORKSHOPS_FEATURE,
+    CONTESTS_FEATURE,
+    ACCOUNTS_FEATURE,
+    PROBLEMS_FEATURE,
+    ALGO_FEATURE,
+)
 FEATURE_BY_EXTENSION = {feature.extension.name: feature for feature in FEATURES}
 
 
@@ -368,42 +390,48 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
             'kcpc.admin',
             False,
             TLE_MODULES,
-            (WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY),
+            (WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, ALGO, NOTIFY),
         ),
         (
             'kcpc.workshops',
             False,
             TLE_MODULES,
-            (ADMIN, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY),
+            (ADMIN, CONTESTS, ACCOUNTS, PROBLEMS, ALGO, NOTIFY),
         ),
         (
             'kcpc.contests',
             False,
             TLE_MODULES,
-            (ADMIN, WORKSHOPS, ACCOUNTS, PROBLEMS, NOTIFY),
+            (ADMIN, WORKSHOPS, ACCOUNTS, PROBLEMS, ALGO, NOTIFY),
         ),
         (
             'kcpc.accounts',
             False,
             TLE_MODULES,
-            (ADMIN, WORKSHOPS, CONTESTS, PROBLEMS, NOTIFY),
+            (ADMIN, WORKSHOPS, CONTESTS, PROBLEMS, ALGO, NOTIFY),
         ),
         (
             'kcpc.problems',
             False,
             TLE_MODULES,
-            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, NOTIFY),
+            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, ALGO, NOTIFY),
+        ),
+        (
+            'kcpc.algo',
+            False,
+            TLE_MODULES,
+            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, NOTIFY),
         ),
         (
             'kcpc.notify',
             False,
             TLE_MODULES,
-            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS),
+            (ADMIN, WORKSHOPS, CONTESTS, ACCOUNTS, PROBLEMS, ALGO),
         ),
         ('kcpc', False, TLE_MODULES, ()),
         (
             'kcpc.admin,kcpc.workshops,kcpc.contests,kcpc.accounts,kcpc.problems,'
-            'kcpc.notify',
+            'kcpc.algo,kcpc.notify',
             False,
             TLE_MODULES,
             (),
@@ -420,6 +448,7 @@ def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
         'kcpc.contests',
         'kcpc.accounts',
         'kcpc.problems',
+        'kcpc.algo',
         'kcpc.notify',
         'kcpc',
         'every kcpc extension by name',
@@ -582,6 +611,7 @@ async def test_tle_boots_when_kcpc_fails_to_start(
         ('kcpc.contests', 'its last job cannot be added'),
         ('kcpc.accounts', 'its last job cannot be added'),
         ('kcpc.problems', 'its last job cannot be added'),
+        ('kcpc.algo', 'its last job cannot be added'),
         ('kcpc.notify', 'cog_load raises'),
         ('kcpc.missing', 'package missing'),
     ],

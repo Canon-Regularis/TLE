@@ -4,8 +4,8 @@
   ``/contests live``. They read the database only, which syncing keeps up to
   date.
 - Admins: ``/kcpc contests`` to add, time and remove contests, choose the
-  server's platforms and posts, and sync now, attached under /kcpc (see
-  ``tle.kcpc.bot.admin``).
+  server's platforms and posts (start posts, results posts), and sync now,
+  attached under /kcpc (see ``tle.kcpc.bot.admin``).
 - A job per source syncs its platform's contests: Codeforces every 5 minutes
   (from TLE's own cache), AtCoder every 30 minutes, and the ICPC contests of
   ``ICPC_CONTEST_CODES`` every 6 hours. With clist.by's credentials set
@@ -14,10 +14,16 @@
   reminder engine's own job posts the reminders, which ``reminders``
   describes, for each platform once all its sources have been synced since the
   bot started.
+- After Codeforces and AtCoder contests, members' rating changes are posted
+  (see ``results``): the job contests.results runs as the bot starts and then
+  every 5 minutes, and the cog passes on TLE's word that it has saved a
+  Codeforces contest's rating changes, once the bot is ready.
 """
 
+import contextlib
+import logging
 import re
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, Literal
@@ -27,6 +33,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from tle.kcpc.bot import codeforces_links
 from tle.kcpc.bot.admin import (
     attach_admin_group,
     detach_admin_group,
@@ -35,6 +42,7 @@ from tle.kcpc.bot.admin import (
 from tle.kcpc.bot.checks import kcpc_admin_only
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.bot.embeds import alert_embed, success_embed, to_embed
+from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import KcpcUserError
 from tle.kcpc.core.messages import URL_LIMIT, EmbedField, OutgoingMessage, shorten
 from tle.kcpc.core.schedule import Every
@@ -54,6 +62,12 @@ from tle.kcpc.features.contests.reminders import (
     platform_name,
 )
 from tle.kcpc.features.contests.repo import ContestRepo, SourceState, StoredContest
+from tle.kcpc.features.contests.results import (
+    RESULTS_INTERVAL,
+    RESULTS_JOB,
+    ContestResults,
+)
+from tle.kcpc.features.contests.results_repo import CODEFORCES, ResultRepo
 from tle.kcpc.features.contests.settings import (
     CONTESTS,
     MANUAL,
@@ -69,8 +83,12 @@ from tle.kcpc.features.contests.sources import (
 )
 from tle.kcpc.features.contests.sync import ContestSource, ContestSync, SyncReport
 from tle.kcpc.platforms.atcoder.contests import AtCoderContestsClient
+from tle.kcpc.platforms.atcoder.profile import AtCoderProfileClient
 from tle.kcpc.platforms.clist import ClistClient
 from tle.kcpc.platforms.icpc import IcpcClient
+from tle.util import codeforces_api as cf, events
+
+logger = logging.getLogger(__name__)
 
 # How often each source is synced, by its name. Codeforces' is TLE's cache,
 # so syncing it asks Codeforces nothing; ICPC dates rarely change. The last
@@ -112,6 +130,11 @@ _DURATION_HINT = (
     'from 1 minute to 7 days.'
 )
 _BAD_LINK = 'The link must be a web address starting with https:// or http://.'
+_RESULTS_ON = (
+    "Members' rating changes are now posted after each Codeforces and AtCoder "
+    'contest of the platforms this server follows, without a ping.'
+)
+_RESULTS_OFF = "Members' rating changes are no longer posted after contests."
 _DATE_AND_TIME = (
     'Give the start as a date and a time, YYYY-MM-DD HH:MM. In a `;kcpc` '
     'command, put it in quotes, as in '
@@ -154,7 +177,8 @@ class _ContestChoice:
 
 
 class KcpcContests(KcpcCog):
-    """Contest reminders, /contests for members and /kcpc contests for admins.
+    """Contest reminders and results, /contests for members and /kcpc contests
+    for admins.
 
     Its subcommands are declared on their own and put in their groups by
     ``cog_load``. discord.py links a cog's subcommands to their groups by
@@ -172,15 +196,23 @@ class KcpcContests(KcpcCog):
     _reminders: ContestReminders
     # What settime and remove suggest; refreshed after every change.
     _choices: tuple[_ContestChoice, ...]
+    _results: ContestResults
+    # TLE's event system, if the bot has one, and the cog's listener there.
+    _event_sys: events.EventSystem | None
+    _listener: events.Listener
+    _unloaded: bool
+    _db: Database  # for the listener, which may run on after shutdown
 
     async def cog_load(self) -> None:
-        """Start reminding, add the admin commands, then start syncing.
+        """Start reminding, add the admin commands, then start syncing, and
+        listen for Codeforces' rating changes and start the results job.
 
         If a step fails, the steps before it are undone before the error
         propagates: discord.py doesn't call ``cog_unload`` when ``cog_load``
         raises.
         """
         services = self.services
+        self._db = services.db
         self._repo = ContestRepo(services.db, tz=services.settings.tz)
         # One ContestSync for the jobs and the commands, so that syncs of the
         # same source take turns.
@@ -194,6 +226,29 @@ class KcpcContests(KcpcCog):
         self._tried_sources = set()
         self._reminders = ContestReminders(self._repo)
         self._choices = ()
+        self._results = ContestResults(
+            self._repo,
+            ResultRepo(services.db),
+            services.guild_settings,
+            services.ledger,
+            services.publisher,
+            AtCoderProfileClient(services.http),
+            services.clock,
+            linked_members=self._linked_members,
+            in_guild=self._in_guild,
+            codeforces_contests=self._cached_codeforces_contests,
+            codeforces_changes=self._saved_rating_changes,
+        )
+        # TLE attaches its event system to the bot before KCPC loads; a bot
+        # without TLE's Codeforces features has none.
+        self._event_sys = getattr(self.bot, 'event_sys', None)
+        self._listener = events.Listener(
+            'KcpcContestResults',
+            events.RatingChangesUpdate,
+            self._on_rating_changes,
+            with_lock=True,
+        )
+        self._unloaded = False
         self._nest_subcommands()
         services.reminders.register(self._reminders)
         added: list[str] = []
@@ -204,21 +259,42 @@ class KcpcContests(KcpcCog):
                 job = self._sync_job(source)
                 services.scheduler.add(job)
                 added.append(job.name)
+            if self._event_sys is not None:
+                self._event_sys.add_listener(self._listener)
+            services.scheduler.add(self._results_job())
         except BaseException:
             for name in added:
                 await services.scheduler.remove(name)
+            self._stop_listening()
             # Detaching a group that isn't attached does nothing.
             detach_admin_group(self.bot, self.contests_admin)
             services.reminders.unregister(CONTESTS)
             raise
 
     async def cog_unload(self) -> None:
-        """Stop syncing and reminding, and take the admin commands away."""
+        """Stop syncing, reminding and posting results, and take the admin
+        commands away.
+
+        A listener task that is running still finishes. As the bot shuts
+        down, KCPC's services close before discord.py unloads the cog, so
+        such a task may find the database closed even before this runs (see
+        ``_on_rating_changes``).
+        """
         services = self.services
+        self._unloaded = True
         for source in self._sources:
             await services.scheduler.remove(sync_job_name(source.name))
+        await services.scheduler.remove(RESULTS_JOB)
+        self._stop_listening()
         services.reminders.unregister(CONTESTS)
         detach_admin_group(self.bot, self.contests_admin)
+
+    def _stop_listening(self) -> None:
+        """Stop listening to TLE's events, if the cog was."""
+        if self._event_sys is None:
+            return
+        with contextlib.suppress(events.ListenerNotRegistered):
+            self._event_sys.remove_listener(self._listener)
 
     def _nest_subcommands(self) -> None:
         """Put each subcommand in its group (see the class docstring)."""
@@ -231,6 +307,7 @@ class KcpcContests(KcpcCog):
             self.remove_contest,
             self.set_platforms,
             self.set_start_posts,
+            self.set_results_posts,
             self.sync_now,
         )
         for command in admin_commands:
@@ -439,6 +516,24 @@ class KcpcContests(KcpcCog):
         )
         await _reply(ctx, success_embed(text))
 
+    @commands.hybrid_command(name='results', brief='Post contest results')  # type: ignore[arg-type]
+    @app_commands.describe(
+        state="on to post members' rating changes after contests, off not to"
+    )
+    @kcpc_admin_only()
+    async def set_results_posts(
+        self, ctx: commands.Context[Any], state: Literal['on', 'off']
+    ) -> None:
+        """Turn on or off a post of members' rating changes after each
+        Codeforces and AtCoder contest they take part in.
+        """
+        await ctx.defer(ephemeral=True)
+        guild = _guild(ctx)
+        on = state == 'on'
+        await self.services.guild_settings.update(guild.id, CONTESTS, results_posts=on)
+        text = _RESULTS_ON if on else _RESULTS_OFF
+        await _reply(ctx, success_embed(text))
+
     @commands.hybrid_command(name='sync', brief='Sync every contest source now')  # type: ignore[arg-type]
     @kcpc_admin_only()
     async def sync_now(self, ctx: commands.Context[Any]) -> None:
@@ -465,6 +560,81 @@ class KcpcContests(KcpcCog):
             persistent=False,
             run_on_start=True,
         )
+
+    def _results_job(self) -> ScheduledJob:
+        """Does what is due about contest results (see ``results``).
+
+        Non-persistent: each run works out from the time and the database
+        what is due, including what came due while the bot was down.
+        """
+
+        async def post_results(slot: datetime) -> None:
+            # Each run works from the time it runs, whichever slot it is for.
+            await self._results.run(self.services.clock.now())
+
+        return ScheduledJob(
+            RESULTS_JOB,
+            Every(RESULTS_INTERVAL),
+            post_results,
+            persistent=False,
+            run_on_start=True,
+        )
+
+    async def _on_rating_changes(self, event: events.RatingChangesUpdate) -> None:
+        """Post a Codeforces contest's results as TLE saves its rating changes.
+
+        Until the bot is ready, no server's channel is known, so an event
+        before then is left to the results job, which catches up once the bot
+        is ready. TLE runs this as a task of its own, which may outlast the
+        cog and KCPC's database, so errors are logged here.
+        """
+        if not self.bot.is_ready():
+            return
+        try:
+            await self._results.report_codeforces(event.contest, event.rating_changes)
+        except Exception as exc:
+            # As the bot shuts down, KCPC's services close kcpc.db before
+            # discord.py unloads the cog: either way, there's nothing to
+            # report, and the job catches up after the restart.
+            expected = (
+                self._unloaded or self._db.closed or isinstance(exc, KcpcUserError)
+            )
+            logger.log(
+                logging.INFO if expected else logging.WARNING,
+                'Could not post the results of Codeforces contest %d; the '
+                'results job tries again',
+                event.contest.id,
+                exc_info=True,
+            )
+
+    async def _linked_members(
+        self, guild_id: int, platform: str
+    ) -> list[tuple[int, str]]:
+        """``(user_id, handle)`` of each member of the guild linked on ``platform``.
+
+        Codeforces handles are TLE's, AtCoder handles whatever feature keeps
+        them (see ``tle.kcpc.core.handles``). Either way, only those of the
+        guild's members count, as far as the bot knows them: TLE marks the
+        handles of members who leave inactive, but AtCoder links stay.
+        """
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return []
+        if platform == CODEFORCES:
+            linked = await codeforces_links.guild_handles(self.bot, guild_id)
+        else:
+            linked = await self.services.handles.linked_handles(guild_id, platform)
+        return [
+            (user_id, handle)
+            for user_id, handle in linked
+            if _is_member(guild, user_id)
+        ]
+
+    def _in_guild(self, guild_id: int) -> bool:
+        """Whether the bot is in the server, even if Discord hasn't sent it
+        yet, as just after the bot reconnects.
+        """
+        return self.bot.get_guild(guild_id) is not None
 
     async def _sync_sources(self, *sources: ContestSource) -> list[SyncReport]:
         """Sync each source in turn, then remind at once if that changed anything.
@@ -600,6 +770,21 @@ class KcpcContests(KcpcCog):
         contests: CachedContests = cache.contest_cache.contests
         return contests
 
+    async def _saved_rating_changes(self, contest_id: int) -> Sequence[cf.RatingChange]:
+        """The contest's rating changes as TLE saved them in its cache; none
+        while it has none, or the bot has no such cache.
+
+        Reading them asks Codeforces nothing: TLE fetches them itself.
+        """
+        cache = getattr(self.bot, 'cf_cache', None)
+        saved = getattr(cache, 'rating_changes_cache', None)
+        if saved is None:
+            return ()
+        changes: list[cf.RatingChange] = await saved.get_rating_changes_for_contest(
+            contest_id
+        )
+        return changes
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(KcpcContests(bot))
@@ -609,6 +794,16 @@ def _guild(ctx: commands.Context[Any]) -> discord.Guild:
     if ctx.guild is None:
         raise commands.NoPrivateMessage()
     return ctx.guild
+
+
+def _is_member(guild: discord.Guild, user_id: int) -> bool:
+    """Whether a user is still a member of ``guild``, as far as the bot knows.
+
+    After each new connection to Discord, the bot has only some of a guild's
+    members, and Discord sends the rest while it runs. Until it has them all
+    (``Guild.chunked``), everyone counts as a member.
+    """
+    return not guild.chunked or guild.get_member(user_id) is not None
 
 
 async def _reply(ctx: commands.Context[Any], embed: discord.Embed) -> None:

@@ -22,6 +22,7 @@ KCPC_WORKSHOPS = Extension('kcpc.workshops', 'tle.kcpc.features.workshops.cog', 
 KCPC_CONTESTS = Extension('kcpc.contests', 'tle.kcpc.features.contests.cog', 'kcpc')
 KCPC_ACCOUNTS = Extension('kcpc.accounts', 'tle.kcpc.features.accounts.cog', 'kcpc')
 KCPC_PROBLEMS = Extension('kcpc.problems', 'tle.kcpc.features.problems.cog', 'kcpc')
+KCPC_ALGO = Extension('kcpc.algo', 'tle.kcpc.features.algo.cog', 'kcpc')
 KCPC_NOTIFY = Extension('kcpc.notify', 'tle.kcpc.features.notify.cog', 'kcpc')
 # The real KCPC extensions, in load order.
 KCPC = [
@@ -30,6 +31,7 @@ KCPC = [
     KCPC_CONTESTS,
     KCPC_ACCOUNTS,
     KCPC_PROBLEMS,
+    KCPC_ALGO,
     KCPC_NOTIFY,
 ]
 
@@ -75,6 +77,7 @@ def test_kcpc_extensions_are_listed_in_order() -> None:
         ('kcpc.contests', 'tle.kcpc.features.contests.cog'),
         ('kcpc.accounts', 'tle.kcpc.features.accounts.cog'),
         ('kcpc.problems', 'tle.kcpc.features.problems.cog'),
+        ('kcpc.algo', 'tle.kcpc.features.algo.cog'),
         ('kcpc.notify', 'tle.kcpc.features.notify.cog'),
     )
     kcpc = [extension for extension in discover() if extension.family == 'kcpc']

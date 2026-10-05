@@ -1,16 +1,18 @@
 """Tests for the contests cog (tle.kcpc.features.contests.cog) and its sources.
 
 The cog runs on real KCPC services (database, settings, ledger, scheduler and
-reminder engine, which posts through FakePublisher), on a real bot that also
+reminder engine), which post through FakePublisher, on a real bot that also
 has the admin cog. Only the sites are faked: the cog's AtCoder and ICPC
-clients are replaced by FakeSites, and TLE's Codeforces cache by one on the
-bot. Most tests call a command's callback with a mocked context; the rest go
-through discord.py, for its checks, its parsing, its error handling and how it
-adds and removes the cog. The last tests check each source on its own.
+clients are replaced by FakeSites, and TLE's Codeforces cache, user database
+and event system by ones on the bot. Most tests call a command's callback
+with a mocked context; the rest go through discord.py, for its checks, its
+parsing, its error handling and how it adds and removes the cog. Then come
+each source on its own, and contest results.
 """
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
@@ -51,6 +53,14 @@ from tle.kcpc.features.contests import cog as contests_cog
 from tle.kcpc.features.contests.cog import KcpcContests, setup, sync_job_name
 from tle.kcpc.features.contests.reminders import ContestOccurrence
 from tle.kcpc.features.contests.repo import ContestInfo, ContestRepo, StoredContest
+from tle.kcpc.features.contests.results import RESULTS_JOB
+from tle.kcpc.features.contests.results_repo import (
+    CODEFORCES,
+    ResultContest,
+    ResultOutcome,
+    ResultRepo,
+    ResultStatus,
+)
 from tle.kcpc.features.contests.settings import (
     CONTESTS,
     SPEC,
@@ -63,9 +73,10 @@ from tle.kcpc.features.contests.sources import (
 )
 from tle.kcpc.features.contests.sync import SourceSnapshot
 from tle.kcpc.platforms.atcoder.contests import AtCoderContest, AtCoderContestsClient
+from tle.kcpc.platforms.atcoder.profile import AtCoderProfile
 from tle.kcpc.platforms.icpc import IcpcClient, IcpcContest
 from tle.kcpc.services import KcpcServices
-from tle.util import codeforces_api as cf
+from tle.util import codeforces_api as cf, events
 
 T = TypeVar('T')
 
@@ -74,6 +85,8 @@ GUILD = 1_100_000_000_000_000_001
 OTHER_GUILD = 1_100_000_000_000_000_002
 CHANNEL = 1_200_000_000_000_000_001
 ADMIN = 1_300_000_000_000_000_001  # the user ID of the admin in ``ctx``
+MEMBER = 1_300_000_000_000_000_002
+LEFT = 1_300_000_000_000_000_003  # once a member of GUILD
 
 MINUTE = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
@@ -85,7 +98,15 @@ SOURCES_LOGGER = 'tle.kcpc.features.contests.sources'
 ADMIN_LOGGER = 'tle.kcpc.bot.admin'
 UNREACHABLE = 'AtCoder is not responding right now. Please try again later.'
 UKIEPC_NAME = 'The 2026 ICPC UK & Ireland Programming Contest'
-ADMIN_COMMANDS = ['add', 'platforms', 'remove', 'settime', 'start-posts', 'sync']
+ADMIN_COMMANDS = [
+    'add',
+    'platforms',
+    'remove',
+    'results',
+    'settime',
+    'start-posts',
+    'sync',
+]
 DURATION_HINT = (
     'Give the duration in hours and minutes, such as 2h, 90m or 1h30m, '
     'from 1 minute to 7 days.'
@@ -105,16 +126,56 @@ DATE_AND_TIME = (
 TEARDOWN_TIMEOUT = 10
 
 
+class FakeUserDb:
+    """TLE's user database, as far as KCPC reads it: members' Codeforces handles.
+
+    ``handles`` are each guild's active ones: TLE marks those of members who
+    leave inactive.
+    """
+
+    def __init__(self) -> None:
+        self.handles: dict[int, list[tuple[int, str]]] = {}
+
+    async def get_handles_for_guild(self, guild_id: int) -> list[tuple[int, str]]:
+        return list(self.handles.get(guild_id, []))
+
+
 class KcpcBot(commands.Bot):
-    """A bot that carries KCPC services and TLE's Codeforces cache, as TLEBot does."""
+    """A bot that carries KCPC services and TLE's Codeforces cache, as TLEBot does.
+
+    It is in the servers in ``servers``. TLE's user database is there once a
+    test sets it, and so is TLE's event system (``event_sys``).
+    """
 
     kcpc: KcpcServices | None = None
     cf_cache: SimpleNamespace | None = None
+    user_db: FakeUserDb | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.servers: dict[int, MagicMock] = {}
+
+    def get_guild(self, id: int, /) -> discord.Guild | None:
+        return cast(discord.Guild | None, self.servers.get(id))
 
 
-def tle_cache(*contests: cf.Contest) -> SimpleNamespace:
-    """TLE's cache system, as far as the cog reads it."""
-    return SimpleNamespace(contest_cache=SimpleNamespace(contests=list(contests)))
+def tle_cache(
+    *contests: cf.Contest, changes: dict[int, list[cf.RatingChange]] | None = None
+) -> SimpleNamespace:
+    """TLE's cache system, as far as the cog reads it.
+
+    With ``changes``, it has the rating changes it saved, by contest ID.
+    """
+    cache = SimpleNamespace(contest_cache=SimpleNamespace(contests=list(contests)))
+    if changes is not None:
+
+        async def saved(contest_id: int) -> list[cf.RatingChange]:
+            return list(changes.get(contest_id, []))
+
+        cache.rating_changes_cache = SimpleNamespace(
+            get_rating_changes_for_contest=saved
+        )
+    return cache
 
 
 # Codeforces lists every past contest, so TLE's cache always has some.
@@ -166,7 +227,7 @@ class FakeSites:
     ``atcoder`` is AtCoder's upcoming table, and ``icpc`` icpc.global's
     contests by code: a code it lacks is unknown, as for a 404. ``errors``
     makes fetching 'atcoder', or an ICPC code, raise. ``fetched`` lists every
-    fetch: 'atcoder', or the ICPC code.
+    fetch: 'atcoder', or the ICPC code. ``profiles`` are AtCoder's profiles.
     """
 
     def __init__(self) -> None:
@@ -174,6 +235,7 @@ class FakeSites:
         self.icpc: dict[str, IcpcContest] = {}
         self.errors: dict[str, Exception] = {}
         self.fetched: list[str] = []
+        self.profiles = FakeProfiles()
 
     async def fetch_upcoming(self) -> list[AtCoderContest]:
         return self._answer('atcoder', list(self.atcoder))
@@ -187,6 +249,29 @@ class FakeSites:
         if error is not None:
             raise error
         return answer
+
+
+class FakeProfiles:
+    """AtCoder's profiles, by handle in any case; ``read`` lists each read."""
+
+    def __init__(self) -> None:
+        self.profiles: dict[str, AtCoderProfile] = {}
+        self.read: list[str] = []
+
+    def set(self, handle: str, rating: int, matches: int) -> None:
+        self.profiles[handle.lower()] = AtCoderProfile(
+            handle=handle,
+            rating=rating,
+            highest_rating=rating,
+            rated_matches=matches,
+            affiliation=None,
+            color='green',
+            url=f'https://atcoder.jp/users/{handle}',
+        )
+
+    async def fetch(self, handle: str) -> AtCoderProfile | None:
+        self.read.append(handle)
+        return self.profiles.get(handle.lower())
 
 
 @pytest.fixture
@@ -221,10 +306,9 @@ async def services(
         features=feature_registry,
         guild_settings=guild_settings,
         ledger=ledger,
-        publisher=DiscordPublisher(
-            MagicMock(spec=commands.Bot), guild_settings, ledger, clock
-        ),
-        # Reminders post through the fake, as they would through publisher.
+        # Contest results post through the publisher itself, and reminders
+        # through the engine's: both go to the fake.
+        publisher=cast(DiscordPublisher, publisher),
         reminders=ReminderEngine(guild_settings, ledger, publisher, clock),
         scheduler=Scheduler(db, clock),
     )
@@ -241,8 +325,12 @@ def sites(monkeypatch: pytest.MonkeyPatch) -> FakeSites:
     def client(http: HttpClient) -> FakeSites:
         return sites
 
+    def profiles(http: HttpClient) -> FakeProfiles:
+        return sites.profiles
+
     monkeypatch.setattr(contests_cog, 'AtCoderContestsClient', client)
     monkeypatch.setattr(contests_cog, 'IcpcClient', client)
+    monkeypatch.setattr(contests_cog, 'AtCoderProfileClient', profiles)
     return sites
 
 
@@ -425,6 +513,7 @@ async def test_loading_adds_the_commands_the_reminders_and_the_sync_jobs(
         for job in services.scheduler.status()
     ]
     assert jobs == [
+        ('contests.results', 'every 5m', False),
         ('contests.sync.atcoder', 'every 30m', False),
         ('contests.sync.codeforces', 'every 5m', False),
         ('contests.sync.icpc', 'every 6h', False),
@@ -471,7 +560,7 @@ async def test_the_sync_jobs_run_at_start_then_each_on_its_interval(
     services.scheduler.start()
     # Each job sleeps until its next slot once its first run is over.
     await eventually(
-        lambda: clock.pending_sleepers == 3 and len(sites.fetched) == 2,
+        lambda: clock.pending_sleepers == 4 and len(sites.fetched) == 2,
         'the jobs wait for their next slots',
     )
     assert sorted(sites.fetched) == ['UKIEPC', 'atcoder']
@@ -604,7 +693,7 @@ async def test_without_the_admin_cog_the_feature_runs_without_its_admin_commands
         assert set(bot.all_commands) == {'help', 'contests'}
         assert {command.name for command in bot.tree.get_commands()} == {'contests'}
         assert services.reminders.features == [CONTESTS]
-        assert len(services.scheduler.status()) == 3
+        assert len(services.scheduler.status()) == 4
 
         await bot.remove_cog('KcpcContests')
 
@@ -1335,6 +1424,33 @@ async def test_start_posts_can_be_turned_on_and_off(
     assert reply(ctx, ephemeral=True).description == text
 
 
+@pytest.mark.parametrize(
+    ('state', 'text'),
+    [
+        (
+            'on',
+            "Members' rating changes are now posted after each Codeforces and "
+            'AtCoder contest of the platforms this server follows, without a ping.',
+        ),
+        ('off', "Members' rating changes are no longer posted after contests."),
+    ],
+)
+async def test_results_posts_can_be_turned_on_and_off(
+    bot: KcpcBot,
+    ctx: MagicMock,
+    guild_settings: GuildSettingsRepo,
+    state: str,
+    text: str,
+) -> None:
+    await follow(guild_settings, results_posts=state == 'off')
+
+    await run(bot, 'kcpc contests results', ctx, state)
+
+    settings = await guild_settings.get_typed(GUILD, CONTESTS, ContestSettings)
+    assert settings.results_posts == (state == 'on')
+    assert reply(ctx, ephemeral=True).description == text
+
+
 async def test_sync_syncs_every_source_and_says_how_each_went(
     bot: KcpcBot,
     ctx: MagicMock,
@@ -1406,6 +1522,7 @@ ADMIN_CALLS = [
     ('kcpc contests remove', ('1',), {}),
     ('kcpc contests platforms', (), {'platforms': 'atcoder'}),
     ('kcpc contests start-posts', ('on',), {}),
+    ('kcpc contests results', ('off',), {}),
     ('kcpc contests sync', (), {}),
 ]
 
@@ -1601,7 +1718,7 @@ async def test_the_codeforces_job_waits_for_tles_cache(
     state = await repo.source_state('codeforces')
     assert state is not None and state.consecutive_failures == 1
     assert state.last_error == "TLE hasn't loaded Codeforces' contest list yet."
-    assert [job.failures for job in services.scheduler.status()] == [0, 0, 0]
+    assert [job.failures for job in services.scheduler.status()] == [0, 0, 0, 0]
 
 
 async def test_the_codeforces_job_reads_tles_cache(
@@ -1743,3 +1860,480 @@ def test_each_source_has_a_sync_job_of_its_own() -> None:
         'contests.sync.atcoder',
         'contests.sync.icpc',
     ]
+
+
+# Contest results: the cog's part (see test_contest_results for the rest).
+
+# A Codeforces round that ended an hour and three quarters ago.
+ENDED = cf_round(2051, NOW - 4 * HOUR, phase='FINISHED', division=2)
+RESULTS_LOGGER = 'tle.kcpc.features.contests.results'
+
+
+def rating_change(handle: str, place: int, old: int, new: int) -> cf.RatingChange:
+    """A rating change in ENDED, as TLE saves it."""
+    return cf.RatingChange(
+        contestId=ENDED.id,
+        contestName=ENDED.name,
+        handle=handle,
+        rank=place,
+        ratingUpdateTimeSeconds=to_epoch(NOW),
+        oldRating=old,
+        newRating=new,
+    )
+
+
+CHANGES = [
+    rating_change('tourist', 1, 3700, 3750),
+    rating_change('Amber_Owl', 30, 1500, 1623),
+    rating_change('Left_Owl', 40, 1500, 1550),
+]
+
+
+def server(guild_id: int, *members: int, chunked: bool = True) -> MagicMock:
+    """A guild with ``members``, all of them once ``chunked``."""
+    guild = MagicMock(spec=discord.Guild, id=guild_id, chunked=chunked)
+    guild.get_member.side_effect = lambda user_id: (
+        MagicMock(spec=discord.Member, id=user_id) if user_id in members else None
+    )
+    return guild
+
+
+@pytest.fixture
+async def installed(db: Database) -> None:
+    """KCPC has posted contest results before: it isn't a new install."""
+    old = ResultContest(CODEFORCES, '2000', 'Old round', None, NOW - 30 * DAY)
+    await ResultRepo(db).add_done([old], ResultOutcome.POSTED, now=NOW - 30 * DAY)
+
+
+@pytest.fixture
+def results_bot(admin_bot: KcpcBot, installed: None) -> KcpcBot:
+    """The admin bot, ready, in GUILD, with TLE's user database and events.
+
+    MEMBER has a Codeforces handle; LEFT had one, which TLE still has as
+    active, having missed them leave while it was down.
+    """
+    admin_bot.event_sys = events.EventSystem()  # type: ignore[attr-defined]
+    admin_bot.servers[GUILD] = server(GUILD, ADMIN, MEMBER)
+    admin_bot.user_db = FakeUserDb()
+    admin_bot.user_db.handles[GUILD] = [(MEMBER, 'amber_owl'), (LEFT, 'Left_Owl')]
+    admin_bot.cf_cache = tle_cache(FINISHED, ENDED, changes={})
+    admin_bot.is_ready = lambda: True  # type: ignore[method-assign]
+    return admin_bot
+
+
+def listeners(bot: KcpcBot) -> list[events.Listener]:
+    event_sys: events.EventSystem = bot.event_sys  # type: ignore[attr-defined]
+    return list(event_sys.listeners_by_event.get(events.RatingChangesUpdate, ()))
+
+
+def dispatch(bot: KcpcBot, changes: list[cf.RatingChange]) -> None:
+    """TLE saying it has saved ENDED's rating changes."""
+    event_sys: events.EventSystem = bot.event_sys  # type: ignore[attr-defined]
+    event_sys.dispatch(
+        events.RatingChangesUpdate, contest=ENDED, rating_changes=changes
+    )
+
+
+async def handled(listener: events.Listener) -> None:
+    """Wait until the listener has dealt with every event dispatched so far.
+
+    The task of each event takes the listener's lock as it starts, and the
+    lock goes to the tasks that wait for it in turn.
+    """
+    await asyncio.sleep(0)  # the events' tasks start
+    assert listener.lock is not None
+    async with listener.lock:
+        pass
+
+
+async def test_the_cog_listens_to_tles_rating_changes_while_loaded(
+    results_bot: KcpcBot, services: KcpcServices
+) -> None:
+    cog = await load_contests(results_bot)
+
+    (listener,) = listeners(results_bot)
+    assert listener.name == 'KcpcContestResults'
+    assert listener.func == cog._on_rating_changes
+    assert listener.lock is not None  # one event at a time
+
+    await results_bot.remove_cog('KcpcContests')
+
+    assert listeners(results_bot) == []
+    assert RESULTS_JOB not in [job.name for job in services.scheduler.status()]
+
+    again = await load_contests(results_bot)
+
+    (listener,) = listeners(results_bot)
+    assert listener.func == again._on_rating_changes
+
+
+async def test_unloading_after_the_listener_went_is_fine(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await load_contests(results_bot)
+    event_sys: events.EventSystem = results_bot.event_sys  # type: ignore[attr-defined]
+    (listener,) = listeners(results_bot)
+    event_sys.remove_listener(listener)
+
+    await results_bot.remove_cog('KcpcContests')
+
+    # discord.py logs an error that cog_unload raises, rather than raising it:
+    # the unload went to its end only if all it undoes is undone.
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert results_bot.get_cog('KcpcContests') is None
+    assert services.reminders.features == []
+    assert services.scheduler.status() == []
+    assert results_bot.get_command('kcpc contests') is None
+    kcpc = results_bot.tree.get_command('kcpc')
+    assert isinstance(kcpc, app_commands.Group)
+    assert kcpc.get_command('contests') is None
+
+    again = await load_contests(results_bot)
+
+    (listener,) = listeners(results_bot)
+    assert listener.func == again._on_rating_changes
+
+
+async def test_without_tles_events_the_results_job_still_runs(
+    bot: KcpcBot, services: KcpcServices, caplog: pytest.LogCaptureFixture
+) -> None:
+    # This bot has no event system, as without TLE's Codeforces features.
+    assert not hasattr(bot, 'event_sys')
+    assert RESULTS_JOB in [job.name for job in services.scheduler.status()]
+
+    await services.scheduler.run_slot(RESULTS_JOB)
+    await bot.remove_cog('KcpcContests')
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_a_load_that_cannot_add_the_results_job_is_undone(
+    results_bot: KcpcBot, services: KcpcServices
+) -> None:
+    async def other(slot: datetime) -> None:
+        pass
+
+    services.scheduler.add(
+        ScheduledJob(RESULTS_JOB, Every(HOUR), other, persistent=False)
+    )
+
+    with pytest.raises(ValueError, match='already scheduled'):
+        await load_contests(results_bot)
+
+    assert_nothing_left_by_a_failed_load(results_bot)
+    assert [job.name for job in services.scheduler.status()] == [RESULTS_JOB]
+    assert listeners(results_bot) == []
+    assert services.reminders.features == []
+
+
+async def test_a_load_with_tles_events_that_cannot_attach_its_commands_is_undone(
+    results_bot: KcpcBot, services: KcpcServices
+) -> None:
+    kcpc = command_named(results_bot, 'kcpc')
+    assert isinstance(kcpc, commands.HybridGroup)
+    clashing: commands.HybridGroup[Any, ..., Any] = commands.hybrid_group(
+        name='contests'
+    )(other_contests)
+    kcpc.add_command(clashing)
+
+    # It fails before it listens to TLE's events: the error is the clash's.
+    with pytest.raises(commands.CommandRegistrationError):
+        await load_contests(results_bot)
+
+    assert_nothing_left_by_a_failed_load(results_bot)
+    assert results_bot.get_command('kcpc contests') is clashing
+    assert services.reminders.features == []
+    assert services.scheduler.status() == []
+    assert listeners(results_bot) == []
+
+
+async def test_a_load_with_tles_events_that_cannot_add_a_sync_job_is_undone(
+    results_bot: KcpcBot, services: KcpcServices
+) -> None:
+    async def other(slot: datetime) -> None:
+        pass
+
+    taken = sync_job_name('atcoder')  # the Codeforces job is added before it
+    services.scheduler.add(ScheduledJob(taken, Every(HOUR), other, persistent=False))
+
+    with pytest.raises(ValueError, match='already scheduled'):
+        await load_contests(results_bot)
+
+    assert_nothing_left_by_a_failed_load(results_bot)
+    assert [job.name for job in services.scheduler.status()] == [taken]
+    assert results_bot.get_command('kcpc contests') is None
+    assert services.reminders.features == []
+    assert listeners(results_bot) == []
+
+
+async def test_the_results_job_runs_as_the_bot_starts(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    clock: FakeClock,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+) -> None:
+    await follow(guild_settings)
+    # TLE saved ENDED's rating changes while the bot was down.
+    results_bot.cf_cache = tle_cache(FINISHED, ENDED, changes={ENDED.id: CHANGES})
+    await load_contests(results_bot)
+
+    services.scheduler.start()
+
+    # At once: the clock doesn't reach the job's next slot, 5 minutes on.
+    await eventually(lambda: len(publisher.posts) == 1, 'the results are posted')
+    assert clock.now() == NOW
+
+
+async def test_tles_rating_changes_are_posted_once_in_each_server(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+) -> None:
+    await follow(guild_settings, GUILD)
+    # The bot isn't in the other server any more.
+    await follow(guild_settings, OTHER_GUILD)
+    results_bot.user_db.handles[OTHER_GUILD] = [(MEMBER, 'Amber_Owl')]  # type: ignore[union-attr]
+    await load_contests(results_bot)
+    (listener,) = listeners(results_bot)
+
+    dispatch(results_bot, CHANGES)
+    await eventually(lambda: len(publisher.posts) == 1, 'the results are posted')
+
+    (post,) = publisher.posts
+    assert post.keys == (f'results:{GUILD}:codeforces:2051',)
+    assert not post.message.mention_role
+    # In Codeforces' case; LEFT has left, whatever TLE says.
+    description = post.message.description
+    assert description is not None
+    assert description.splitlines() == [
+        '**Platform:** Codeforces',
+        f'**30.** <@{MEMBER}> [Amber\\_Owl](https://codeforces.com/profile/'
+        'Amber_Owl): 1500 → 1623 (**+123**), Specialist → Expert',
+    ]
+
+    # Neither the job nor the same news again posts it twice.
+    results_bot.cf_cache = tle_cache(FINISHED, ENDED, changes={ENDED.id: CHANGES})
+    await services.scheduler.run_slot(RESULTS_JOB)
+    dispatch(results_bot, CHANGES)
+    await handled(listener)
+
+    assert len(publisher.posts) == 1
+
+
+async def test_rating_changes_before_the_bot_is_ready_are_left_to_the_job(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    db: Database,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+) -> None:
+    await follow(guild_settings)
+    results_bot.is_ready = lambda: False  # type: ignore[method-assign]
+    await load_contests(results_bot)
+    (listener,) = listeners(results_bot)
+
+    dispatch(results_bot, CHANGES)
+    await handled(listener)
+
+    assert publisher.posts == []
+    assert await ResultRepo(db).get(CODEFORCES, '2051') is None
+
+    # TLE saved them before it said so.
+    results_bot.cf_cache = tle_cache(FINISHED, ENDED, changes={ENDED.id: CHANGES})
+    await services.scheduler.run_slot(RESULTS_JOB)
+
+    assert [post.keys for post in publisher.posts] == [
+        (f'results:{GUILD}:codeforces:2051',)
+    ]
+    record = await ResultRepo(db).get(CODEFORCES, '2051')
+    assert record is not None and record.status is ResultStatus.DONE
+
+
+async def test_until_the_bot_has_every_member_everyone_counts(
+    results_bot: KcpcBot,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+) -> None:
+    await follow(guild_settings)
+    results_bot.servers[GUILD] = server(GUILD, MEMBER, chunked=False)
+    await load_contests(results_bot)
+
+    dispatch(results_bot, CHANGES)
+    await eventually(lambda: len(publisher.posts) == 1, 'the results are posted')
+
+    description = publisher.posts[0].message.description
+    assert description is not None
+    assert [line.split()[1] for line in description.splitlines()[1:]] == [
+        f'<@{MEMBER}>',
+        f'<@{LEFT}>',
+    ]
+
+
+async def test_a_listener_that_outlives_the_cog_logs_its_failure(
+    results_bot: KcpcBot,
+    db: Database,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=COG_LOGGER)
+    await follow(guild_settings)
+    await load_contests(results_bot)
+
+    # TLE's event starts a task, which gets going once the bot has shut down.
+    (listener,) = listeners(results_bot)
+    assert listener.lock is not None
+    async with listener.lock:
+        dispatch(results_bot, CHANGES)
+        await results_bot.remove_cog('KcpcContests')
+        await db.close()
+    await handled(listener)
+
+    assert publisher.posts == []
+    (record,) = [r for r in caplog.records if r.name == COG_LOGGER]
+    assert record.levelno == logging.INFO
+    assert record.exc_info is not None
+    assert record.exc_info[0] is sqlite3.ProgrammingError  # the database is closed
+    assert record.getMessage() == (
+        'Could not post the results of Codeforces contest 2051; the results job '
+        'tries again'
+    )
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_a_listener_that_finds_kcpc_shut_down_logs_its_failure(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=COG_LOGGER)
+    await follow(guild_settings)
+    await load_contests(results_bot)
+
+    # TLEBot.close() shuts KCPC down, closing kcpc.db, before discord.py
+    # unloads the cog, and TLE's event starts a task that gets going between.
+    (listener,) = listeners(results_bot)
+    assert listener.lock is not None
+    async with listener.lock:
+        dispatch(results_bot, CHANGES)
+        await services.shutdown()
+    await eventually(
+        lambda: any(r.name == COG_LOGGER for r in caplog.records), 'it is logged'
+    )
+    await results_bot.remove_cog('KcpcContests')
+
+    assert publisher.posts == []
+    (record,) = [r for r in caplog.records if r.name == COG_LOGGER]
+    assert record.levelno == logging.INFO
+    assert record.exc_info is not None
+    assert record.exc_info[0] is sqlite3.ProgrammingError  # the database is closed
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_a_listener_failure_after_the_cog_unloaded_is_info(
+    monkeypatch: pytest.MonkeyPatch,
+    results_bot: KcpcBot,
+    guild_settings: GuildSettingsRepo,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=COG_LOGGER)
+    await follow(guild_settings)
+    await load_contests(results_bot)
+
+    async def broken(guild_id: int) -> list[tuple[int, str]]:
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(results_bot.user_db, 'get_handles_for_guild', broken)
+
+    # The extension is unloaded, as for a reload, while TLE's event waits; the
+    # database stays open.
+    (listener,) = listeners(results_bot)
+    assert listener.lock is not None
+    async with listener.lock:
+        dispatch(results_bot, CHANGES)
+        await results_bot.remove_cog('KcpcContests')
+    await eventually(
+        lambda: any(r.name == COG_LOGGER for r in caplog.records), 'it is logged'
+    )
+
+    (record,) = [r for r in caplog.records if r.name == COG_LOGGER]
+    assert record.levelno == logging.INFO
+    assert record.exc_info is not None and str(record.exc_info[1]) == 'boom'
+
+
+async def test_a_listener_failure_while_loaded_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    results_bot: KcpcBot,
+    guild_settings: GuildSettingsRepo,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await follow(guild_settings)
+    await load_contests(results_bot)
+
+    async def broken(guild_id: int) -> list[tuple[int, str]]:
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(results_bot.user_db, 'get_handles_for_guild', broken)
+
+    dispatch(results_bot, CHANGES)
+    await eventually(
+        lambda: any(r.name == COG_LOGGER for r in caplog.records), 'it is logged'
+    )
+
+    (record,) = [r for r in caplog.records if r.name == COG_LOGGER]
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and str(record.exc_info[1]) == 'boom'
+    # TLE's own handler logs nothing: the cog did.
+    assert [r for r in caplog.records if r.name == 'Listener'] == []
+
+
+async def test_atcoder_handles_come_from_the_handle_registry(
+    results_bot: KcpcBot,
+    services: KcpcServices,
+    clock: FakeClock,
+    sites: FakeSites,
+    repo: ContestRepo,
+    guild_settings: GuildSettingsRepo,
+    publisher: FakePublisher,
+) -> None:
+    class AtCoderLinks:
+        async def linked_handle(
+            self, guild_id: int, user_id: int, platform: str
+        ) -> str | None:
+            return None
+
+        async def linked_handles(
+            self, guild_id: int, platform: str
+        ) -> list[tuple[int, str]]:
+            # AtCoder links stay when members leave.
+            return [(MEMBER, 'Amber_Owl'), (LEFT, 'Left_Owl')]
+
+    await follow(guild_settings)
+    services.handles.register('atcoder', AtCoderLinks())
+    abc = atcoder_contest('abc478', NOW + 10 * MINUTE)
+    info = ContestInfo(
+        'atcoder', abc.contest_id, abc.name, abc.start, None, abc.end, abc.url
+    )
+    await repo.add([info], now=NOW)
+    sites.profiles.set('Amber_Owl', 1200, 5)
+    sites.profiles.set('Left_Owl', 1500, 9)
+    await load_contests(results_bot)
+
+    await clock.advance_to(abc.end - 30 * MINUTE)
+    await services.scheduler.run_slot(RESULTS_JOB)
+
+    assert sites.profiles.read == ['Amber_Owl']
+
+    sites.profiles.set('Amber_Owl', 1290, 6)
+    await clock.advance_to(abc.end + 15 * MINUTE)
+    await services.scheduler.run_slot(RESULTS_JOB)
+
+    (post,) = publisher.posts
+    assert post.keys == (f'results:{GUILD}:atcoder:abc478',)
+    assert post.message.title == 'Results: AtCoder Beginner Contest 478'
