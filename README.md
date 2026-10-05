@@ -28,11 +28,14 @@ everything.
 The bot also runs the KCPC club's own features (in `tle/kcpc`), added in
 phases. So far it reminds members of the club's workshops on Luma and of
 contests: Codeforces, AtCoder, ICPC and the club's own, and with a clist.by
-account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. Members can
-also link their Codeforces and AtCoder accounts, for profiles and server
-leaderboards. Each Friday it posts a problem from Codeforces or AtCoder, with
-its solution the Friday after, and `/randproblem` gives members a random
-problem by topic and difficulty.
+account, CodeChef, LeetCode, TopCoder and the ICPC World Finals. After
+Codeforces and AtCoder contests, it posts how members' ratings changed.
+Members can also link their Codeforces and AtCoder accounts, for profiles and
+server leaderboards. Each Friday it posts a problem from Codeforces or
+AtCoder, with its solution the Friday after, and `/randproblem` gives members
+a random problem by topic and difficulty. On the 1st of each month it posts
+an algorithm of the month: a data structure or algorithm to learn, with where
+to read about it.
 `tle/kcpc/__init__.py` outlines how it is put together. KCPC keeps its data
 in its own database, `data/db/kcpc.db`, and doesn't run when the bot is
 started with `--nodb`.
@@ -41,13 +44,14 @@ Every extension, TLE's or KCPC's, can be switched off with
 `DISABLED_EXTENSIONS`: e.g. `tle.duel,tle.graphs,tle.starboard`, or `kcpc`
 for all of KCPC. KCPC's extensions are `kcpc.admin` (`/kcpc`),
 `kcpc.workshops` (workshop reminders, `/event` and `/kcpc workshops`),
-`kcpc.contests` (contest reminders, `/contests` and `/kcpc contests`),
-`kcpc.accounts` (account linking, `/link`, `/unlink`, `/profile`, `/rank` and
-`/kcpc accounts`), `kcpc.problems` (the weekly problem, `/randproblem`,
-`/weekly` and `/kcpc weekly`) and `kcpc.notify` (`/notify`). KCPC's own
-settings are all optional: `KCPC_TIMEZONE`, `KCPC_DB_PATH`, `HTTP_USER_AGENT`,
-`LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`, `CLIST_USERNAME` and `CLIST_API_KEY`
-(see §3 and `.env.example`).
+`kcpc.contests` (contest reminders and results, `/contests` and
+`/kcpc contests`), `kcpc.accounts` (account linking, `/link`, `/unlink`,
+`/profile`, `/rank` and `/kcpc accounts`), `kcpc.problems` (the weekly
+problem, `/randproblem`, `/weekly` and `/kcpc weekly`), `kcpc.algo` (the
+algorithm of the month, `/algo` and `/kcpc algo`) and `kcpc.notify`
+(`/notify`). KCPC's own settings are all optional: `KCPC_TIMEZONE`,
+`KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`,
+`CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and `.env.example`).
 
 Server admins set KCPC up with `/kcpc` (or `;kcpc`). It needs the Manage
 Server permission or the `TLE_ADMIN` role. Discord only shows `/kcpc` to
@@ -62,8 +66,7 @@ under Server Settings → Integrations.
 /kcpc status                        database, jobs, post counts and recent skips
 ```
 
-The features are `algo`, `contests`, `weekly` and `workshops`; so far, only
-`algo` doesn't post anything.
+The features are `algo`, `contests`, `weekly` and `workshops`.
 
 #### Workshop reminders
 
@@ -114,6 +117,7 @@ To have the bot remind a server of upcoming contests:
 /kcpc role contests @Contests                    a pings-only role they mention
 /kcpc contests platforms codeforces atcoder      which platforms (all by default)
 /kcpc contests start-posts on                    also post as each contest starts
+/kcpc contests results off                       no results posts (on by default)
 /kcpc enable contests                            start reminding
 ```
 
@@ -184,9 +188,50 @@ Members can use:
 /notify contests on|off         get the contest pings, or stop them
 ```
 
+After each Codeforces and AtCoder contest of the server's platforms, the bot
+posts the results in the same channel, without a ping: each member who took
+part, with their handle and how their rating changed (old → new, and by how
+much), the biggest gains first, and on Codeforces their place and any change
+of rank, such as Pupil → Specialist. It lists members who linked the account
+(`/link`, or TLE's `;handle set` for Codeforces) and are still in the server,
+up to 30 of them (fewer if their lines are long), then how many more there
+are, and a contest in which no member was rated gets no post.
+
+Codeforces results are posted as soon as TLE has read the contest's rating
+changes: usually a few hours after the contest, or the next day after a round
+with a 12-hour open hacking phase (Educational, Div. 3 and Div. 4 rounds). The
+bot reads them from TLE's own copy, so it asks Codeforces for nothing more,
+and after a restart it catches up on the contests of the last 48 hours.
+AtCoder lets bots read only users' profiles: their rating and how many rated
+contests they have taken part in. So in the last half hour of an ABC, ARC or
+AGC, the bot reads the profile of each member's linked AtCoder account, then
+reads them again from 15 minutes after the end, every 30 minutes for up to 6
+hours, until their ratings change. If the bot is down from before it sees
+them change until those 6 hours run out, the contest gets no post. AtCoder
+results have no places, as AtCoder's standings are off limits to bots.
+Heuristic contests (AHC) and other series get no results posts.
+
+While the bot reads for one AtCoder contest, another may end. A member's
+rating change then goes to the contest that ended first, unless the member's
+profile, read for the later contest over an hour after the first ended,
+showed that they hadn't taken part in the first. So a member's change can go
+to the wrong contest when two contests end together, when AtCoder rates both
+between two of the bot's reads, when it rates the first over an hour after
+its end, or when a contest ends less than an hour and a half after one that
+no member took part in.
+
+On a new install, the bot posts no results of contests that ended before it
+started. Admins turn the results posts off, or on again, with
+`/kcpc contests results off|on`, for Codeforces and AtCoder alike.
+
 TLE's own contest reminders (`;remind`) also ping for Codeforces rounds. In a
 server that uses KCPC's contest reminders, a TLE admin should switch TLE's off
-with `;remind clear`, or members are pinged twice for each round.
+with `;remind clear`, or members are pinged twice for each round. Likewise,
+TLE's `;roleupdate publish here` posts the rank changes and the top rating
+gains of a server's members after each rated Codeforces round, in the channel
+where it was run. A server that wants one post per round should turn off one
+of them: TLE's with `;roleupdate publish off`, or KCPC's with
+`/kcpc contests results off`, which stops its AtCoder results too.
 
 #### Account linking
 
@@ -364,6 +409,64 @@ gives a problem anyway and says it couldn't check them all. Until the bot has
 read the problems after a restart, `/randproblem` and `/kcpc weekly queue` ask
 to try again in a few minutes.
 
+#### Algorithm of the month
+
+To have the bot post an algorithm of the month in a server:
+
+```text
+/kcpc channel algo #algorithms   where the topics go
+/kcpc role algo @Algo            a pings-only role each topic mentions
+/kcpc enable algo                start posting
+```
+
+On the 1st of each month at 12:00 in the club's time zone (`KCPC_TIMEZONE`),
+the bot posts a data structure or algorithm to learn that month, such as
+prefix sums, Dijkstra's algorithm or the segment tree: what it is for, how far
+into the syllabus it is (beginner, intermediate or advanced), and links to its
+articles on GeeksforGeeks and, where it has one, cp-algorithms. The post
+mentions the role. The first topic comes on the next 1st, unless an admin
+posts this month's at once with `/kcpc algo post-now`: the first time the bot
+starts with this feature, it posts nothing, even on the 1st. If the bot is
+down at noon, it posts when it is back, up to 24 hours late; any later and it
+skips that month, though `post-now` can still post it until the next 1st.
+
+The topic is picked at random from a list of about 40, the usual
+competitive-programming syllabus from prefix sums to maximum flow. A server
+doesn't get a topic again until it has had every one in the list; then the
+list starts over. A topic whose post never went out doesn't count.
+
+Admins can change the topic and see what comes next:
+
+```text
+/kcpc algo reroll     replace this month's topic with another, and post it
+/kcpc algo post-now   post this month's topic now
+/kcpc algo preview    the next post, this month's topic and the topics left
+```
+
+`reroll` picks another topic that the server hasn't had since the list last
+started over, and posts it, saying which topic it replaces, if that one was
+posted; the topic it replaces can come up again later. When this month's
+topic is the last one left before the list starts over, there is none to
+reroll to. While Discord hasn't confirmed this month's last post, `reroll`
+asks you to try again in a few minutes. `post-now` posts this month's topic,
+or says that it is out already, or that Discord refused it earlier, so that
+it can't go out again (`reroll` posts another). Before noon on the 1st, both
+act on the month before, and their replies name the month. `preview` shows
+when and where the next topic posts (or why it won't), this month's topic
+and whether it was posted, and how many topics are left before the list
+starts over.
+
+Members can use:
+
+```text
+/algo current         this month's topic
+/algo history         the topics so far
+/notify algo on|off   get the algorithm of the month pings, or stop them
+```
+
+`/algo current` (also plain `;algo`) links the topic's articles, and
+`/algo history` lists this month's and earlier months' topics, newest first.
+
 ---
 
 ## 2 · Quick start (production)
@@ -431,12 +534,16 @@ every key in `.env` to the container. Run without Docker, the bot reads
 * `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
   bot has read (and the contests and times admins have set), members' AtCoder
   links and the links waiting to be verified, the ratings last read for
-  `/profile` and `/rank`, each server's weekly problems and queue, the
-  progress of KCPC's scheduled jobs, and the delivery ledger, which records
-  KCPC's automatic posts so that none goes out twice. Before each upgrade of
-  its database the bot copies it to `kcpc.db.v<N>.bak`, next to it. If you set
-  `KCPC_DB_PATH`, these files are there instead; under Docker, keep that path
-  inside `data/`, or they are lost when the container is recreated.
+  `/profile` and `/rank`, each server's weekly problems and queue and its
+  algorithms of the month, when results posts started and the contests whose
+  results the bot has worked on since (members' rating changes, and the
+  AtCoder ratings it compares them with),
+  the progress of KCPC's scheduled jobs, and the delivery ledger, which
+  records KCPC's automatic posts so that none goes out twice. Before each
+  upgrade of its database the bot copies it to `kcpc.db.v<N>.bak`, next to
+  it. If you set `KCPC_DB_PATH`, these files are there instead; under Docker,
+  keep that path inside `data/`, or they are lost when the container is
+  recreated.
 * `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
   but an admin has to refill the rating changes and problemsets with
   `;cache ratingchanges all` and `;cache problemsets all`.

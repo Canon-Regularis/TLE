@@ -19,6 +19,15 @@ class HandleSource(Protocol):
         """The member's handle on ``platform``, in the platform's case, or None."""
         ...
 
+    async def linked_handles(
+        self, guild_id: int, platform: str
+    ) -> list[tuple[int, str]]:
+        """``(user_id, handle)`` of each link on ``platform`` in the guild.
+
+        Links of members who have left the guild are included.
+        """
+        ...
+
 
 class HandleRegistry:
     """The source of members' handles on each platform, as features register them.
@@ -59,3 +68,17 @@ class HandleRegistry:
         if source is None:
             return None
         return await source.linked_handle(guild_id, user_id, platform)
+
+    async def linked_handles(
+        self, guild_id: int, platform: str
+    ) -> list[tuple[int, str]]:
+        """``(user_id, handle)`` of each link on ``platform`` in the guild.
+
+        Links of members who have left the guild are included, so a caller
+        that wants only members checks. None are known when no feature keeps
+        handles on the platform.
+        """
+        source = self._sources.get(platform)
+        if source is None:
+            return []
+        return await source.linked_handles(guild_id, platform)
