@@ -232,7 +232,7 @@ class AccountService:
         the cog can read, so for Codeforces the cog passes ``current_handle``,
         the member's handle there, and ``owner_id``, whoever has ``handle``
         there, members who left included. A member who has a Codeforces
-        handle can't link another: as TLE has it, an Admin or Moderator
+        handle can't link another: as TLE has it, a moderator or admin
         changes it. ``vet``, if given, checks the profile once it is fetched,
         and raises ``KcpcUserError`` for an account that couldn't be linked
         anyway, so that the member isn't sent to edit their profile for
@@ -493,7 +493,7 @@ def _ranking_key(
 def _codeforces_handle_set(handle: str) -> str:
     return (
         f'Your Codeforces handle is already set to {_escape(handle)}. '
-        'Ask an Admin or Moderator if you wish to change it.'
+        'To change it, ask a moderator or admin.'
     )
 
 

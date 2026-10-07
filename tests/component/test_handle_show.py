@@ -237,7 +237,7 @@ async def test_slash_handle_show_reaches_discord_saying_what_it_does(
         # ;help keeps the group's brief, and ;handle show is there too.
         prefix_group = bot.get_command('handle')
         assert prefix_group is not None
-        assert prefix_group.brief == 'Commands that have to do with handles'
+        assert prefix_group.brief == 'Link, show and look up Codeforces handles'
         assert bot.get_command('handle show') is not None
     finally:
         await bot.close()
@@ -247,6 +247,6 @@ def test_help_stays_with_the_group_and_its_other_commands(handles: ModuleType) -
     group = handles.Handles.handle
 
     assert group.help.startswith(
-        'Change or collect information about specific handles on Codeforces'
+        'Show the handles a member has linked: yours, if you name no one.'
     )
     assert {'set', 'get', 'identify', 'remove', 'show'} <= set(group.all_commands)

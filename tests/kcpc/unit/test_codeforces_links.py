@@ -176,7 +176,9 @@ class TestCheckRankRole:
             check_rank_role(guild, 1700)
 
         assert type(excinfo.value) is KcpcUserError
-        assert str(excinfo.value) == 'Role for rank `Expert` not present in the server'
+        assert str(excinfo.value) == (
+            'Role for rank `Expert` not present in the server.'
+        )
         check_rank_role(guild, 1900)  # Candidate Master's role is still there
 
 
@@ -228,7 +230,9 @@ class TestLink:
         with pytest.raises(KcpcUserError) as excinfo:
             await link(bot, guild, member, HANDLE)
 
-        assert str(excinfo.value) == 'Role for rank `Expert` not present in the server'
+        assert str(excinfo.value) == (
+            'Role for rank `Expert` not present in the server.'
+        )
         assert await linked_handle(bot, GUILD_ID, MEMBER_ID) is None
         assert await user_db.fetch_cf_user(HANDLE) is None
         member.add_roles.assert_not_awaited()

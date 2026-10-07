@@ -2,11 +2,13 @@
 
 - ``/link codeforces <handle>`` and ``/link atcoder <handle>`` give the member
   a token to put on the account's profile, with a Verify button (see
-  ``views``); ``/link verify <platform>`` does what the button does. How the
-  token proves the account is the member's is in ``service``.
+  ``views``); ``/link verify <platform>`` does what the button does. Each of
+  the three can be used once every 10 seconds by each member, and a member
+  verifies at most that often, by command or button alike. How the token
+  proves the account is the member's is in ``service``.
 - Codeforces handles are linked in TLE's own table, the rank role given as by
   ``;handle set``, through ``tle.kcpc.bot.codeforces_links``. TLE's commands
-  share them, so moderators unlink them, with ``/handle remove``. AtCoder
+  share them, so moderators unlink them, with ``;handle remove``. AtCoder
   accounts are linked in kcpc.db, and ``/unlink atcoder`` unlinks them.
 - While the cog is loaded, other features read members' AtCoder handles
   through ``KcpcServices.handles`` (see ``tle.kcpc.core.handles``), where the
@@ -30,6 +32,7 @@
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -89,13 +92,22 @@ _PURGE_INTERVAL = timedelta(hours=1)
 _PER_PAGE = 10  # members on each page of /rank
 # The longest handle either platform allows: Codeforces' 24 characters.
 _MAX_HANDLE_LENGTH = 24
+# Seconds before a member can use each /link command again: each use asks
+# Codeforces or AtCoder for a profile. The cooldowns are put on the commands
+# themselves, above their decorators: on the functions below them, discord.py
+# would share one cooldown among the copies it makes of a command, one for each
+# cog it loads, so a cog loaded again would keep the old cog's cooldowns. The
+# Verify button has no cooldown of its own, so verifying, whichever way, keeps
+# to the same rate (see KcpcAccounts.verify_link).
+_LINK_COOLDOWN = 10.0
+_VERIFY_AGAIN_TEXT = 'You can verify again in {seconds} {unit}.'
 # Seconds /profile waits for fresh ratings before it shows the stored ones. The
 # sites' own timeouts, with retries, run to minutes.
 _PROFILE_REFRESH_WAIT = 10.0
 
 _UNLINK_CODEFORCES = (
-    "Your Codeforces handle is shared with TLE's commands, such as gitgud, duels "
-    'and rank roles, so an Admin or Moderator unlinks it, with /handle remove.'
+    'Your Codeforces handle is also used by gitgud, duels and rank roles, so a '
+    'moderator or admin unlinks it, with `;handle remove`.'
 )
 # Who can free an AtCoder handle that someone else here linked, when there is
 # no /kcpc accounts unlink for an admin to use: kcpc.admin is switched off.
@@ -140,6 +152,8 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
     # Set by cog_load, which runs before any command or job of the cog can.
     _service: AccountService
     _refresher: RatingRefresher
+    # When each member last verified, on the services' monotonic clock.
+    _verified_at: dict[int, float]
 
     async def cog_load(self) -> None:
         """Make the service, add the Verify button and admin commands, then the jobs.
@@ -153,6 +167,7 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         atcoder = AtCoderProfileClient(services.http)
         self._service = AccountService(repo, atcoder, services.clock)
         self._refresher = RatingRefresher(repo, atcoder, services.clock)
+        self._verified_at = {}
         # Other features read members' AtCoder handles from the service.
         services.handles.register(ATCODER, self._service)
         added: list[str] = []
@@ -189,14 +204,16 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
     @commands.hybrid_group(name='link', brief='Link your Codeforces or AtCoder account')  # type: ignore[arg-type]
     @commands.guild_only()
     async def link(self, ctx: commands.Context[Any]) -> None:
-        """Link your Codeforces or AtCoder account, to show it on /profile and /rank.
+        """Link your Codeforces or AtCoder account, to show it on /profile and
+        /rank.
 
-        You get a token to put on your profile for a few minutes, which proves
-        the account is yours.
+        You put a token on the account's profile for a few minutes, which
+        proves that the account is yours.
         """
         # Only ;link gets here: Discord can't run a slash group.
         await ctx.send_help(ctx.command)
 
+    @commands.cooldown(1, _LINK_COOLDOWN, commands.BucketType.user)
     @link.command(name='codeforces', brief='Link your Codeforces account')  # type: ignore[arg-type]
     @app_commands.describe(handle='Your Codeforces handle')
     async def link_codeforces(
@@ -204,12 +221,18 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         ctx: commands.Context[Any],
         handle: commands.Range[str, 1, _MAX_HANDLE_LENGTH],
     ) -> None:
-        """Link your Codeforces account, with a token in its Organization.
+        """Link your Codeforces account: you get a token to put in its
+        Organization field, then press Verify.
 
-        TLE's commands, such as gitgud, duels and rank roles, use it too.
+        Gitgud, duels and rank roles use the handle too.
+
+        Examples:
+            /link codeforces alice_cp
+            ;link codeforces alice_cp
         """
         await self._start_link(ctx, CODEFORCES, handle)
 
+    @commands.cooldown(1, _LINK_COOLDOWN, commands.BucketType.user)
     @link.command(name='atcoder', brief='Link your AtCoder account')  # type: ignore[arg-type]
     @app_commands.describe(handle='Your AtCoder username')
     async def link_atcoder(
@@ -217,17 +240,27 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         ctx: commands.Context[Any],
         handle: commands.Range[str, 1, _MAX_HANDLE_LENGTH],
     ) -> None:
-        """Link your AtCoder account, with a token in its Affiliation."""
+        """Link your AtCoder account: you get a token to put in its
+        Affiliation field, then press Verify.
+
+        Examples:
+            /link atcoder alice_cp
+            ;link atcoder alice_cp
+        """
         await self._start_link(ctx, ATCODER, handle)
 
+    @commands.cooldown(1, _LINK_COOLDOWN, commands.BucketType.user)
     @link.command(name='verify', brief='Verify the account you are linking')  # type: ignore[arg-type]
-    @app_commands.describe(platform='Where the account is')
+    @app_commands.describe(platform='The platform of the account you are linking')
     async def link_verify(
         self, ctx: commands.Context[Any], platform: Literal['codeforces', 'atcoder']
     ) -> None:
-        """Check the token is on your profile, and link the account if it is.
+        """Check that the token is on your profile, and link the account if it
+        is. It does what pressing Verify does.
 
-        The same as pressing Verify.
+        Examples:
+            /link verify codeforces
+            ;link verify atcoder
         """
         await ctx.defer(ephemeral=True)
         embed = await self.verify_link(_guild(ctx), _author(ctx), platform)
@@ -239,7 +272,11 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         """Link the account the member is linking, if its profile shows the token.
 
         What /link verify and the Verify button do; returns the reply to show.
+        Each check asks Codeforces or AtCoder for the profile, so a member can
+        verify once every _LINK_COOLDOWN seconds, by command or button:
+        ``KcpcUserError``, saying when, before then.
         """
+        self._count_verification(member.id)
         service = self._service
         if platform == CODEFORCES:
             current = await codeforces_links.linked_handle(
@@ -271,16 +308,40 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         )
         return success_embed(_linked_text(profile))
 
-    @commands.hybrid_command(brief='Unlink your AtCoder account')  # type: ignore[arg-type]
+    def _count_verification(self, member_id: int) -> None:
+        """Count a verification by member ``member_id`` now; ``KcpcUserError``
+        if their last one was less than _LINK_COOLDOWN seconds ago.
+        """
+        now = self.services.clock.monotonic()
+        # Forget the members who may verify again.
+        self._verified_at = {
+            member: at
+            for member, at in self._verified_at.items()
+            if now - at < _LINK_COOLDOWN
+        }
+        last = self._verified_at.get(member_id)
+        if last is not None:
+            seconds = max(1, math.ceil(_LINK_COOLDOWN - (now - last)))
+            unit = 'second' if seconds == 1 else 'seconds'
+            raise KcpcUserError(_VERIFY_AGAIN_TEXT.format(seconds=seconds, unit=unit))
+        self._verified_at[member_id] = now
+
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        brief='Unlink your AtCoder account; a moderator unlinks Codeforces handles'
+    )
     @commands.guild_only()
-    @app_commands.describe(platform='Where the account is')
+    @app_commands.describe(platform='The platform of the account to unlink')
     async def unlink(
         self, ctx: commands.Context[Any], platform: Literal['codeforces', 'atcoder']
     ) -> None:
-        """Unlink your AtCoder account.
+        """Unlink your AtCoder account, so that /profile and /rank leave it out.
 
-        An Admin or Moderator unlinks Codeforces handles, with /handle remove,
-        since TLE's commands use them too.
+        Your Codeforces handle is also used by gitgud, duels and rank roles,
+        so a moderator or admin unlinks it, with ;handle remove.
+
+        Examples:
+            /unlink atcoder
+            ;unlink atcoder
         """
         guild, member = _guild(ctx), _author(ctx)
         if platform == CODEFORCES:
@@ -289,14 +350,16 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         handle = _escape(removed.handle)
         await _reply(ctx, success_embed(f'Unlinked your AtCoder account {handle}.'))
 
-    @commands.hybrid_group(name='accounts', brief="Members' linked accounts")  # type: ignore[arg-type]
+    @commands.hybrid_group(  # type: ignore[arg-type]
+        name='accounts', brief='Manage the AtCoder accounts that members linked'
+    )
     @kcpc_admin_only()
     async def accounts_admin(self, ctx: commands.Context[Any]) -> None:
-        """Unlink a member's AtCoder account, e.g. one that isn't theirs."""
+        """Unlink a member's AtCoder account, such as one that isn't theirs."""
         # Only ;kcpc accounts gets here: Discord can't run a slash group.
         await ctx.send_help(ctx.command)
 
-    @accounts_admin.command(name='unlink', brief="Unlink anyone's AtCoder account")  # type: ignore[arg-type]
+    @accounts_admin.command(name='unlink', brief="Unlink a member's AtCoder account")  # type: ignore[arg-type]
     @app_commands.describe(handle='The AtCoder username to unlink')
     @kcpc_admin_only()
     async def admin_unlink(
@@ -306,10 +369,13 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
     ) -> None:
         """Unlink an AtCoder account from whoever linked it in this server.
 
-        It frees the handle of a member who linked an account that isn't
-        theirs, so that its owner can link it, or removes the link of a member
-        who left (which doesn't stop anyone who proves the account is theirs
-        from linking it). Codeforces handles are removed with /handle remove.
+        Use it to free a handle that a member linked but doesn't own, so that
+        its owner can link it. Codeforces handles are removed with
+        ;handle remove.
+
+        Examples:
+            /kcpc accounts unlink alice_cp
+            ;kcpc accounts unlink alice_cp
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -331,15 +397,19 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
             ),
         )
 
-    @commands.hybrid_command(brief="A member's linked accounts and ratings")  # type: ignore[arg-type]
+    @commands.hybrid_command(brief="Show a member's linked accounts and ratings")  # type: ignore[arg-type]
     @commands.guild_only()
     @app_commands.describe(member='Whose accounts to show; yours if left out')
     async def profile(
         self, ctx: commands.Context[Any], member: discord.Member | None = None
     ) -> None:
-        """Show a member's linked Codeforces and AtCoder accounts, with ratings.
+        """Show a member's linked Codeforces and AtCoder accounts, with their
+        ratings. Ratings more than an hour old are refreshed first.
 
-        Ratings more than an hour old are refreshed first.
+        Examples:
+            /profile
+            /profile member:@alice
+            ;profile @alice
         """
         await ctx.defer()
         guild = _guild(ctx)
@@ -362,15 +432,24 @@ class KcpcAccounts(KcpcCog, name=ACCOUNTS_COG):
         ]
         await ctx.send(embeds=embeds)
 
-    @commands.hybrid_command(brief="This server's members by rating")  # type: ignore[arg-type]
+    @commands.hybrid_command(brief="Rank this server's members by rating")  # type: ignore[arg-type]
     @commands.guild_only()
-    @app_commands.describe(platform='Codeforces if left out')
+    @app_commands.describe(
+        platform='The platform whose ratings to rank by; Codeforces if left out'
+    )
     async def rank(
         self,
         ctx: commands.Context[Any],
         platform: Literal['codeforces', 'atcoder'] = 'codeforces',
     ) -> None:
-        """Rank this server's members by their current Codeforces or AtCoder rating."""
+        """Rank this server's members by their current Codeforces or AtCoder
+        rating. Only members who linked an account there are ranked.
+
+        Examples:
+            /rank
+            /rank platform:atcoder
+            ;rank atcoder
+        """
         guild = _guild(ctx)
         members = await self._linked_members(guild, platform)
         standings = await self._service.leaderboard(platform, members)

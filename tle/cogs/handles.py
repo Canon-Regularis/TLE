@@ -5,11 +5,13 @@ import datetime as dt
 import html
 import io
 import logging
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, Literal
 
 import cairo
 import discord
 import gi
+from discord import app_commands
 from discord.ext import commands
 
 from tle import constants
@@ -37,6 +39,36 @@ _PAGINATE_WAIT_TIME = 5 * 60  # 5 minutes
 _TOP_DELTAS_COUNT = 10
 _MAX_RATING_CHANGES_PER_EMBED = 15
 _UPDATE_HANDLE_STATUS_INTERVAL = 6 * 60 * 60  # 6 hours
+# Discord's limits on one message's embeds: how many, and how many characters
+# in all.
+_EMBEDS_PER_MESSAGE = 10
+_EMBED_CHARACTERS_PER_MESSAGE = 6000
+
+# What the options that take a choice accept, by command and option, for a
+# value that is missing or isn't one of them. discord.py's own reply names the
+# option instead, such as arg.
+_CHOICES = {
+    ('roleupdate auto', 'arg'): 'Choose `on` or `off`.',
+    ('roleupdate publish', 'arg'): (
+        'Choose `here`, `off` or a contest ID, such as `1950`.'
+    ),
+    ('role', 'action'): 'Choose `give` to take the role, or `remove` to drop it.',
+    ('role', 'which'): 'Choose `duel` or `vc`.',
+}
+# The roles that /role hands out, by the choice that names them: the role's
+# name, and what members get it for. Replies say what it is for, never its
+# name.
+_PING_ROLES = {
+    'duel': ('Duelist', 'duel pings'),
+    'vc': ('Virtual Contestant', 'virtual contest pings'),
+}
+# The trusted role, as replies name it: by what it is, never by its name or id.
+_NO_TRUSTED_ROLE = 'This server has no trusted role, so nobody can be made trusted.'
+# Why the trusted role can't be given, when Discord refuses it.
+_TRUSTED_ROLE_REFUSED = (
+    "I can't give the trusted role: it must be below my highest role, and I "
+    'need the Manage Roles permission.'
+)
 
 
 class HandleCogError(commands.CommandError):
@@ -246,6 +278,28 @@ def _linked_handle_line(platform: str, handle: str, url: str) -> str:
     return f'**{platform}:** [{discord.utils.escape_markdown(handle)}]({url})'
 
 
+def _embed_batches(embeds: Sequence[discord.Embed]) -> list[list[discord.Embed]]:
+    """``embeds`` in order, in batches that each fit in one message.
+
+    A batch grows only while it holds at most 10 embeds of at most 6000
+    characters in all, Discord's limits on one message.
+    """
+    batches: list[list[discord.Embed]] = []
+    size = 0
+    for embed in embeds:
+        if (
+            batches
+            and len(batches[-1]) < _EMBEDS_PER_MESSAGE
+            and size + len(embed) <= _EMBED_CHARACTERS_PER_MESSAGE
+        ):
+            batches[-1].append(embed)
+            size += len(embed)
+        else:
+            batches.append([embed])
+            size = len(embed)
+    return batches
+
+
 class Handles(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot: commands.Bot = bot
@@ -263,16 +317,27 @@ class Handles(commands.Cog):
     async def on_member_remove(self, member: discord.Member) -> None:
         await self.bot.user_db.set_inactive([(member.guild.id, member.id)])
 
-    @commands.hybrid_command(brief='update status, mark guild members as active')
-    @commands.has_role(constants.TLE_ADMIN)
+    @commands.hybrid_command(brief="Mark this server's current members as active")
     async def _updatestatus(self, ctx: commands.Context) -> None:
+        """Mark the linked handles of this server's current members as active,
+        and those of members who have left as inactive.
+
+        Rank updates and ;handle list leave out inactive handles. The bot keeps
+        this up to date as members join and leave, so you need this only if it
+        missed some, for example while it was offline.
+
+        Examples:
+            /_updatestatus
+            ;_updatestatus
+        """
         gid = ctx.guild.id
         active_ids = [m.id for m in ctx.guild.members]
         await self.bot.user_db.reset_status(gid)
         rc = 0
         for chunk in paginator.chunkify(active_ids, 100):
             rc += await self.bot.user_db.update_status(gid, chunk)
-        await ctx.send(f'{rc} members active with handle')
+        members = 'member' if rc == 1 else 'members'
+        await ctx.send(f'Marked {rc} {members} with a linked handle as active.')
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
@@ -328,14 +393,18 @@ class Handles(commands.Cog):
         )
         self.logger.info(f'All guilds updated for contest {contest.id}.')
 
-    @commands.hybrid_group(brief='Commands that have to do with handles')
+    @commands.hybrid_group(brief='Link, show and look up Codeforces handles')
     async def handle(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
-        """Change or collect information about specific handles on Codeforces
+        """Show the handles a member has linked: yours, if you name no one.
 
-        On its own, it shows the handles a member has linked: yours, if you
-        name no one.
+        The commands in this group link Codeforces handles, look them up, and
+        keep them up to date when members change them.
+
+        Examples:
+            ;handle
+            ;handle @alice
         """
         await self._show_handles(ctx, member)
 
@@ -345,7 +414,7 @@ class Handles(commands.Cog):
     # discord.py makes the cog, it re-adds each subcommand to its group, first
     # removing the slash command of that name, which would drop the fallback.
     @handle.command(name='show', brief="Show a member's linked handles")
-    @discord.app_commands.describe(member='Whose handles to show; yours if left out')
+    @app_commands.describe(member='Whose handles to show; yours if left out')
     async def show(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
@@ -353,6 +422,11 @@ class Handles(commands.Cog):
 
         That is their Codeforces handle, and the accounts they linked with
         /link, such as AtCoder.
+
+        Examples:
+            /handle show
+            /handle show member:@alice
+            ;handle show @alice
         """
         await self._show_handles(ctx, member)
 
@@ -429,15 +503,25 @@ class Handles(commands.Cog):
             log=self.logger,
         )
 
-    @handle.command(brief='Set Codeforces handle of a user', aliases=['link'])
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @handle.command(brief='Link a member to a Codeforces handle', aliases=['link'])
+    @app_commands.describe(
+        member='The member to link', handle='Their Codeforces handle, such as tourist'
+    )
     async def set(
         self, ctx: commands.Context, member: discord.Member, handle: str
     ) -> None:
-        """Set Codeforces handle of a user."""
-        # CF API returns correct handle ignoring case, update to it
-        (user,) = await cf.user.info(handles=[handle])
-        await self._set(ctx, member, user)
+        """Link a member to a Codeforces handle, in place of any they had.
+
+        They get the role for the handle's Codeforces rank instead of their
+        old rank role.
+
+        Examples:
+            ;handle set @alice tourist
+        """
+        async with ctx.typing():
+            # CF API returns correct handle ignoring case, update to it
+            (user,) = await cf.user.info(handles=[handle])
+            await self._set(ctx, member, user)
         embed = _make_profile_embed(member, user, mode='set')
         await ctx.send(embed=embed)
 
@@ -459,28 +543,36 @@ class Handles(commands.Cog):
     ) -> None:
         await self._set_from_oauth(ctx.guild, member, user)
 
-    @handle.command(brief='Identify yourself')
+    @handle.command(brief='Sign in to Codeforces to link your account')
     async def identify(self, ctx: commands.Context) -> None:
-        """Link your Codeforces account via OAuth.
+        """Link your Codeforces account by signing in to Codeforces.
 
-        Opens a Codeforces authorization link so you can verify your handle.
+        You get a sign-in link that works for 5 minutes, then a message saying
+        whether your account was linked. Only you see them: with ;handle
+        identify, both come by direct message.
+
+        Examples:
+            /handle identify
+            ;handle identify
         """
         if not constants.OAUTH_CONFIGURED:
             raise HandleCogError(
-                'OAuth is not configured. An admin must set'
-                ' OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, and OAUTH_REDIRECT_URI.'
+                "Signing in to Codeforces isn't set up for this bot. Ask a "
+                'moderator to link your handle.'
             )
 
         if await self.bot.user_db.get_handle(ctx.author.id, ctx.guild.id):
             raise HandleCogError(
-                f'{ctx.author.mention}, you cannot identify when your handle'
-                ' is already set. Ask an Admin or Moderator if you wish to change it'
+                'You have already linked a Codeforces handle. To change it, ask a '
+                'moderator.'
             )
 
         self.bot.oauth_state_store.revoke(ctx.author.id)
 
+        # The slash command's interaction tells the member how it went, as
+        # privately as this; without one, they hear by direct message.
         state = self.bot.oauth_state_store.create(
-            ctx.author.id, ctx.guild.id, ctx.channel.id
+            ctx.author.id, ctx.guild.id, interaction=ctx.interaction
         )
         assert constants.OAUTH_CLIENT_ID is not None
         assert constants.OAUTH_REDIRECT_URI is not None
@@ -492,62 +584,88 @@ class Handles(commands.Cog):
         view.add_item(
             discord.ui.Button(
                 style=discord.ButtonStyle.link,
-                label='Link Codeforces Account',
+                label='Sign in to Codeforces',
                 url=auth_url,
             )
         )
         msg = (
-            'Click the button below to link your Codeforces account.'
-            ' The link expires in 5 minutes.'
+            'Press the button to sign in to Codeforces and link your account.'
+            " The link works for 5 minutes, and I'll tell you here how it went."
         )
         if ctx.interaction:
             await ctx.send(msg, view=view, ephemeral=True)
         else:
             try:
                 await ctx.author.send(msg, view=view)
-                await ctx.send('Check your DMs for the link!')
+                await ctx.send("I've sent you the sign-in link in a direct message.")
             except discord.Forbidden:
                 self.bot.oauth_state_store.revoke(ctx.author.id)
                 await ctx.send(
-                    f'{ctx.author.mention}, I could not DM you.'
-                    ' Please enable DMs from server members'
-                    ' and try again, or use the'
-                    ' /handle identify slash command instead.'
+                    "I couldn't send you a direct message. Allow direct messages"
+                    " from this server's members and try again, or use"
+                    ' `/handle identify`.'
                 )
 
-    @handle.command(brief='Get handle by Discord username')
+    @handle.command(brief="Show a member's Codeforces handle, rating and rank")
+    @app_commands.describe(member='The member whose handle to show')
     async def get(self, ctx: commands.Context, member: discord.Member) -> None:
-        """Show Codeforces handle of a user."""
+        """Show the Codeforces handle a member has linked, with its rating and
+        rank.
+
+        Examples:
+            /handle get member:@alice
+            ;handle get @alice
+        """
         handle = await self.bot.user_db.get_handle(member.id, ctx.guild.id)
         if not handle:
-            raise HandleCogError(f'Handle for {member.mention} not found in database')
+            raise HandleCogError(f"{member.mention} hasn't linked a Codeforces handle.")
         user = await self.bot.user_db.fetch_cf_user(handle)
         embed = _make_profile_embed(member, user, mode='get')
         await ctx.send(embed=embed)
 
-    @handle.command(brief='Get Discord username by cf handle')
+    @handle.command(brief='Find who linked a Codeforces handle')
+    @app_commands.describe(handle='A Codeforces handle, such as tourist')
     async def rget(self, ctx: commands.Context, handle: str) -> None:
-        """Show Discord username of a cf handle."""
+        """Find the member of this server who linked a Codeforces handle.
+
+        Examples:
+            /handle rget handle:tourist
+            ;handle rget tourist
+        """
         user_id = await self.bot.user_db.get_user_id(handle, ctx.guild.id)
         if not user_id:
-            raise HandleCogError(
-                f'Discord username for `{handle}` not found in database'
-            )
-        user = await self.bot.user_db.fetch_cf_user(handle)
+            raise HandleCogError(f'No member of this server has linked `{handle}`.')
         member = ctx.guild.get_member(user_id)
         if member is None:
-            raise HandleCogError(f'{user_id} not found in the guild')
+            # TLE keeps the handles of members who leave, for if they come back.
+            raise HandleCogError(
+                f'`{handle}` was linked by someone who has left this server.'
+            )
+        user = await self.bot.user_db.fetch_cf_user(handle)
         embed = _make_profile_embed(member, user, mode='get')
         await ctx.send(embed=embed)
 
-    @handle.command(brief='Unlink handle', aliases=['unlink'])
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @handle.command(
+        brief='Unlink a Codeforces handle from the member who linked it',
+        aliases=['unlink'],
+    )
+    @app_commands.describe(
+        handle='The Codeforces handle, or ! and a member, such as !alice'
+    )
     async def remove(self, ctx: commands.Context, handle: str) -> None:
-        """Remove Codeforces handle of a user."""
+        """Unlink a Codeforces handle from the member who linked it, who also
+        loses their rank role.
+
+        Name the handle, or the member with ! in front.
+
+        Examples:
+            ;handle remove tourist
+            ;handle remove !alice
+        """
         (handle,) = await cf_common.resolve_handles(ctx, self.converter, [handle])
         user_id = await self.bot.user_db.get_user_id(handle, ctx.guild.id)
         if user_id is None:
-            raise HandleCogError(f'{handle} not found in database')
+            raise HandleCogError(f'No member of this server has linked `{handle}`.')
 
         await self.bot.user_db.remove_handle(handle, ctx.guild.id)
         member = ctx.guild.get_member(user_id)
@@ -556,22 +674,37 @@ class Handles(commands.Cog):
             await self.update_member_rank_role(
                 member, role_to_assign=None, reason='Handle unlinked'
             )
-        embed = discord_common.embed_success(f'Removed {handle} from database')
+        embed = discord_common.embed_success(f'Unlinked `{handle}`.')
         await ctx.send(embed=embed)
 
-    @handle.command(brief="Resolve redirect of a user's handle")
+    @handle.command(brief='Update your handle after you change it on Codeforces')
     async def unmagic(self, ctx: commands.Context) -> None:
-        """Updates handle of the calling user if they have changed handles
-        (typically new year's magic)"""
+        """Update your linked handle after you change it on Codeforces.
+
+        Codeforces lets you change your handle around each New Year. This finds
+        your new handle through your old one, and links it instead.
+
+        Examples:
+            /handle unmagic
+            ;handle unmagic
+        """
         member = ctx.author
         handle = await self.bot.user_db.get_handle(member.id, ctx.guild.id)
-        await self._unmagic_handles(ctx, [handle], {handle: member})
+        if handle is None:
+            raise HandleCogError(
+                "You haven't linked a Codeforces handle, so there is none to update."
+            )
+        async with ctx.typing():
+            await self._unmagic_handles(ctx, [handle], {handle: member})
 
-    @handle.command(brief='Resolve handles needing redirection')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @handle.command(brief='Update every linked handle changed on Codeforces')
     async def unmagic_all(self, ctx: commands.Context) -> None:
-        """Updates handles of all users that have changed handles
-        (typically new year's magic)"""
+        """Update the linked handles of all members who have changed their
+        handle on Codeforces, as many do around each New Year.
+
+        Examples:
+            ;handle unmagic_all
+        """
         user_id_and_handles = await self.bot.user_db.get_handles_for_guild(ctx.guild.id)
 
         handles = []
@@ -580,15 +713,25 @@ class Handles(commands.Cog):
             member = ctx.guild.get_member(user_id)
             handles.append(handle)
             rev_lookup[handle] = member
-        await self._unmagic_handles(ctx, handles, rev_lookup)
+        async with ctx.typing():
+            await self._unmagic_handles(ctx, handles, rev_lookup)
 
     @handle.command(
-        brief='Show handle resolution for the given handles',
+        brief='Preview what unmagic would do for the handles you give',
+        usage='<handles...> [+skip_filter]',
         with_app_command=False,
     )
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
     async def unmagic_debug(self, ctx: commands.Context, *args: str) -> None:
-        """See what the resolve logic would do."""
+        """Show the handle that each handle you give now leads to on
+        Codeforces, as ;handle unmagic would see it, without linking anything.
+
+        It lists only the handles that have changed, unless you add
+        +skip_filter.
+
+        Examples:
+            ;handle unmagic_debug tourist
+            ;handle unmagic_debug tourist Petr +skip_filter
+        """
         handles = list(args)
         skip_filter = False
         if '+skip_filter' in handles:
@@ -635,7 +778,9 @@ class Handles(commands.Cog):
         # Return summary embed
         lines = []
         if not fixed and not failed:
-            return discord_common.embed_success('No handles updated')
+            return discord_common.embed_success(
+                'No linked handle has changed on Codeforces.'
+            )
         if fixed:
             lines.append('**Fixed**')
             lines += (f'{old} -> {new}' for old, new in fixed)
@@ -644,44 +789,64 @@ class Handles(commands.Cog):
             lines += failed
         return discord_common.embed_success('\n'.join(lines))
 
-    @commands.hybrid_command(brief='Show gudgitters', aliases=['gitgudders'])
+    @commands.hybrid_command(
+        brief='Show the members with the most gitgud points', aliases=['gitgudders']
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def gudgitters(self, ctx: commands.Context) -> None:
-        """Show the list of users of gitgud with their scores."""
-        res = await self.bot.user_db.get_gudgitters()
-        res.sort(key=lambda r: r[1], reverse=True)
+        """Show the 10 members of this server with the most gitgud points.
 
-        rankings = []
-        index = 0
-        for user_id, score in res:
-            member = ctx.guild.get_member(int(user_id))
-            if member is None:
-                continue
-            if score > 0:
-                handle = await self.bot.user_db.get_handle(user_id, ctx.guild.id)
-                user = await self.bot.user_db.fetch_cf_user(handle)
-                if user is None:
+        You earn points by solving the problems that /gitgud gives you.
+
+        Examples:
+            /gudgitters
+            ;gudgitters
+        """
+        async with ctx.typing():
+            res = await self.bot.user_db.get_gudgitters()
+            res.sort(key=lambda r: r[1], reverse=True)
+
+            rankings = []
+            index = 0
+            for user_id, score in res:
+                member = ctx.guild.get_member(int(user_id))
+                if member is None:
                     continue
-                discord_handle = member.display_name
-                rating = user.rating
-                rankings.append((index, discord_handle, handle, rating, score))
-                index += 1
-            if index == 10:
-                break
+                if score > 0:
+                    handle = await self.bot.user_db.get_handle(user_id, ctx.guild.id)
+                    user = await self.bot.user_db.fetch_cf_user(handle)
+                    if user is None:
+                        continue
+                    discord_handle = member.display_name
+                    rating = user.rating
+                    rankings.append((index, discord_handle, handle, rating, score))
+                    index += 1
+                if index == 10:
+                    break
 
-        if not rankings:
-            raise HandleCogError(
-                'No one has completed a gitgud challenge,'
-                ' send ;gitgud to request and ;gotgud to mark it as complete'
-            )
-        discord_file = get_gudgitters_image(rankings)
+            if not rankings:
+                raise HandleCogError(
+                    'Nobody here has solved a gitgud problem yet. Get one with '
+                    '`/gitgud`, and say you solved it with `/gotgud`.'
+                )
+            discord_file = get_gudgitters_image(rankings)
         await ctx.send(file=discord_file)
 
-    @handle.command(brief='Show all handles', with_app_command=False)
+    @handle.command(
+        brief="List the server's members with their Codeforces handles",
+        with_app_command=False,
+    )
     async def list(self, ctx: commands.Context, *countries: str) -> None:
-        """Shows members of the server who have registered their handles and
-        their Codeforces ratings. You can additionally specify a list of countries
-        if you wish to display only members from those countries. Country data is
-        sourced from codeforces profiles. e.g. ;handle list Croatia Slovenia
+        """List the members of this server who have linked a Codeforces handle,
+        highest rated first.
+
+        Name countries to list only the members whose Codeforces profiles give
+        one of them. Put a name of several words in quotes.
+
+        Examples:
+            ;handle list
+            ;handle list Croatia Slovenia
+            ;handle list "United Kingdom"
         """
         country_list = [country.title() for country in countries]
         res = await self.bot.user_db.get_cf_users_for_guild(ctx.guild.id)
@@ -696,7 +861,14 @@ class Handles(commands.Cog):
             if member is not None
         ]
         if not users:
-            raise HandleCogError('No members with registered handles.')
+            if country_list:
+                raise HandleCogError(
+                    'No member of this server from those countries has linked a '
+                    'Codeforces handle.'
+                )
+            raise HandleCogError(
+                'No member of this server has linked a Codeforces handle.'
+            )
 
         users.sort(
             key=lambda x: (1 if x[2] is None else -x[2], x[1])
@@ -730,7 +902,9 @@ class Handles(commands.Cog):
             (member, handle) for member, handle in member_handles if member is not None
         ]
         if not member_handles:
-            raise HandleCogError('Handles not set for any user')
+            raise HandleCogError(
+                'No member of this server has linked a Codeforces handle.'
+            )
         members, handles = zip(*member_handles, strict=False)
         users = await cf.user.info(handles=handles)
         for user in users:
@@ -744,10 +918,11 @@ class Handles(commands.Cog):
         }
         missing_roles = required_roles - rank2role.keys()
         if missing_roles:
-            roles_str = ', '.join(f'`{role}`' for role in missing_roles)
+            roles_str = ', '.join(f'`{role}`' for role in sorted(missing_roles))
             plural = 's' if len(missing_roles) > 1 else ''
             raise HandleCogError(
-                f'Role{plural} for rank{plural} {roles_str} not present in the server'
+                f'This server has no role for the rank{plural} {roles_str}. Add '
+                'a role named after each rank, then try again.'
             )
 
         for member, user in zip(members, users, strict=False):
@@ -856,87 +1031,129 @@ class Handles(commands.Cog):
 
         return embeds
 
-    @commands.hybrid_group(brief='Commands for role updates', fallback='show')
+    @commands.hybrid_group(brief='Show the rank role commands', fallback='show')
     async def roleupdate(self, ctx: commands.Context) -> None:
-        """Group for commands involving role updates."""
+        """Show the commands that update rank roles, the roles named after
+        Codeforces ranks such as Expert, and post members' rank changes after
+        contests.
+
+        Examples:
+            /roleupdate show
+            ;roleupdate
+        """
         await ctx.send_help(ctx.command)
 
-    @roleupdate.command(brief='Update Codeforces rank roles')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @roleupdate.command(brief="Update every member's rank role from Codeforces now")
     async def now(self, ctx: commands.Context) -> None:
-        """Updates Codeforces rank roles for every member in this server."""
-        await self._update_ranks_all(ctx.guild)
+        """Give every member with a linked handle the rank role for their
+        current Codeforces rating, in place of any other rank role.
+
+        Examples:
+            /roleupdate now
+            ;roleupdate now
+        """
+        async with ctx.typing():
+            await self._update_ranks_all(ctx.guild)
         await ctx.send(
-            embed=discord_common.embed_success('Roles updated successfully.')
+            embed=discord_common.embed_success(
+                'Updated the rank role of every member with a linked handle.'
+            )
         )
 
-    @roleupdate.command(brief='Enable or disable auto role updates', usage='on|off')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
-    async def auto(self, ctx: commands.Context, arg: str) -> None:
-        """Auto role update refers to automatic updating of rank roles when rating
-        changes are released on Codeforces. 'on'/'off' disables or enables auto role
-        updates.
+    @roleupdate.command(brief='Turn automatic rank role updates on or off')
+    @app_commands.describe(
+        arg='on to update rank roles after each rated contest; off to stop'
+    )
+    async def auto(self, ctx: commands.Context, arg: Literal['on', 'off']) -> None:
+        """Turn automatic rank role updates on or off. While they are on, every
+        member's rank role is updated whenever Codeforces publishes the rating
+        changes of a contest.
+
+        Examples:
+            /roleupdate auto arg:on
+            ;roleupdate auto off
         """
         if arg == 'on':
             rc = await self.bot.user_db.enable_auto_role_update(ctx.guild.id)
             if not rc:
-                raise HandleCogError('Auto role update is already enabled.')
+                raise HandleCogError('Automatic rank role updates are already on.')
             await ctx.send(
-                embed=discord_common.embed_success('Auto role updates enabled.')
+                embed=discord_common.embed_success(
+                    'Automatic rank role updates are on.'
+                )
             )
         elif arg == 'off':
             rc = await self.bot.user_db.disable_auto_role_update(ctx.guild.id)
             if not rc:
-                raise HandleCogError('Auto role update is already disabled.')
+                raise HandleCogError('Automatic rank role updates are already off.')
             await ctx.send(
-                embed=discord_common.embed_success('Auto role updates disabled.')
+                embed=discord_common.embed_success(
+                    'Automatic rank role updates are off.'
+                )
             )
         else:
-            raise ValueError(f"arg must be 'on' or 'off', got '{arg}' instead.")
+            # Discord offers only on and off, and ;roleupdate auto takes no
+            # other value, so only a stray value gets here.
+            raise HandleCogError(_CHOICES['roleupdate auto', 'arg'])
 
     @roleupdate.command(
-        brief='Publish a rank update for the given contest', usage='here|off|contest_id'
+        brief='Post rank changes here after each contest, or for one contest now'
     )
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @app_commands.describe(
+        arg='here to post after each contest, off to stop, or a contest ID to post '
+        'its changes now'
+    )
     async def publish(self, ctx: commands.Context, arg: str) -> None:
-        """This is a feature to publish a summary of rank changes and top rating
-        increases in a particular contest for members of this server. 'here' will
-        automatically publish the summary to this channel whenever rating changes on
-        Codeforces are released. 'off' will disable auto publishing. Specifying a
-        contest id will publish the summary immediately.
+        """Post this server's rank changes and biggest rating gains in this
+        channel. With here, they come after each rated contest, until you use
+        off. With a contest ID, that contest's come now.
+
+        Examples:
+            /roleupdate publish arg:here
+            /roleupdate publish arg:1950
+            ;roleupdate publish off
         """
         if arg == 'here':
+            if isinstance(ctx.channel, discord.Thread):
+                raise HandleCogError(discord_common.NOT_IN_A_THREAD_MESSAGE)
             await self.bot.user_db.set_rankup_channel(ctx.guild.id, ctx.channel.id)
             await ctx.send(
                 embed=discord_common.embed_success(
-                    'Auto rank update publishing enabled.'
+                    'Rank changes will be posted in this channel after each rated '
+                    'contest.'
                 )
             )
         elif arg == 'off':
             rc = await self.bot.user_db.clear_rankup_channel(ctx.guild.id)
             if not rc:
-                raise HandleCogError('Rank update publishing is already disabled.')
+                raise HandleCogError(
+                    "Rank changes aren't posted after contests, so there is nothing "
+                    'to stop.'
+                )
             await ctx.send(
-                embed=discord_common.embed_success('Rank update publishing disabled.')
+                embed=discord_common.embed_success(
+                    'Rank changes will no longer be posted after contests.'
+                )
             )
         else:
             try:
                 contest_id = int(arg)
             except ValueError:
-                raise ValueError(
-                    f"arg must be 'here', 'off' or a contest ID, got '{arg}' instead."
-                )
+                raise HandleCogError(_CHOICES['roleupdate publish', 'arg'])
             await self._publish_now(ctx, contest_id)
 
     async def _publish_now(self, ctx: commands.Context, contest_id: int) -> None:
         try:
             contest = self.bot.cf_cache.contest_cache.get_contest(contest_id)
         except ContestNotFound as e:
-            raise HandleCogError(f'Contest with id `{e.contest_id}` not found.')
+            raise HandleCogError(f'Contest with ID `{e.contest_id}` not found.')
         if contest.phase != 'FINISHED':
             raise HandleCogError(
                 f'Contest `{contest_id} | {contest.name}` has not finished.'
             )
+        # Codeforces may take longer to answer than Discord waits for a slash
+        # command's first answer.
+        await ctx.defer()
         try:
             changes = await cf.contest.ratingChanges(contest_id=contest_id)
         except cf.RatingChangesUnavailableError:
@@ -951,85 +1168,89 @@ class Handles(commands.Cog):
         rankup_embeds = await self._make_rankup_embeds(
             ctx.guild, contest, change_by_handle
         )
-        for rankup_embed in rankup_embeds:
-            await ctx.channel.send(embed=rankup_embed)
-
-    async def _generic_remind(
-        self, ctx: commands.Context, action: str, role_name: str, what: str
-    ) -> None:
-        roles = [role for role in ctx.guild.roles if role.name == role_name]
-        if not roles:
-            raise HandleCogError(f'Role `{role_name}` not present in the server')
-        role = roles[0]
-        if action == 'give':
-            if role in ctx.author.roles:
-                await ctx.send(
-                    embed=discord_common.embed_neutral(
-                        f'You are already subscribed to {what} reminders'
-                    )
-                )
-                return
-            await ctx.author.add_roles(
-                role, reason=f'User subscribed to {what} reminders'
-            )
-            await ctx.send(
-                embed=discord_common.embed_success(
-                    f'Successfully subscribed to {what} reminders'
-                )
-            )
-        elif action == 'remove':
-            if role not in ctx.author.roles:
-                await ctx.send(
-                    embed=discord_common.embed_neutral(
-                        f'You are not subscribed to {what} reminders'
-                    )
-                )
-                return
-            await ctx.author.remove_roles(
-                role, reason=f'User unsubscribed from {what} reminders'
-            )
-            await ctx.send(
-                embed=discord_common.embed_success(
-                    f'Successfully unsubscribed from {what} reminders'
-                )
-            )
-        else:
-            raise HandleCogError(f'Invalid action {action}')
+        # As answers to the command, in as few messages as Discord allows.
+        for batch in _embed_batches(rankup_embeds):
+            await ctx.send(embeds=batch)
 
     @commands.hybrid_command(
-        brief='Grants or removes the specified pingable role',
-        usage='[give/remove] [vc/duel]',
+        brief='Take or drop the ping role for duels or virtual contests'
+    )
+    @app_commands.describe(
+        action='give to take the role, or remove to drop it',
+        which='duel for duel pings, or vc for virtual contest pings',
     )
     async def role(self, ctx: commands.Context, action: str, which: str) -> None:
-        """e.g. ;role remove duel"""
-        if which == 'vc':
-            await self._generic_remind(ctx, action, 'Virtual Contestant', 'vc')
-        elif which == 'duel':
-            await self._generic_remind(ctx, action, 'Duelist', 'duel')
-        else:
-            raise HandleCogError(f'Invalid role {which}')
+        """Take or drop the role that is pinged about duels, or the one pinged
+        about virtual contests.
 
-    @discord_common.send_error_if(HandleCogError, cf_common.HandleIsVjudgeError)
+        Examples:
+            /role action:give which:duel
+            ;role give duel
+            ;role remove vc
+        """
+        if action not in ('give', 'remove'):
+            raise HandleCogError(_CHOICES['role', 'action'])
+        if which not in _PING_ROLES:
+            raise HandleCogError(_CHOICES['role', 'which'])
+        role_name, pings = _PING_ROLES[which]
+        role = discord.utils.get(ctx.guild.roles, name=role_name)
+        if role is None:
+            raise HandleCogError(f'This server has no role for {pings}.')
+        has_it = role in ctx.author.roles
+        if action == 'give':
+            if has_it:
+                text = f'You already have the role for {pings}.'
+                await ctx.send(embed=discord_common.embed_neutral(text))
+                return
+            # The role is whichever has that name, so it may be one that must
+            # not be handed out to whoever asks, such as a staff role.
+            problem = discord_common.self_assignable_problem(role, ctx.guild.me)
+            if problem is not None:
+                raise HandleCogError(
+                    f"I can't give you the role for {pings}: {problem}. Ask an "
+                    'admin to fix the role.'
+                )
+            await ctx.author.add_roles(role, reason=f'Member asked for {pings}')
+            text = f'You now have the role for {pings}.'
+        else:
+            if not has_it:
+                text = f"You don't have the role for {pings}."
+                await ctx.send(embed=discord_common.embed_neutral(text))
+                return
+            await ctx.author.remove_roles(role, reason=f'Member asked to stop {pings}')
+            text = f'You no longer have the role for {pings}.'
+        await ctx.send(embed=discord_common.embed_success(text))
+
+    @discord_common.send_error_if(HandleCogError, cf_common.ResolveHandleError)
     async def cog_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        pass
+        # An option that takes a choice, left out or given something else on
+        # prefix, gets the choices: discord.py's own reply names the option.
+        if ctx.command is not None and isinstance(
+            error, (commands.MissingRequiredArgument, commands.BadLiteralArgument)
+        ):
+            choices = _CHOICES.get((ctx.command.qualified_name, error.param.name))
+            if choices is not None:
+                error.handled = True
+                await self.cog_command_error(ctx, HandleCogError(choices))
 
-    @handle.command(brief='Give the Trusted role to another user')
-    @commands.has_any_role(
-        constants.TLE_ADMIN, constants.TLE_MODERATOR, constants.TLE_TRUSTED
-    )
+    @handle.command(brief='Make another member trusted')
+    @app_commands.describe(target_user='The member to make trusted')
     async def refer(self, ctx: commands.Context, target_user: discord.Member) -> None:
-        """Allows Trusted users to grant the Trusted role to other users.
+        """Make another member trusted, unless they are in purgatory. Trusted
+        members can then refer others too.
 
-        The command fails if the target user has the Purgatory role.
+        Examples:
+            /handle refer target_user:@alice
+            ;handle refer @alice
         """
         guild = ctx.guild
         trusted_role_name = constants.TLE_TRUSTED
         purgatory_role_name = constants.TLE_PURGATORY
 
         if target_user == ctx.author:
-            raise HandleCogError('You cannot refer yourself.')
+            raise HandleCogError("You can't refer yourself.")
 
         # Find the Purgatory role
         purgatory_role = discord_common.get_role(guild, purgatory_role_name)
@@ -1043,8 +1264,8 @@ class Handles(commands.Cog):
         elif purgatory_role in target_user.roles:
             await ctx.send(
                 embed=discord_common.embed_alert(
-                    f'Cannot grant Trusted role to {target_user.mention}.'
-                    f' User is currently in Purgatory.'
+                    f"{target_user.mention} is in purgatory, so they can't be made "
+                    'trusted.'
                 )
             )
             return
@@ -1052,15 +1273,13 @@ class Handles(commands.Cog):
         # Find the Trusted role
         trusted_role = discord_common.get_role(guild, trusted_role_name)
         if trusted_role is None:
-            raise HandleCogError(
-                f"The role '{trusted_role_name}' does not exist in this server."
-            )
+            raise HandleCogError(_NO_TRUSTED_ROLE)
 
         # Check if target user already has the role
         if trusted_role in target_user.roles:
             await ctx.send(
                 embed=discord_common.embed_neutral(
-                    f'{target_user.mention} already has the Trusted role.'
+                    f'{target_user.mention} is already trusted.'
                 )
             )
             return
@@ -1070,24 +1289,26 @@ class Handles(commands.Cog):
             await target_user.add_roles(
                 trusted_role, reason=f'Referred by {ctx.author.name} ({ctx.author.id})'
             )
-            await ctx.send(
-                f'Trusted role granted to {target_user.mention}'
-                f' by {ctx.author.mention}.'
-            )
         except discord.Forbidden:
-            raise HandleCogError(
-                f"No permissions to assign the '{trusted_role_name}' role."
-            )
+            raise HandleCogError(_TRUSTED_ROLE_REFUSED)
         except discord.HTTPException as e:
-            raise HandleCogError(
-                f'Failed to assign the role due to an unexpected error: {e}'
+            self.logger.warning(
+                f'Could not make {target_user.id} trusted in guild {guild.id}: {e}'
             )
+            raise HandleCogError(
+                'Something went wrong while giving the trusted role. Try again later.'
+            )
+        await ctx.send(
+            f'{target_user.mention} is now trusted, referred by {ctx.author.mention}.'
+        )
 
-    @handle.command(brief='Grant Trusted role to old members without Purgatory role.')
-    @commands.has_role(constants.TLE_ADMIN)
+    @handle.command(brief='Make members who joined before 21 April 2025 trusted')
     async def grandfather(self, ctx: commands.Context) -> None:
-        """Grants the Trusted role to all members who joined before April 21, 2025,
-        and do not currently have the Purgatory role. April 20 was o3's first contest.
+        """Make every member who joined before 21 April 2025 trusted, unless
+        they are in purgatory.
+
+        Examples:
+            ;handle grandfather
         """
         guild = ctx.guild
         trusted_role_name = constants.TLE_TRUSTED
@@ -1095,9 +1316,7 @@ class Handles(commands.Cog):
 
         trusted_role = discord_common.get_role(guild, trusted_role_name)
         if trusted_role is None:
-            raise HandleCogError(
-                f"The role '{trusted_role_name}' does not exist in this server."
-            )
+            raise HandleCogError(_NO_TRUSTED_ROLE)
 
         purgatory_role = discord_common.get_role(guild, purgatory_role_name)
         # If Purgatory role doesn't exist, we assume no one has it.
@@ -1119,18 +1338,19 @@ class Handles(commands.Cog):
         processed_count = 0
         http_failure_count = 0
 
-        status_message = await ctx.send(
-            'Processing members for grandfathering Trusted...'
-        )
-
         # Create a list to avoid issues if members leave/join during processing
         members_to_process = list(guild.members)
+
+        status_message = await ctx.send(
+            f'Checking {len(members_to_process)} members, to make those who joined '
+            'before 21 April 2025 trusted…'
+        )
 
         for i, member in enumerate(members_to_process):
             processed_count += 1
             if i % 100 == 0 and i > 0:
                 await status_message.edit(
-                    content=f'Processing members... ({i}/{len(members_to_process)})'
+                    content=f'Checked {i} of {len(members_to_process)} members…'
                 )
 
             if purgatory_role is not None and purgatory_role in member.roles:
@@ -1169,8 +1389,8 @@ class Handles(commands.Cog):
             except discord.Forbidden:
                 await ctx.send(
                     embed=discord_common.embed_alert(
-                        f"Missing permissions to assign the '{trusted_role_name}'"
-                        f' role to {member.mention}. Stopping.'
+                        f'{_TRUSTED_ROLE_REFUSED} I stopped there. Made trusted so '
+                        f'far: {added_count}.'
                     )
                 )
                 return  # Stop processing if permissions are missing
@@ -1182,15 +1402,14 @@ class Handles(commands.Cog):
                 http_failure_count += 1
 
         summary_message = (
-            f'Grandfathering complete.\n'
-            f'- Processed: {processed_count} members\n'
-            f'- Granted Trusted: {added_count} members\n'
-            f'- Skipped (Joined after cutoff): {skipped_join_date}\n'
-            f'- Skipped (Already Trusted): {skipped_already_trusted}\n'
-            f'- HTTP failure granting role: {http_failure_count}\n'
+            f'Done: I checked {processed_count} members.\n'
+            f'- Made trusted: {added_count}\n'
+            f'- Already trusted: {skipped_already_trusted}\n'
+            f'- Joined on or after 21 April 2025, or unknown: {skipped_join_date}\n'
+            f'- Could not be made trusted: {http_failure_count}\n'
         )
         if purgatory_role:
-            summary_message += f'- Skipped (Has Purgatory): {skipped_purgatory}\n'
+            summary_message += f'- In purgatory: {skipped_purgatory}\n'
 
         await status_message.edit(content=summary_message)
 

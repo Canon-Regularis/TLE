@@ -43,7 +43,7 @@ _NOCASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _FREEING_A_HANDLE = {
     'atcoder': 'If it is yours, ask an admin to unlink it with /kcpc accounts unlink.',
     'codeforces': (
-        'If it is yours, ask an Admin or Moderator to remove it with /handle remove.'
+        'If it is yours, ask a moderator or admin to remove it with `;handle remove`.'
     ),
 }
 
