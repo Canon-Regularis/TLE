@@ -8,10 +8,16 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 import seaborn as sns
+from discord import app_commands
 from discord.ext import commands
 from matplotlib import pyplot as plt
 
 from tle import constants, extensions
+from tle.access.cog import Access
+from tle.access.context import TLEContext
+from tle.access.help import Help
+from tle.access.service import AccessService, AccessTree
+from tle.access.slash import apply_visibility
 from tle.config import Settings
 from tle.kcpc.core.errors import ConfigError
 from tle.util import codeforces_common as cf_common, db, discord_common
@@ -65,27 +71,79 @@ def strtobool(value: str) -> bool:
     raise ValueError(f'Invalid truth value {value!r}.')
 
 
-class TLEContext(commands.Context):
-    async def send(self, *args: Any, **kwargs: Any) -> discord.Message:
-        if self.interaction is None and 'reference' not in kwargs:
-            kwargs['reference'] = self.message
-            kwargs.setdefault('mention_author', False)
-        return await super().send(*args, **kwargs)
+def warn_of_unusable_developer_role() -> None:
+    """Repeat tle.constants' warning that ``TLE_DEVELOPER`` isn't a role ID.
+
+    tle.constants reads the setting on import, before logging is set up, so
+    its own warning reaches neither the log file nor the log channel.
+    """
+    value = environ.get('TLE_DEVELOPER', '').strip()
+    if value and constants.TLE_DEVELOPER is None:
+        logging.warning(
+            f'TLE_DEVELOPER must be a role ID, not {value!r}, so it is ignored'
+        )
 
 
 class TLEBot(commands.Bot):
+    """The bot: TLE's cogs, KCPC's features, and the access rules over them.
+
+    The access service checks every command, prefix or slash, before it runs,
+    and its command tree checks every slash command and autocomplete first.
+    /help and /access belong to the bot itself rather than to an extension,
+    so DISABLED_EXTENSIONS never turns them off.
+    """
+
+    # The user database, which cf_common.initialize attaches to the bot.
+    user_db: Any
+
     def __init__(self, nodb: bool, settings: Settings, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+        super().__init__(
+            # /help, from the Help cog, takes the place of discord.py's help.
+            help_command=None,
+            tree_cls=AccessTree,
+            # A message pings the members it names, unless it says otherwise,
+            # but never @everyone, a role, or the author of a message it
+            # replies to.
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=False
+            ),
+            # Slash commands work in servers alone, and the bot is installed
+            # in servers, never on a member's account.
+            allowed_contexts=app_commands.AppCommandContext(
+                guild=True, dm_channel=False, private_channel=False
+            ),
+            allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
+            **kwargs,
+        )
         self.nodb: bool = nodb
         self.settings: Settings = settings
         self.kcpc: KcpcServices | None = None
         self.oauth_server: Any = None
         self.oauth_state_store: Any = None
+        self.access = AccessService(self, allowed_guilds=settings.allowed_guild_ids)
+        self.add_check(self.access.check)
+        self.add_listener(discord_common.bot_error_handler, name='on_command_error')
+        self._started = False
+        self._presence_task: asyncio.Task[None] | None = None
 
     async def get_context(
-        self, message: discord.Message, *, cls: type | None = None
+        self,
+        origin: discord.Message | discord.Interaction,
+        /,
+        *,
+        cls: type | None = None,
     ) -> commands.Context:
-        return await super().get_context(message, cls=cls or TLEContext)
+        # A hybrid command's slash form gets its context here too.
+        return await super().get_context(origin, cls=cls or TLEContext)
+
+    async def is_owner(self, user: discord.abc.User, /) -> bool:
+        """Whether ``user`` owns the bot, as the access rules count owners.
+
+        It never asks Discord: the owners are found as the bot starts up, and
+        if that fails, an owner's command looks again, at most every few
+        minutes.
+        """
+        return self.access.is_owner(user)
 
     async def setup_hook(self) -> None:
         enabled, unknown = extensions.select(
@@ -98,7 +156,9 @@ class TLEBot(commands.Bot):
             logging.warning(
                 f'Ignoring unknown extension {token!r} in DISABLED_EXTENSIONS'
             )
+        warn_of_unusable_developer_role()
         await cf_common.initialize(self, self.nodb)
+        await self._start_access()
         kcpc_enabled = any(ext.family == extensions.KCPC_FAMILY for ext in enabled)
         if kcpc_enabled and not await self._start_kcpc():
             enabled = [ext for ext in enabled if ext.family != extensions.KCPC_FAMILY]
@@ -118,8 +178,75 @@ class TLEBot(commands.Bot):
             )
             await self.oauth_server.start()
             logging.info('OAuth callback server started')
+        await self._finish_access()
         await self.tree.sync()
         logging.info('Slash commands synced')
+
+    async def _start_access(self) -> None:
+        """Load every server's access settings, and add /access and /help.
+
+        Under --nodb the user database refuses every call, so the settings are
+        kept in memory alone.
+        """
+        self.access.use_user_db(None if self.nodb else self.user_db)
+        await self.access.load()
+        await self.add_cog(Access(self))
+        await self.add_cog(Help(self))
+
+    async def _finish_access(self) -> None:
+        """Once every command is in: find the bot's owners, report commands
+        without a rule, and keep staff commands out of members' slash lists.
+
+        The slash pass must run again before any later sync, should an
+        extension ever be loaded after this.
+        """
+        try:
+            await self.access.resolve_owners()
+        except Exception:
+            # It logs its own failures; this is a second safety.
+            logging.exception("Could not find the bot's owners")
+        self.access.report_unruled(self.walk_commands())
+        apply_visibility(self)
+
+    async def on_ready(self) -> None:
+        """Once connected for the first time: name the servers that
+        ALLOWED_GUILD_IDS doesn't list, and start showing a status. Later
+        reconnects change nothing.
+        """
+        if self._started:
+            return
+        self._started = True
+        self._report_unlisted_guilds()
+        self._presence_task = asyncio.create_task(discord_common.presence(self))
+
+    def _report_unlisted_guilds(self) -> None:
+        """Log the servers the bot is in that ALLOWED_GUILD_IDS doesn't list.
+
+        The bot stays in them, so that a mistake in the setting can't make it
+        leave the club's server; the access rules ignore them anyway.
+        """
+        unlisted = [
+            guild for guild in self.guilds if not self.access.guild_allowed(guild.id)
+        ]
+        if unlisted:
+            names = ', '.join(f'{guild.name} ({guild.id})' for guild in unlisted)
+            logging.warning(
+                'ALLOWED_GUILD_IDS does not list these servers, so the bot '
+                f'ignores commands there: {names}'
+            )
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Leave a server that ALLOWED_GUILD_IDS doesn't list, as it joins."""
+        if self.access.guild_allowed(guild.id):
+            return
+        logging.warning(
+            f'Leaving the server {guild.name} ({guild.id}), which '
+            'ALLOWED_GUILD_IDS does not list'
+        )
+        try:
+            await guild.leave()
+        except discord.HTTPException as exc:
+            logging.warning(f'Could not leave the server {guild.id}: {exc}')
 
     async def _start_kcpc(self) -> bool:
         """Start the KCPC services; False if KCPC can't run this time."""
@@ -207,32 +334,6 @@ def main() -> None:
         command_prefix=commands.when_mentioned_or(';'),
         intents=intents,
     )
-
-    def no_dm_check(ctx: commands.Context) -> bool:
-        if ctx.guild is None:
-            raise commands.NoPrivateMessage('Private messages not permitted.')
-        return True
-
-    # Restrict bot usage to inside guild channels only.
-    bot.add_check(no_dm_check)
-
-    async def interaction_guild_check(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                'Private messages not permitted.', ephemeral=True
-            )
-            return False
-        return True
-
-    bot.tree.interaction_check = interaction_guild_check
-
-    @bot.event
-    @discord_common.once
-    async def on_ready() -> None:
-        asyncio.create_task(discord_common.presence(bot))
-
-    bot.add_listener(discord_common.bot_error_handler, name='on_command_error')
-
     bot.run(token)
 
 

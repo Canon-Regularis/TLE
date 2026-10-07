@@ -1,33 +1,40 @@
 """Boot tests: ``TLEBot.setup_hook`` with different extensions switched off.
 
-The bot never logs in. TLE's database setup (``cf_common.initialize``) and the
-slash command sync are stubbed out, OAuth is off, no log channel is set and
-kcpc.db goes in a temporary directory. The rest runs for real: choosing the
-extensions, starting KCPC, loading every cog and, at the end, closing the bot.
-KCPC's jobs wait for the bot to be ready, which it never is here, so none of
-them runs.
+The bot boots as ``booting.booted`` boots it: it never logs in, and stand-ins
+take the place of TLE's database setup, of Discord's description of the bot's
+application and of the slash command sync. The rest runs for real: choosing
+the extensions, starting KCPC, loading every cog, the access rules and, at the
+end, closing the bot. KCPC's jobs wait for the bot to be ready, which it never
+is here, so none of them runs.
 """
 
+import asyncio
 import importlib
 import logging
 import pkgutil
 import sqlite3
 import sys
-from collections.abc import AsyncIterator, Collection, Iterable
-from contextlib import asynccontextmanager, closing
+from collections.abc import Collection, Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 from discord import app_commands
 from discord.ext import commands
 
+from tests.kcpc.component.booting import OWNER_ID, Stubs, booted
 from tle import constants, extensions
-from tle.config import Settings
+from tle.__main__ import TLEBot
+from tle.access import slash, table
+from tle.access.cog import Access
+from tle.access.help import Help
+from tle.access.service import AccessService, AccessTree
+from tle.access.settings import GuildAccess, decode
 from tle.kcpc import bootstrap
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.core.errors import MigrationError
@@ -37,13 +44,7 @@ from tle.kcpc.features.contests.settings import ContestSettings
 from tle.kcpc.features.problems.settings import WeeklySettings
 from tle.kcpc.features.workshops.settings import WorkshopSettings
 from tle.kcpc.services import KcpcServices
-
-# TLE's cogs draw with cairo and pango, through gi, and tle.__main__ imports
-# matplotlib and seaborn: Docker and CI have them, a bare virtualenv may not.
-pytest.importorskip('gi')
-
-from tle.__main__ import TLEBot  # noqa: E402
-from tle.util import codeforces_common as cf_common  # noqa: E402
+from tle.util import discord_common
 
 COGS_DIR = Path(__file__).resolve().parents[3] / 'tle' / 'cogs'
 TLE_MODULES = frozenset(
@@ -53,8 +54,12 @@ TLE_MODULES = frozenset(
 )
 LOGGING_MODULE = 'tle.cogs.logging'
 KCPC_FAILED = 'KCPC failed to start; KCPC extensions will not be loaded'
-# Where TLE's and KCPC's extension modules live (KCPC's in features/*/cog.py).
-EXTENSION_PACKAGES = ('tle.cogs.', 'tle.kcpc.features.')
+ACCESS_LOGGER = 'tle.access'
+# Real snowflakes are 64-bit, so use big ones.
+GUILD_ID = 1_100_000_000_000_000_001
+OTHER_GUILD_ID = 1_100_000_000_000_000_002
+STAFF_CHANNEL_ID = 1_200_000_000_000_000_010
+DEVELOPER_ROLE_ID = 1_300_000_000_000_000_005
 
 
 @dataclass(frozen=True)
@@ -178,76 +183,15 @@ FEATURES = (
 FEATURE_BY_EXTENSION = {feature.extension.name: feature for feature in FEATURES}
 
 
-@dataclass(frozen=True)
-class Stubs:
-    """Stand-ins for the calls that would reach TLE's databases or Discord."""
-
-    initialize: AsyncMock  # cf_common.initialize
-    sync: AsyncMock  # CommandTree.sync
-
-
-@pytest.fixture(autouse=True)
-def stubs(monkeypatch: pytest.MonkeyPatch) -> Stubs:
-    stubs = Stubs(initialize=AsyncMock(), sync=AsyncMock(return_value=[]))
-    monkeypatch.setattr(cf_common, 'initialize', stubs.initialize)
-    monkeypatch.setattr(app_commands.CommandTree, 'sync', stubs.sync)
-    monkeypatch.setattr(constants, 'OAUTH_CONFIGURED', False)
-    # Unset, the logging extension loads but installs no log handler.
-    monkeypatch.delenv('LOGGING_COG_CHANNEL_ID', raising=False)
-    return stubs
+@pytest.fixture
+def stubs() -> Stubs:
+    """The stand-ins of a test that looks at them: it passes them to booted."""
+    return Stubs()
 
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / 'db' / 'kcpc.db'
-
-
-@asynccontextmanager
-async def booted(
-    db_path: Path, *, disabled: str = '', nodb: bool = False
-) -> AsyncIterator[TLEBot]:
-    """A bot whose ``setup_hook`` has run; it is closed on the way out.
-
-    The extension modules imported before it booted are then put back in
-    sys.modules (see ``extension_modules``).
-    """
-    settings = Settings.from_env(
-        {'DISABLED_EXTENSIONS': disabled, 'KCPC_DB_PATH': str(db_path)}
-    )
-    intents = discord.Intents.default()  # as tle.__main__.main sets them
-    intents.members = True
-    intents.message_content = True
-    bot = TLEBot(nodb=nodb, settings=settings, command_prefix=';', intents=intents)
-    imported = extension_modules()
-    try:
-        # The context manager sets the bot up for the running loop, as logging
-        # in would; KCPC's jobs wait on bot.wait_until_ready, which needs that.
-        async with bot:
-            await bot.setup_hook()
-            yield bot
-    finally:
-        sys.modules.update(imported)
-        # bot.close() should have done this already (shutting down twice is
-        # fine), but a database left open would keep pytest from exiting.
-        if bot.kcpc is not None:
-            await bot.kcpc.shutdown()
-
-
-def extension_modules() -> dict[str, ModuleType]:
-    """The extension modules imported so far, which booting takes away.
-
-    discord.py loads each extension as a new module, which replaces the one in
-    sys.modules, and removes it when the bot closes. Other tests import TLE's
-    cogs and patch them by name, e.g. ``patch('tle.cogs.codeforces.cf_common')``,
-    and since Python 3.11 such a name is looked up through sys.modules. If
-    these modules weren't put back, those patches would import new copies and
-    miss the modules the tests use.
-    """
-    return {
-        name: module
-        for name, module in sys.modules.items()
-        if name.startswith(EXTENSION_PACKAGES)
-    }
 
 
 async def is_closed(services: KcpcServices) -> bool:
@@ -327,6 +271,22 @@ def subcommand_names(command: object) -> set[str]:
     return set()
 
 
+def assert_access_in_place(bot: TLEBot, *, nodb: bool) -> None:
+    """The access rules are in place, whichever extensions are switched off:
+    the service and its command tree, and /help and /access, prefix and
+    slash, which take the place of discord.py's help. Settings are stored in
+    the user database, but under --nodb in memory alone.
+    """
+    assert isinstance(bot.access, AccessService)
+    assert isinstance(bot.tree, AccessTree)
+    assert bot.help_command is None
+    for name, cog in (('help', Help), ('access', Access)):
+        command = bot.get_command(name)
+        assert command is not None and isinstance(command.cog, cog), name
+        assert bot.tree.get_command(name) is not None, name
+    assert bot.access.persistent is not nodb
+
+
 def fail_cog_load(monkeypatch: pytest.MonkeyPatch, cog_name: str) -> None:
     """Make ``cog_load`` raise for the KCPC cog called ``cog_name``.
 
@@ -374,6 +334,15 @@ def bot_records(
 
 def bot_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
     return [record.getMessage() for record in bot_records(caplog, level)]
+
+
+def access_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """What the access service logged at WARNING or above."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == ACCESS_LOGGER and record.levelno >= logging.WARNING
+    ]
 
 
 @pytest.mark.parametrize(
@@ -465,9 +434,10 @@ async def test_the_bot_boots_with_the_enabled_extensions(
     tle_modules: frozenset[str],
     kcpc: tuple[KcpcExtension, ...],
 ) -> None:
-    async with booted(db_path, disabled=disabled, nodb=nodb) as bot:
+    async with booted(db_path, disabled=disabled, nodb=nodb, stubs=stubs) as bot:
         assert set(bot.extensions) == tle_modules | modules_of(kcpc)
         assert_kcpc_extensions(bot, kcpc)
+        assert_access_in_place(bot, nodb=nodb)
         services = bot.kcpc
         # KCPC runs if any of its extensions is enabled, and not with --nodb.
         if kcpc:
@@ -541,10 +511,21 @@ async def test_setup_hook_starts_things_in_order(
     monkeypatch: pytest.MonkeyPatch, stubs: Stubs, db_path: Path
 ) -> None:
     steps: list[str] = []
-    stubs.initialize.side_effect = lambda *args: steps.append('cf_common.initialize')
+    attach_user_db = stubs.initialize.side_effect
+
+    async def initialize(bot: TLEBot, nodb: bool) -> None:
+        steps.append('cf_common.initialize')
+        await attach_user_db(bot, nodb)
+
+    stubs.initialize.side_effect = initialize
     stubs.sync.side_effect = lambda: steps.append('tree.sync')
     real_build_services = bootstrap.build_services
     real_load_extension = TLEBot.load_extension
+    real_add_cog = TLEBot.add_cog
+    real_load = AccessService.load
+    real_resolve_owners = AccessService.resolve_owners
+    real_report_unruled = AccessService.report_unruled
+    real_apply_visibility = slash.apply_visibility
 
     async def build_services(*args: Any, **kwargs: Any) -> KcpcServices:
         steps.append('kcpc.build_services')
@@ -554,21 +535,57 @@ async def test_setup_hook_starts_things_in_order(
         steps.append(name)
         await real_load_extension(bot, name)
 
+    async def add_cog(bot: TLEBot, cog: commands.Cog, **options: Any) -> None:
+        if isinstance(cog, (Access, Help)):
+            steps.append(f'add_cog {cog.qualified_name}')
+        await real_add_cog(bot, cog, **options)
+
+    async def load(service: AccessService) -> None:
+        steps.append('access.load')
+        await real_load(service)
+
+    async def resolve_owners(service: AccessService) -> None:
+        steps.append('access.resolve_owners')
+        await real_resolve_owners(service)
+
+    def report_unruled(service: AccessService, found: Any) -> list[str]:
+        steps.append('access.report_unruled')
+        return real_report_unruled(service, found)
+
+    def apply_visibility(bot: commands.Bot) -> Any:
+        steps.append('apply_visibility')
+        return real_apply_visibility(bot)
+
     monkeypatch.setattr(bootstrap, 'build_services', build_services)
     monkeypatch.setattr(TLEBot, 'load_extension', load_extension)
+    monkeypatch.setattr(TLEBot, 'add_cog', add_cog)
+    monkeypatch.setattr(AccessService, 'load', load)
+    monkeypatch.setattr(AccessService, 'resolve_owners', resolve_owners)
+    monkeypatch.setattr(AccessService, 'report_unruled', report_unruled)
+    monkeypatch.setattr('tle.__main__.apply_visibility', apply_visibility)
 
-    async with booted(db_path):
+    async with booted(db_path, stubs=stubs):
         pass
 
-    # The log channel first, so that it hears of problems while starting up,
-    # and KCPC's services before the extensions that use them. kcpc.admin
-    # comes before the features that add their admin commands to /kcpc.
+    # The log channel first, so that it hears of problems while starting up.
+    # Then the access settings, and /access and /help, which no extension can
+    # switch off. KCPC's services come before the extensions that use them,
+    # and kcpc.admin before the features that add their admin commands to
+    # /kcpc. Once every command is in: the owners, whose commands need them,
+    # the report of commands without a rule, and the slash pass, which must
+    # come before the sync.
     assert steps == [
         LOGGING_MODULE,
         'cf_common.initialize',
+        'access.load',
+        'add_cog Access',
+        'add_cog Help',
         'kcpc.build_services',
         *sorted(TLE_MODULES - {LOGGING_MODULE}),
         *(extension.module for extension in KCPC),
+        'access.resolve_owners',
+        'access.report_unruled',
+        'apply_visibility',
         'tree.sync',
     ]
 
@@ -640,7 +657,7 @@ async def test_the_bot_boots_without_a_kcpc_extension_that_fails_to_load(
         error = ModuleNotFoundError
     loaded = [extension for extension in KCPC if extension.name != failing]
 
-    async with booted(db_path) as bot:
+    async with booted(db_path, stubs=stubs) as bot:
         assert set(bot.extensions) == TLE_MODULES | modules_of(loaded)
         assert_kcpc_extensions(bot, loaded)
         # KCPC's services keep running, so that the reconcile job still settles
@@ -667,7 +684,7 @@ async def test_a_tle_extension_that_fails_to_load_still_stops_the_bot(
     monkeypatch.setattr(extensions, 'discover', lambda: [*discover(), missing])
 
     with pytest.raises(commands.ExtensionNotFound):
-        async with booted(db_path):
+        async with booted(db_path, stubs=stubs):
             pass
 
     stubs.sync.assert_not_awaited()
@@ -714,3 +731,210 @@ async def test_unknown_disabled_extensions_are_reported(
         "Ignoring unknown extension 'kcpc.nope' in DISABLED_EXTENSIONS",
         "Ignoring unknown extension 'tle.nope' in DISABLED_EXTENSIONS",
     ]
+
+
+# The access rules
+
+
+@pytest.mark.parametrize('nodb', [False, True], ids=['database', 'nodb'])
+async def test_access_settings_are_stored_in_the_user_database(
+    db_path: Path, nodb: bool
+) -> None:
+    settings = GuildAccess(frozenset({STAFF_CHANNEL_ID + 1}), STAFF_CHANNEL_ID)
+
+    async with booted(db_path, nodb=nodb) as bot:
+        # Under --nodb the database refuses every call, so it isn't asked.
+        await bot.access.change(GUILD_ID, lambda _: settings)
+
+        assert bot.access.guild_access(GUILD_ID) == settings
+        if not nodb:
+            rows = await bot.user_db.get_all_access_settings()
+            assert [(guild_id, decode(text)) for guild_id, text in rows] == [
+                (GUILD_ID, (settings, ()))
+            ]
+
+
+async def test_commands_without_a_rule_are_reported_as_the_bot_boots(
+    monkeypatch: pytest.MonkeyPatch, db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rules = dict(table.RULES)
+    del rules['gitgud']
+    monkeypatch.setattr(table, 'RULES', MappingProxyType(rules))
+
+    with caplog.at_level(logging.WARNING, logger=ACCESS_LOGGER):
+        async with booted(db_path):
+            pass
+
+    assert access_messages(caplog) == [
+        'Command gitgud has no access rule, so only the bot owner can use it, and '
+        'only in the staff channel'
+    ]
+
+
+async def test_the_bot_s_owner_is_found_once_as_it_boots(
+    stubs: Stubs, db_path: Path
+) -> None:
+    async with booted(db_path, stubs=stubs) as bot:
+        owner = MagicMock(spec=discord.User, id=OWNER_ID)
+        member = MagicMock(spec=discord.User, id=OWNER_ID + 1)
+
+        assert await bot.is_owner(owner)
+        assert not await bot.is_owner(member)
+
+    # While the bot booted: bot.is_owner never asks Discord.
+    stubs.application_info.assert_awaited_once_with()
+
+
+async def test_owners_that_cannot_be_found_never_stop_the_bot(
+    stubs: Stubs, db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    stubs.application_info.side_effect = discord.HTTPException(
+        MagicMock(status=503, reason='Service Unavailable'), 'down'
+    )
+
+    async with booted(db_path, stubs=stubs) as bot:
+        # Until Discord says who owns the bot, nobody does.
+        assert not await bot.is_owner(MagicMock(spec=discord.User, id=OWNER_ID))
+
+    stubs.sync.assert_awaited_once_with()
+    stubs.application_info.assert_awaited_once_with()
+    (warning,) = access_messages(caplog)
+    assert warning.startswith("Could not find the bot's owners (")
+
+
+async def test_a_failure_to_find_the_owners_is_logged_and_the_bot_boots(
+    monkeypatch: pytest.MonkeyPatch,
+    stubs: Stubs,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The service logs its own failures; this is the bot's second safety.
+    monkeypatch.setattr(
+        AccessService, 'resolve_owners', AsyncMock(side_effect=RuntimeError('boom'))
+    )
+
+    async with booted(db_path, stubs=stubs):
+        pass
+
+    stubs.sync.assert_awaited_once_with()
+    (record,) = bot_records(caplog, logging.ERROR)
+    assert record.getMessage() == "Could not find the bot's owners"
+    assert record.exc_info is not None and record.exc_info[0] is RuntimeError
+
+
+@pytest.mark.parametrize(
+    ('value', 'role', 'warned'),
+    [
+        ('Developers', None, True),
+        ('', None, False),
+        (str(DEVELOPER_ROLE_ID), DEVELOPER_ROLE_ID, False),
+    ],
+    ids=['not an id', 'blank', 'an id'],
+)
+async def test_an_unusable_developer_role_is_reported_once_logging_is_set_up(
+    monkeypatch: pytest.MonkeyPatch,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    value: str,
+    role: int | None,
+    warned: bool,
+) -> None:
+    # As tle.constants reads it on import, before logging is set up, and
+    # warns about a value that isn't an id where only the console sees it.
+    monkeypatch.setenv('TLE_DEVELOPER', value)
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', role)
+
+    async with booted(db_path):
+        pass
+
+    warning = "TLE_DEVELOPER must be a role ID, not 'Developers', so it is ignored"
+    assert (warning in bot_messages(caplog, logging.WARNING)) is warned
+
+
+# ALLOWED_GUILD_IDS
+
+
+def make_guild(guild_id: int, name: str) -> MagicMock:
+    guild = MagicMock(spec=discord.Guild, id=guild_id)
+    guild.name = name
+    guild.leave = AsyncMock()
+    return guild
+
+
+async def test_the_bot_leaves_a_server_that_is_not_allowed_as_it_joins(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    listed = make_guild(GUILD_ID, 'The club')
+    unlisted = make_guild(OTHER_GUILD_ID, 'Elsewhere')
+
+    async with booted(db_path, allowed_guilds=str(GUILD_ID)) as bot:
+        await bot.on_guild_join(listed)
+        await bot.on_guild_join(unlisted)
+
+    listed.leave.assert_not_awaited()
+    unlisted.leave.assert_awaited_once_with()
+    assert bot_messages(caplog, logging.WARNING) == [
+        f'Leaving the server Elsewhere ({OTHER_GUILD_ID}), which ALLOWED_GUILD_IDS '
+        'does not list'
+    ]
+
+
+async def test_without_allowed_guild_ids_the_bot_stays_in_every_server(
+    db_path: Path,
+) -> None:
+    guild = make_guild(OTHER_GUILD_ID, 'Elsewhere')
+
+    async with booted(db_path) as bot:
+        await bot.on_guild_join(guild)
+
+    guild.leave.assert_not_awaited()
+
+
+async def test_a_server_the_bot_cannot_leave_is_only_logged(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    guild = make_guild(OTHER_GUILD_ID, 'Elsewhere')
+    guild.leave.side_effect = discord.HTTPException(
+        MagicMock(status=500, reason='Server Error'), 'oops'
+    )
+
+    async with booted(db_path, allowed_guilds=str(GUILD_ID)) as bot:
+        await bot.on_guild_join(guild)  # raises nothing
+
+    assert bot_messages(caplog, logging.WARNING)[-1] == (
+        f'Could not leave the server {OTHER_GUILD_ID}: '
+        '500 Server Error (error code: 0): oops'
+    )
+
+
+@pytest.mark.parametrize(
+    ('allowed', 'named'), [(str(GUILD_ID), True), ('', False)], ids=['set', 'unset']
+)
+async def test_once_ready_the_bot_names_the_servers_that_are_not_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    allowed: str,
+    named: bool,
+) -> None:
+    listed = make_guild(GUILD_ID, 'The club')
+    unlisted = make_guild(OTHER_GUILD_ID, 'Elsewhere')
+    monkeypatch.setattr(TLEBot, 'guilds', property(lambda bot: [listed, unlisted]))
+    presence = AsyncMock()
+    monkeypatch.setattr(discord_common, 'presence', presence)
+
+    async with booted(db_path, allowed_guilds=allowed) as bot:
+        await bot.on_ready()
+        await bot.on_ready()  # after a reconnect, which changes nothing
+        await asyncio.sleep(0)  # the status's turn to start
+
+    # It stays in every one, so that a mistake in the setting can't make it
+    # leave the club's server.
+    listed.leave.assert_not_awaited()
+    unlisted.leave.assert_not_awaited()
+    presence.assert_awaited_once_with(bot)
+    named_them = (
+        'ALLOWED_GUILD_IDS does not list these servers, so the bot ignores '
+        f'commands there: Elsewhere ({OTHER_GUILD_ID})'
+    )
+    assert bot_messages(caplog, logging.WARNING) == ([named_them] if named else [])
