@@ -13,7 +13,7 @@ in tle/kcpc/__init__.py):
 - a feature imports from tle.kcpc only core, bot, platforms and itself, and
   only its cog.py and views.py import discord;
 - services.py and bootstrap.py, which assemble everything, may import anything
-  but TLE's user database (below).
+  but TLE's user database and its access package (below).
 
 The contests feature, and no other KCPC module, may import TLE's event system,
 tle.util.events, to hear when TLE has saved a contest's rating changes.
@@ -25,6 +25,10 @@ may import tle.util.handle_linking. No KCPC module imports what reaches TLE's
 user database otherwise, tle.util.db, tle.util.codeforces_common (which holds
 it) or TLE's cogs, and only the bridge uses the database the bot carries, as
 ``bot.user_db``.
+
+No KCPC module imports TLE's access package, tle.access, either. Where KCPC
+needs the access service, it reaches it only as the bot's ``access``
+attribute, through ``getattr(bot, 'access', None)``.
 
 Relative imports are not allowed anywhere. TLE's cogs import KCPC only lazily.
 One more test checks, in a fresh interpreter, that tle.util.discord_common can
@@ -60,6 +64,8 @@ TLE_CODEFORCES = 'tle.util.codeforces_api'
 TLE_EVENTS = 'tle.util.events'
 # What reaches TLE's user database, besides the bridge's handle linking.
 TLE_USER_DB = ('tle.util.db', 'tle.util.codeforces_common', 'tle.cogs')
+# TLE's access rules and service, which KCPC reaches only through the bot.
+TLE_ACCESS = 'tle.access'
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,11 @@ def violation(ref: ImportRef) -> str | None:
         return f'only {CODEFORCES_LINKS} may import {HANDLE_LINKING}'
     if _under(ref.target, *TLE_USER_DB):
         return f"KCPC reaches TLE's user database only through {CODEFORCES_LINKS}"
+    if _under(ref.target, TLE_ACCESS):
+        return (
+            f'KCPC never imports {TLE_ACCESS}: it reaches the access service as '
+            "the bot's access attribute"
+        )
     if _under(ref.target, TLE_EVENTS) and not _under(ref.module, CONTESTS):
         return f'only {CONTESTS} may import {TLE_EVENTS}'
     for layer, check in _LAYER_CHECKS:
@@ -344,6 +355,14 @@ def test_only_the_contests_feature_uses_tles_events() -> None:
     users = {ref.module for ref in kcpc_imports() if _under(ref.target, TLE_EVENTS)}
 
     assert users == {f'{CONTESTS}.cog'}
+
+
+def test_no_kcpc_module_imports_tles_access_package() -> None:
+    # KCPC asks the bot for the access service, as getattr(bot, 'access',
+    # None), so it loads and runs whether or not the bot has one.
+    refs = [str(ref) for ref in kcpc_imports() if _under(ref.target, TLE_ACCESS)]
+
+    assert refs == []
 
 
 def mentions_user_db(node: ast.AST) -> bool:
@@ -717,6 +736,18 @@ def test_tles_discord_common_imports_on_its_own() -> None:
             False,
         ),
         ('tle.kcpc.bootstrap', 'import tle.cogs', False),
+        # No KCPC module imports TLE's access package, not even where TLE's
+        # other modules may be imported, nor lazily or for type checking.
+        (f'{ACCOUNTS}.views', 'from tle.access.service import AccessService', False),
+        (f'{ACCOUNTS}.cog', 'def f():\n    import tle.access', False),
+        (
+            'tle.kcpc.features.admin.cog',
+            'if TYPE_CHECKING:\n    from tle.access import service',
+            False,
+        ),
+        ('tle.kcpc.services', 'from tle.access.rules import Who', False),
+        ('tle.kcpc.bootstrap', 'import tle.access.table', False),
+        ('tle.kcpc', 'from tle.access import context', False),
         ('tle.kcpc.core.x', 'from . import db', False),
         ('tle.kcpc.bootstrap', 'from .services import KcpcServices', False),
     ],
