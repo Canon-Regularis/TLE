@@ -11,6 +11,7 @@ import discord
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from discord import app_commands
 from discord.ext import commands
 from matplotlib import (
     dates as mdates,
@@ -33,6 +34,20 @@ pd.plotting.register_matplotlib_converters()
 # A user is considered active if the duration since his last contest is not
 # more than this
 CONTEST_ACTIVE_TIME_CUTOFF = 90 * 24 * 60 * 60  # 90 days
+
+# How often a member can use each plot, in seconds: drawing a plot is slow,
+# and most plots ask Codeforces for data first. A use counts only once the
+# plot's arguments are parsed (cooldown_after_parsing), so that a mistyped
+# plot costs no wait.
+PLOT_COOLDOWN_SECONDS = 20
+
+# The replies to plots of a server that has nothing to plot yet.
+NO_RATED_MEMBERS_MESSAGE = (
+    'No member of this server has linked a rated Codeforces handle yet.'
+)
+NO_COUNTRIES_MESSAGE = (
+    'No member of this server has linked a Codeforces handle with a country yet.'
+)
 
 
 class GraphCogError(commands.CommandError):
@@ -301,22 +316,57 @@ class Graphs(commands.Cog):
         self.bot: commands.Bot = bot
         self.converter: commands.MemberConverter = commands.MemberConverter()
 
-    @commands.hybrid_group(
-        brief='Graphs for analyzing Codeforces activity', fallback='show'
-    )
+    @commands.hybrid_group(brief='Show the graph commands', fallback='show')
     async def plot(self, ctx: commands.Context) -> None:
-        """Plot various graphs. Wherever Codeforces handles are accepted it is
-        possible to use a server member's name instead by prefixing it with
-        '!', for name with spaces use "!name with spaces" (with quotes)."""
-        await ctx.send_help('plot')
+        """Show the graph commands, which plot Codeforces ratings and solved problems.
+
+        Of the plots, only /plot distrib and /plot cfdistrib are slash commands:
+        type the others after ;plot, such as ;plot rating. Most of them plot the
+        Codeforces handles you name, or yours if you name none. For the handle
+        a member linked, type `!` and their name: `!Alice`, or `"!Alice Smith"`
+        if the name has spaces.
+
+        The plots of solved problems also take these filters, in any order:
+        - `+contest`, `+outof`, `+virtual`, `+practice`: only problems solved that way
+        - `+team`: count solutions by teams too
+        - `+dp`, `~math`: only problems with a tag, or without it
+        - `r>=1500`, `r<=2000`: only problems rated at least, or at most, that
+        - `d>=2024`, `d<01062025`: only solves from, or before, a date
+        - `c+div2`: only contests whose names contain that text
+        - `i+A`: only problems with that index in their contest
+
+        `+outof` means out of competition, which the plots call unofficial.
+        Part of a tag is enough, such as `+binary` for binary search. Dates
+        are yyyy, mmyyyy or ddmmyyyy.
+
+        Examples:
+            /plot distrib
+            ;plot rating
+            ;plot rating tourist !Alice
+            ;plot solved +contest r>=1600 d>=2024
+        """
+        await ctx.send_help(ctx.command)
 
     @plot.command(
-        brief='Plot Codeforces rating graph',
-        usage='[+zoom] [+number] [+peak] [handles...] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy]',  # noqa: E501
+        brief='Plot your Codeforces rating over time',
+        usage='[handles...] [+zoom] [+number] [+peak] [d>=date] [d<date]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def rating(self, ctx: commands.Context, *args: str) -> None:
-        """Plots Codeforces rating graph for the handles provided."""
+        """Plot your Codeforces rating over time; name up to 5 handles to plot
+        theirs instead. Add any of these:
+        - `+zoom`: fit the graph to the ratings
+        - `+number`: number the contests instead of dating them
+        - `+peak`: plot only the contests that set a new highest rating
+        - `d>=2024`, `d<2025`: only contests from, or before, a date
+
+        Examples:
+            ;plot rating
+            ;plot rating tourist !Alice +zoom
+            ;plot rating +peak d>=2024
+        """
 
         (zoom, number, peak), remaining = cf_common.filter_flags(
             args, ['+zoom', '+number', '+peak']
@@ -385,13 +435,23 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Plot Codeforces extremes graph',
-        usage='[handles] [+solved] [+unsolved] [+nolegend]',
+        brief='Plot your hardest solved and easiest unsolved problem in each contest',
+        usage='[handle] [+solved] [+unsolved] [+nolegend]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def extreme(self, ctx: commands.Context, *args: str) -> None:
-        """Plots pairs of lowest rated unsolved problem and highest rated
-        solved problem for every contest that was rated for the given user.
+        """For each rated contest you took part in, plot the rating of the
+        hardest problem you solved in it and of the easiest one you didn't.
+        Name a handle to plot theirs instead. Add any of these:
+        - `+solved`: plot only the hardest problems solved
+        - `+unsolved`: plot only the easiest problems not solved
+        - `+nolegend`: leave the legend out
+
+        Examples:
+            ;plot extreme
+            ;plot extreme tourist +solved
         """
         (solved, unsolved, nolegend), remaining = cf_common.filter_flags(
             args, ['+solved', '+unsolved', '+nolegend']
@@ -437,13 +497,22 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief="Show histogram of solved problems' rating on CF",
-        usage='[handles] [+practice] [+contest] [+virtual] [+outof] [+team] [+tag..] [~tag..] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [c+marker..] [i+index..]',  # noqa: E501
+        brief='Plot how many problems of each rating you have solved',
+        usage='[handles...] [filters...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def solved(self, ctx: commands.Context, *args: str) -> None:
-        """Shows a histogram of solved problems' rating on Codeforces for the
-        handles provided. e.g. ;plot solved meooow +contest +virtual +outof +dp
+        """Plot how many problems of each rating you have solved; name up to 5
+        handles to plot theirs instead. For a single handle, each bar shows how
+        the problems were solved: in a contest, unofficially, virtually or in
+        practice. It takes the filters that /help plot lists.
+
+        Examples:
+            ;plot solved
+            ;plot solved tourist !Alice
+            ;plot solved +practice +dp r>=1600
         """
         filt = cf_common.SubFilter()
         remaining = filt.parse(args)
@@ -516,12 +585,23 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Show histogram of solved problems on CF over time',
-        usage='[handles] [+practice] [+contest] [+virtual] [+outof] [+team] [+tag..] [~tag..] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [phase_days=] [c+marker..] [i+index..]',  # noqa: E501
+        brief='Plot how many problems you have solved over time',
+        usage='[handles...] [phase_days=1] [filters...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def hist(self, ctx: commands.Context, *args: str) -> None:
-        """Shows histogram of problems solved on Codeforces over time"""
+        """Plot how many problems you have solved over time; name up to 5
+        handles to plot theirs instead. It takes the filters that /help plot
+        lists, and `phase_days=7` to make each bar at least 7 days long rather
+        than 1.
+
+        Examples:
+            ;plot hist
+            ;plot hist !Alice phase_days=7
+            ;plot hist +contest d>=2024
+        """
         filt = cf_common.SubFilter()
         remaining = filt.parse(args)
         phase_days = 1
@@ -635,12 +715,21 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Plot count of solved CF problems over time',
-        usage='[handles] [+practice] [+contest] [+virtual] [+outof] [+team] [+tag..] [~tag..] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [c+marker..] [i+index..]',  # noqa: E501
+        brief='Plot the running total of problems you have solved over time',
+        usage='[handles...] [filters...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def curve(self, ctx: commands.Context, *args: str) -> None:
-        """Plots the count of problems solved over time on Codeforces."""
+        """Plot the running total of problems you have solved over time; name up
+        to 5 handles to plot theirs instead. It takes the filters that /help
+        plot lists.
+
+        Examples:
+            ;plot curve
+            ;plot curve tourist !Alice r>=1900
+        """
         filt = cf_common.SubFilter()
         remaining = filt.parse(args)
         handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
@@ -685,14 +774,28 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Show history of problems solved by rating',
+        brief='Plot the problems you solved by rating and date, over your rating graph',
         aliases=['chilli'],
-        usage='[handle] [+practice] [+contest] [+virtual] [+outof] [+team] [+tag..] [~tag..] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [b=10] [s=3] [c+marker..] [i+index..] [+nolegend]',  # noqa: E501
+        usage='[handle] [b=10] [s=3] [+nolegend] [filters...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def scatter(self, ctx: commands.Context, *args: str) -> None:
-        """Plot Codeforces rating overlaid on a scatter plot of problems solved.
-        Also plots a running average of ratings of problems solved in practice."""
+        """Plot a point for each problem you solved, at its rating and the date
+        you solved it, over your rating graph; name a handle to plot theirs
+        instead. A line shows the moving average of the ratings of your practice
+        problems, over 10 problems. It takes the filters that /help plot lists,
+        and any of these:
+        - `b=20`: average over 20 problems instead
+        - `s=5`: make the points bigger, from 1 to 100; 3 by default
+        - `+nolegend`: leave the legend out
+
+        Examples:
+            ;plot scatter
+            ;plot scatter tourist b=20
+            ;plot scatter +practice d>=2024
+        """
         (nolegend,), remaining = cf_common.filter_flags(args, ['+nolegend'])
         (legend,) = cf_common.negate_flags(nolegend)
         filt = cf_common.SubFilter()
@@ -777,9 +880,10 @@ class Graphs(commands.Cog):
         binsize: int,
         title: str,
     ) -> None:
-        if mode not in ('log', 'normal'):
-            raise GraphCogError('Mode should be either `log` or `normal`')
-
+        """Send a histogram of ``ratings`` in bands of ``binsize``, its numbers
+        of users on a log scale if ``mode`` is 'log'. The caller checks that
+        ``mode`` is 'log' or 'normal'.
+        """
         ratings = [r for r in ratings if r >= 0]
         assert ratings, 'Cannot histogram plot empty list of ratings'
 
@@ -845,9 +949,16 @@ class Graphs(commands.Cog):
         discord_common.set_author_footer(embed, ctx.author)
         await ctx.send(embed=embed, file=discord_file)
 
-    @plot.command(brief='Show server rating distribution')
+    @plot.command(brief="Plot the rating distribution of this server's members")
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def distrib(self, ctx: commands.Context) -> None:
-        """Plots rating distribution of users in this server"""
+        """Plot the Codeforces rating distribution of this server's members who
+        have linked a rated handle.
+
+        Examples:
+            /plot distrib
+            ;plot distrib
+        """
 
         def in_purgatory(userid: int) -> bool:
             member = ctx.guild.get_member(int(userid))
@@ -855,24 +966,38 @@ class Graphs(commands.Cog):
                 member, constants.TLE_PURGATORY
             )
 
-        res = await self.bot.user_db.get_cf_users_for_guild(ctx.guild.id)
-        ratings = [
-            cf_user.rating
-            for user_id, cf_user in res
-            if cf_user.rating is not None and not in_purgatory(user_id)
-        ]
-        await self._rating_hist(
-            ctx,
-            ratings,
-            'normal',
-            binsize=100,
-            title='Rating distribution of server members',
-        )
+        # Drawing the plot can take longer than the 3 seconds a slash command
+        # has to answer, so typing defers the answer first.
+        async with ctx.typing():
+            res = await self.bot.user_db.get_cf_users_for_guild(ctx.guild.id)
+            ratings = [
+                cf_user.rating
+                for user_id, cf_user in res
+                if cf_user.rating is not None and not in_purgatory(user_id)
+            ]
+            if not ratings:
+                raise GraphCogError(NO_RATED_MEMBERS_MESSAGE)
+            await self._rating_hist(
+                ctx,
+                ratings,
+                'normal',
+                binsize=100,
+                title='Rating distribution of server members',
+            )
 
     @plot.command(
-        brief='Show Codeforces rating distribution',
-        usage='[normal/log] [active/all] [contest_cutoff=5]',
+        brief='Plot the rating distribution of Codeforces users',
+        cooldown_after_parsing=True,
     )
+    @app_commands.describe(
+        mode='The scale for the numbers of users: log or normal; log if left out',
+        activity=(
+            'Which users count: active (a rated contest in the last 90 days) or '
+            'all; active if left out'
+        ),
+        contest_cutoff='The fewest rated contests a user needs to count; 5 if left out',
+    )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def cfdistrib(
         self,
         ctx: commands.Context,
@@ -880,41 +1005,57 @@ class Graphs(commands.Cog):
         activity: str = 'active',
         contest_cutoff: int = 5,
     ) -> None:
-        """Plots rating distribution of either active or all users on Codeforces,
-        in either normal or log scale.
-        Default mode is log, default activity is active (competed in last 90 days)
-        Default contest cutoff is 5 (competed at least five times overall)
+        """Plot the rating distribution of Codeforces users: by default, those
+        with at least 5 rated contests and one in the last 90 days, with the
+        numbers of users on a log scale.
+
+        Examples:
+            /plot cfdistrib
+            /plot cfdistrib mode:normal activity:all
+            ;plot cfdistrib normal all 10
         """
-        if activity not in ['active', 'all']:
+        if mode not in ('log', 'normal'):
+            raise GraphCogError('Mode should be either `log` or `normal`')
+        if activity not in ('active', 'all'):
             raise GraphCogError('Activity should be either `active` or `all`')
 
         time_cutoff = (
             int(time.time()) - CONTEST_ACTIVE_TIME_CUTOFF if activity == 'active' else 0
         )
-        handles = await (
-            self.bot.cf_cache.rating_changes_cache.get_users_with_more_than_n_contests(
+        cache = self.bot.cf_cache.rating_changes_cache
+        # Finding the users goes through every rating change on Codeforces,
+        # and drawing them takes time too: more than the 3 seconds a slash
+        # command has to answer, so typing defers the answer first.
+        async with ctx.typing():
+            handles = await cache.get_users_with_more_than_n_contests(
                 time_cutoff, contest_cutoff
             )
-        )
-        if not handles:
-            raise GraphCogError('No Codeforces users meet the specified criteria')
-
-        ratings = [
-            self.bot.cf_cache.rating_changes_cache.get_current_rating(handle)
-            for handle in handles
-        ]
-        title = f'Rating distribution of {activity} Codeforces users ({mode} scale)'
-        await self._rating_hist(ctx, ratings, mode, binsize=100, title=title)
+            if not handles:
+                raise GraphCogError('No Codeforces users meet the specified criteria')
+            ratings = [cache.get_current_rating(handle) for handle in handles]
+            title = f'Rating distribution of {activity} Codeforces users ({mode} scale)'
+            await self._rating_hist(ctx, ratings, mode, binsize=100, title=title)
 
     @plot.command(
-        brief='Show percentile distribution on codeforces',
-        usage='[+zoom] [+nomarker] [handles...] [+exact]',
+        brief='Plot the percentile of each Codeforces rating, marking yours',
+        usage='[handles...] [+zoom] [+exact] [+nomarker]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def centile(self, ctx: commands.Context, *args: str) -> None:
-        """Show codeforces percentile distribution and mark given handles in the plot.
+        """Plot the percentile of each Codeforces rating: the percentage of
+        rated users below it. It marks you, or up to 50 handles you name. Add
+        any of these:
+        - `+zoom`: zoom in on the handles marked
+        - `+exact`: show their percentiles
+        - `+nomarker`: mark nobody
 
-        If +zoom and handles are given, it zooms to the neighborhood of the handles."""
+        Examples:
+            ;plot centile
+            ;plot centile tourist !Alice +exact
+            ;plot centile +nomarker
+        """
         (zoom, nomarker, exact), remaining = cf_common.filter_flags(
             args, ['+zoom', '+nomarker', '+exact']
         )
@@ -1039,8 +1180,21 @@ class Graphs(commands.Cog):
         discord_common.set_author_footer(embed, ctx.author)
         await ctx.send(embed=embed, file=discord_file)
 
-    @plot.command(brief='Plot histogram of gudgiting', with_app_command=False)
+    @plot.command(
+        brief='Plot how hard the gitgud problems you solved were',
+        with_app_command=False,
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def howgud(self, ctx: commands.Context, *members: discord.Member) -> None:
+        """Plot how many gitgud problems you have solved at each difficulty: the
+        problem's rating minus yours when you took it on. Name up to 5 members
+        to plot theirs instead.
+
+        Examples:
+            ;plot howgud
+            ;plot howgud @alice @bob
+        """
         assert isinstance(ctx.author, discord.Member)
         members = members or (ctx.author,)
         if len(members) > 5:
@@ -1071,15 +1225,19 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Plot distribution of server members by country',
+        brief="Plot this server's members by country, or their ratings by country",
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def country(self, ctx: commands.Context, *countries: str) -> None:
-        """Plots distribution of server members by countries. When no countries
-        are specified, plots a bar graph of all members by country. When one or
-        more countries are specified, plots a swarmplot of members by country
-        and rating. Only members with registered handles and countries set on
-        Codeforces are considered.
+        """Plot how many of this server's members come from each country, as the
+        Codeforces profiles they linked say. Name up to 8 countries to plot the
+        ratings of their members instead.
+
+        Examples:
+            ;plot country
+            ;plot country Poland "United Kingdom"
         """
         max_countries = 8
         if len(countries) > max_countries:
@@ -1090,6 +1248,8 @@ class Graphs(commands.Cog):
 
         country_list: Sequence[str] = countries
         if not country_list:
+            if not counter:
+                raise GraphCogError(NO_COUNTRIES_MESSAGE)
             # list because seaborn complains for tuple.
             country_list, counts = map(list, zip(*counter.most_common(), strict=False))
             plt.clf()
@@ -1181,17 +1341,24 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Show rating changes by rank',
-        usage='contest_id [+server] [+zoom] [handles..]',
+        brief="Plot a contest's rating changes against rank",
+        usage='<contest_id> [handles...] [+server] [+zoom]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def visualrank(
         self, ctx: commands.Context, contest_id: int, *args: str
     ) -> None:
-        """Plot rating changes by rank. Add handles to specify a handle in the plot.
-        if arguments contains `+server`, it will include just server members
-        and not all codeforces users. Specify `+zoom` to zoom to the
-        neighborhood of handles.
+        """Plot each user's rating change in a Codeforces contest against their
+        rank, marking up to 20 handles you name. Add any of these:
+        - `+server`: plot only this server's members and the handles you name
+        - `+zoom`: zoom in on the handles you name
+
+        Examples:
+            ;plot visualrank 1950
+            ;plot visualrank 1950 tourist +zoom
+            ;plot visualrank 1950 +server
         """
 
         (in_server, zoom), remaining = cf_common.filter_flags(
@@ -1293,12 +1460,27 @@ class Graphs(commands.Cog):
         await ctx.send(embed=embed, file=discord_file)
 
     @plot.command(
-        brief='Show speed of solving problems by rating',
-        usage='[handles...] [+contest] [+virtual] [+outof] [+scatter] [+median] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [s=3]',  # noqa: E501
+        brief='Plot how long you take to solve problems of each rating in contests',
+        usage='[handles...] [+median] [+scatter] [s=3] [filters...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, PLOT_COOLDOWN_SECONDS, commands.BucketType.user)
     async def speed(self, ctx: commands.Context, *args: str) -> None:
-        """Plot time spent on problems of particular rating during contest."""
+        """Plot how many minutes you take, on average, to solve problems of each
+        rating in contests; name up to 5 handles to plot theirs instead. Each
+        solve's time runs from your previous solve in the contest, or from its
+        start. It takes the filters that /help plot lists, except `+practice`,
+        and any of these:
+        - `+median`: plot the median time instead of the average
+        - `+scatter`: plot each solve too
+        - `s=5`: make the points of each solve bigger; 3 by default
+
+        Examples:
+            ;plot speed
+            ;plot speed tourist +median
+            ;plot speed +scatter r>=1600
+        """
 
         (add_scatter, use_median), remaining = cf_common.filter_flags(
             args, ['+scatter', '+median']
