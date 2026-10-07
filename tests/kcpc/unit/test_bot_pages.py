@@ -16,6 +16,7 @@ from discord.ext import commands
 from tle.kcpc.bot.embeds import ALERT_COLOR
 from tle.kcpc.bot.pages import NOT_YOUR_PAGES, PAGE_TIMEOUT, PageView, send_pages
 from tle.kcpc.bot.views import KcpcView
+from tle.util import paginator
 
 OWNER = 1_300_000_000_000_000_001
 STRANGER = 1_300_000_000_000_000_002
@@ -101,6 +102,13 @@ async def test_only_the_member_who_ran_the_command_can_turn_the_pages() -> None:
     assert refusal.colour == discord.Colour(ALERT_COLOR)
     assert view.page.title == 'Page 1'
     assert await view.interaction_check(make_interaction(OWNER)) is True
+
+
+def test_kcpc_and_tles_pages_refuse_strangers_in_the_same_words() -> None:
+    # Members can't tell which paginator a reply uses. KCPC can't import
+    # TLE's, so each has its own copy of the words.
+    assert NOT_YOUR_PAGES == paginator.NOT_YOUR_PAGES
+    assert NOT_YOUR_PAGES == 'Only the person who asked can turn these pages.'
 
 
 async def test_a_timeout_disables_both_buttons_on_the_message() -> None:

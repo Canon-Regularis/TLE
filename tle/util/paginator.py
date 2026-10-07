@@ -1,10 +1,18 @@
+import logging
 from collections.abc import Sequence
 from typing import Any
 
 import discord
 from discord.ext import commands
 
+from tle.util import discord_common
+
+logger = logging.getLogger(__name__)
+
 Page = tuple[str | None, discord.Embed]
+
+# The private reply to anyone who presses the buttons of someone else's pages.
+NOT_YOUR_PAGES = 'Only the person who asked can turn these pages.'
 
 
 def chunkify(sequence: Sequence[Any], chunk_size: int) -> list[Sequence[Any]]:
@@ -21,12 +29,34 @@ class NoPagesError(PaginatorError):
 
 
 class PaginatorView(discord.ui.View):
-    def __init__(self, pages: Sequence[Page], *, timeout: float) -> None:
+    """Buttons that show ``pages`` one at a time.
+
+    With ``owner_id``, only that user can turn the pages: anyone else who presses
+    a button gets a private refusal. With None, anyone can, as on the standings
+    that the rated-VC watcher posts.
+    """
+
+    def __init__(
+        self, pages: Sequence[Page], *, timeout: float, owner_id: int | None = None
+    ) -> None:
         super().__init__(timeout=timeout)
         self.pages = pages
+        self.owner_id = owner_id
         self.cur_page = 0
         self.message: discord.Message | None = None
         self._update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id is None or interaction.user.id == self.owner_id:
+            return True
+        try:
+            await interaction.response.send_message(
+                embed=discord_common.embed_alert(NOT_YOUR_PAGES), ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            # The pages stay as they are either way.
+            logger.debug('Could not refuse a press on a paged reply: %s', exc)
+        return False
 
     def _update_buttons(self) -> None:
         on_first = self.cur_page == 0
@@ -87,8 +117,10 @@ class PaginatorView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(view=self)
-            except discord.NotFound:
-                pass
+            except discord.HTTPException as exc:
+                # The message may be gone, or be private and older than the 15
+                # minutes in which an interaction's replies can be edited.
+                logger.debug('Could not disable the buttons of a paged reply: %s', exc)
 
 
 async def paginate(
@@ -99,24 +131,37 @@ async def paginate(
     set_pagenum_footers: bool = False,
     delete_after: float | None = None,
     ctx: commands.Context | None = None,
+    ephemeral: bool = False,
 ) -> None:
+    """Send the first of ``pages``, with buttons to turn them if there are more.
+
+    With ``ctx``, it replies to the command, and only its author can turn the
+    pages; without, it posts in ``channel``, and anyone can. ``ephemeral`` makes
+    the reply to a slash command private (prefix replies ignore it), so it needs
+    ``ctx``.
+    """
+    if ephemeral and ctx is None:
+        raise ValueError('A private reply needs ctx: a post in a channel is public')
     if not pages:
         raise NoPagesError()
     if len(pages) > 1 and set_pagenum_footers:
         for i, (_content, embed) in enumerate(pages):
             embed.set_footer(text=f'Page {i + 1} / {len(pages)}')
 
+    # Passed only when set, so that public replies are sent exactly as before.
+    private: dict[str, Any] = {'ephemeral': True} if ephemeral else {}
     content, embed = pages[0]
     if len(pages) == 1:
         if ctx is not None:
-            await ctx.send(content, embed=embed, delete_after=delete_after)
+            await ctx.send(content, embed=embed, delete_after=delete_after, **private)
         else:
             await channel.send(content, embed=embed, delete_after=delete_after)
     else:
-        view = PaginatorView(pages, timeout=wait_time)
+        owner_id = None if ctx is None else ctx.author.id
+        view = PaginatorView(pages, timeout=wait_time, owner_id=owner_id)
         if ctx is not None:
             view.message = await ctx.send(
-                content, embed=embed, view=view, delete_after=delete_after
+                content, embed=embed, view=view, delete_after=delete_after, **private
             )
         else:
             view.message = await channel.send(
