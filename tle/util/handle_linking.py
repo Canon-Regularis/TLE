@@ -49,7 +49,9 @@ def role_for_rank(guild: discord.Guild, rank: cf.Rank) -> discord.Role | None:
         return None
     role = discord.utils.get(guild.roles, name=rank.title)
     if role is None:
-        raise HandleLinkError(f'Role for rank `{rank.title}` not present in the server')
+        raise HandleLinkError(
+            f'Role for rank `{rank.title}` not present in the server.'
+        )
     return role
 
 
@@ -131,6 +133,7 @@ async def maybe_add_trusted_role(
     """Add trusted role for eligible users.
 
     Condition: `member` has been 1900+ for any amount of time before o1 release.
+    The trusted role is ``constants.TLE_TRUSTED``, a role's id or its name.
     """
     handle = await user_db.get_handle(member.id, member.guild.id)
     if not handle:
@@ -138,7 +141,7 @@ async def maybe_add_trusted_role(
             f'WARN: handle not found in guild {member.guild.name} ({member.guild.id})'
         )
         return
-    trusted_role = discord.utils.get(member.guild.roles, name=constants.TLE_TRUSTED)
+    trusted_role = discord_common.get_role(member.guild, constants.TLE_TRUSTED)
     if not trusted_role:
         log.warning(
             "WARN: 'Trusted' role not found in guild"

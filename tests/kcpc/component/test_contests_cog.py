@@ -854,6 +854,35 @@ async def test_contests_works_as_a_prefix_command_too(
     assert reply(ctx).title == title
 
 
+@pytest.mark.parametrize('args', ['club', 'upcoming Club'])
+async def test_contests_takes_a_platform_by_the_name_its_choices_show(
+    bot: KcpcBot,
+    guild: MagicMock,
+    repo: ContestRepo,
+    guild_settings: GuildSettingsRepo,
+    args: str,
+) -> None:
+    # /contests upcoming offers the club's own contests as Club, though their
+    # platform's key is manual: a member who saw it there types ;contests club.
+    group = bot.tree.get_command('contests')
+    assert isinstance(group, app_commands.Group)
+    upcoming = group.get_command('upcoming')
+    assert isinstance(upcoming, app_commands.Command)
+    (platform,) = upcoming.parameters
+    assert app_commands.Choice(name='Club', value='manual') in platform.choices
+    await follow(guild_settings, platforms=('codeforces',))
+    await repo.add_manual(
+        'KCPC Autumn Contest', NOW + DAY, NOW + DAY + HOUR, None, now=NOW
+    )
+    ctx = make_context(bot, guild, make_member(manage_guild=False), args=args)
+
+    await invoke(bot, 'contests', ctx)
+
+    embed = reply(ctx)
+    assert embed.title == 'Upcoming Club contests'
+    assert [field.name for field in embed.fields] == ['KCPC Autumn Contest']
+
+
 async def test_contests_live_shows_what_runs_now_and_when_it_ends(
     bot: KcpcBot,
     ctx: MagicMock,
@@ -898,8 +927,9 @@ async def test_contests_live_without_running_contests_says_so(
     await run(bot, 'contests live', ctx)
 
     embed = reply(ctx)
+    # The slash command, which a group without its subcommand isn't.
     assert embed.description == (
-        'No contests are running right now. `/contests` shows the next ones.'
+        'No contests are running right now. `/contests upcoming` shows the next ones.'
     )
     assert embed.footer.text is None  # club contests have no source
 

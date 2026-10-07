@@ -3,9 +3,11 @@
 - Members: ``/contests upcoming [platform]`` (also plain ``;contests``) and
   ``/contests live``. They read the database only, which syncing keeps up to
   date.
-- Admins: ``/kcpc contests`` to add, time and remove contests, choose the
-  server's platforms and posts (start posts, results posts), and sync now,
-  attached under /kcpc (see ``tle.kcpc.bot.admin``).
+- Admins: ``/kcpc contests`` to choose the server's platforms and posts
+  (start posts, results posts), attached under /kcpc (see
+  ``tle.kcpc.bot.admin``). Adding, timing and removing club contests, and
+  syncing now, concern every server, so the access rules leave them to the
+  bot owner.
 - A job per source syncs its platform's contests: Codeforces every 5 minutes
   (from TLE's own cache), AtCoder every 30 minutes, and the ICPC contests of
   ``ICPC_CONTEST_CODES`` every 6 hours. With clist.by's credentials set
@@ -120,7 +122,9 @@ _SHORTEST = timedelta(minutes=1)
 _LONGEST = timedelta(days=7)
 
 _NOTHING_UPCOMING = 'No contests are coming up. Check back soon!'
-_NOTHING_LIVE = 'No contests are running right now. `/contests` shows the next ones.'
+_NOTHING_LIVE = (
+    'No contests are running right now. `/contests upcoming` shows the next ones.'
+)
 _UNKNOWN_PLATFORM = f'There is no such platform. Choose from: {", ".join(PLATFORMS)}.'
 _PICK_A_CONTEST = (
     'Pick the contest from the suggestions that appear as you type, or give its ID.'
@@ -156,6 +160,23 @@ _PLATFORM_CHOICES = [
     app_commands.Choice(name=platform_name(platform), value=platform)
     for platform in PLATFORMS
 ]
+# The platforms by the names that the choices show, such as club for manual,
+# the club's own contests: ;contests takes either.
+_PLATFORMS_BY_NAME = {
+    platform_name(platform).lower(): platform for platform in PLATFORMS
+}
+# The brief of /contests upcoming, which the prefix twin ;contests upcoming
+# shares.
+_UPCOMING_BRIEF = (
+    "Show upcoming contests on this server's platforms, or on one you choose"
+)
+# The description of /kcpc contests platforms' option. It names no list of every
+# platform, which could outgrow Discord's 100 characters: the command's help
+# lists them, and a mistake gets the list.
+_PLATFORMS_OPTION = (
+    'The platforms to follow, separated by spaces or commas, such as '
+    'codeforces atcoder manual'
+)
 
 
 # A subcommand of the cog, as discord.py types it.
@@ -332,29 +353,53 @@ class KcpcContests(KcpcCog):
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
-    @commands.hybrid_group(fallback='upcoming', brief='Upcoming contests')  # type: ignore[arg-type]
+    @commands.hybrid_group(fallback='upcoming', brief=_UPCOMING_BRIEF)  # type: ignore[arg-type]
     @commands.guild_only()
-    @app_commands.describe(platform='Only the contests on this platform')
+    @app_commands.describe(
+        platform="The platform whose contests to show; this server's platforms if "
+        'left out'
+    )
     @app_commands.choices(platform=_PLATFORM_CHOICES)
     async def contests(
         self, ctx: commands.Context[Any], platform: str | None = None
     ) -> None:
-        """Show the next contests on this server's platforms, or on one of them."""
+        """Show the next 10 contests on this server's platforms, or on the
+        platform you choose, with when each starts and how long it runs.
+
+        Examples:
+            /contests upcoming
+            /contests upcoming platform:atcoder
+            ;contests
+            ;contests atcoder
+        """
         await self._show_upcoming(ctx, platform)
 
     # The slash command is the group's fallback, which prefix commands lack.
     @commands.hybrid_command(  # type: ignore[arg-type]
-        name='upcoming', with_app_command=False, brief='Upcoming contests'
+        name='upcoming', with_app_command=False, brief=_UPCOMING_BRIEF
     )
     async def upcoming(
         self, ctx: commands.Context[Any], platform: str | None = None
     ) -> None:
-        """Show the next contests on this server's platforms, or on one of them."""
+        """Show the next 10 contests on this server's platforms, or on the
+        platform you choose, with when each starts and how long it runs.
+
+        Examples:
+            /contests upcoming
+            ;contests upcoming
+            ;contests upcoming atcoder
+        """
         await self._show_upcoming(ctx, platform)
 
-    @commands.hybrid_command(name='live', brief='Contests running now')  # type: ignore[arg-type]
+    @commands.hybrid_command(name='live', brief='Show the contests running now')  # type: ignore[arg-type]
     async def live(self, ctx: commands.Context[Any]) -> None:
-        """Show the contests running now on this server's platforms."""
+        """Show the contests running now on this server's platforms, and when
+        each ends.
+
+        Examples:
+            /contests live
+            ;contests live
+        """
         guild = _guild(ctx)
         platforms = await self._platforms(guild.id)
         now = self.services.clock.now()
@@ -368,10 +413,16 @@ class KcpcContests(KcpcCog):
         )
         await ctx.send(embed=to_embed(message))
 
-    @commands.hybrid_group(name='contests', brief='Club contests, times and platforms')  # type: ignore[arg-type]
+    @commands.hybrid_group(  # type: ignore[arg-type]
+        name='contests',
+        brief='Set up contest reminders, results posts and club contests',
+    )
     @kcpc_admin_only()
     async def contests_admin(self, ctx: commands.Context[Any]) -> None:
-        """Add club contests, set contest times, and choose this server's platforms."""
+        """Choose the platforms whose contests this server is reminded of, and
+        what gets posted. The bot owner also adds, times and removes club
+        contests here.
+        """
         # Only ;kcpc contests gets here: Discord can't run a slash group.
         await ctx.send_help(ctx.command)
 
@@ -380,7 +431,7 @@ class KcpcContests(KcpcCog):
         name="The contest's name",
         start='When it starts, in club time: YYYY-MM-DD HH:MM',
         duration='How long it runs, such as 2h, 90m or 1h30m',
-        url='Its page, if it has one (an http or https link)',
+        url='Its page, an http or https link; none if left out',
     )
     @kcpc_admin_only()
     async def add_contest(
@@ -391,11 +442,15 @@ class KcpcContests(KcpcCog):
         duration: str,
         url: str | None = None,
     ) -> None:
-        """Add a contest of the club's own, which members are reminded of.
+        """Add a club contest, which members are reminded of.
 
-        Every server the bot is in that follows club contests (the platform
-        'manual') gets its reminders. As a prefix command, quote a name or
-        start with spaces in: ;kcpc contests add Weekly "2026-10-17 10:00" 2h
+        Every server that follows the `manual` platform, the club's own
+        contests, gets its reminders. With the ; command, put quotes around a
+        name or a start with a space in it.
+
+        Examples:
+            /kcpc contests add name:Weekly contest start:2026-10-17 10:00 duration:2h
+            ;kcpc contests add "Weekly contest" "2026-10-17 10:00" 2h
         """
         await ctx.defer(ephemeral=True)
         title = name.strip()
@@ -421,7 +476,7 @@ class KcpcContests(KcpcCog):
     @app_commands.describe(
         contest='The contest: pick one as you type',
         start='When it starts, in club time: YYYY-MM-DD HH:MM',
-        duration='How long it runs, such as 5h; leave it out to keep its length',
+        duration='How long it runs, such as 5h; unchanged if left out',
     )
     @app_commands.autocomplete(contest=contest_autocomplete)
     @kcpc_admin_only()
@@ -433,12 +488,16 @@ class KcpcContests(KcpcCog):
         start: str,
         duration: str | None = None,
     ) -> None:
-        """Set when a contest starts, whatever its site says.
+        """Set when a contest starts, whatever its site says, such as an ICPC
+        contest whose site gives only the date.
 
-        Typically for an ICPC contest, whose site gives only the date. Members
-        are reminded of it at this time from now on, and those reminded of an
-        earlier time are told it changed. As a prefix command the start and
-        duration end the message: ;kcpc contests settime 12 2026-10-17 10:00 5h
+        Members are reminded of the new time, and those reminded of the old one
+        are told it changed. With the ; command, give the contest's ID, then
+        the start and the duration, without quotes.
+
+        Examples:
+            /kcpc contests settime contest:12 start:2026-10-17 10:00 duration:5h
+            ;kcpc contests settime 12 2026-10-17 10:00 5h
         """
         await ctx.defer(ephemeral=True)
         start_text, duration_text = _start_and_duration(start, duration)
@@ -460,9 +519,13 @@ class KcpcContests(KcpcCog):
     @app_commands.autocomplete(contest=club_contest_autocomplete)
     @kcpc_admin_only()
     async def remove_contest(self, ctx: commands.Context[Any], contest: str) -> None:
-        """Remove a contest added with /kcpc contests add.
+        """Remove a club contest added with /kcpc contests add.
 
         Members who were reminded of it are told it is cancelled.
+
+        Examples:
+            /kcpc contests remove 12
+            ;kcpc contests remove 12
         """
         await ctx.defer(ephemeral=True)
         removed = await self._repo.cancel_manual(
@@ -477,17 +540,23 @@ class KcpcContests(KcpcCog):
             ),
         )
 
-    @commands.hybrid_command(name='platforms', brief='Choose the platforms to follow')  # type: ignore[arg-type]
-    @app_commands.describe(
-        platforms='Separated by commas or spaces, from: ' + ', '.join(PLATFORMS)
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        name='platforms',
+        brief='Choose the platforms whose contests this server follows',
     )
+    @app_commands.describe(platforms=_PLATFORMS_OPTION)
     @kcpc_admin_only()
     async def set_platforms(
         self, ctx: commands.Context[Any], *, platforms: str
     ) -> None:
-        """Choose the platforms whose contests this server follows.
+        """Choose the platforms whose contests this server follows: codeforces,
+        atcoder, codechef, leetcode, topcoder, icpc and manual, the club's own.
 
-        'manual' is the club's own contests, which admins add.
+        The platforms you give replace those followed before.
+
+        Examples:
+            /kcpc contests platforms codeforces atcoder manual
+            ;kcpc contests platforms codeforces, atcoder, icpc
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -498,13 +567,21 @@ class KcpcContests(KcpcCog):
             ctx, success_embed(f'This server now follows contests on: {names}.')
         )
 
-    @commands.hybrid_command(name='start-posts', brief='Post as contests start')  # type: ignore[arg-type]
-    @app_commands.describe(state='on to post again as each contest starts, off not to')
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        name='start-posts', brief='Choose whether each contest gets a post as it starts'
+    )
+    @app_commands.describe(state='on to post again as each contest starts, off to stop')
     @kcpc_admin_only()
     async def set_start_posts(
         self, ctx: commands.Context[Any], state: Literal['on', 'off']
     ) -> None:
-        """Turn on or off a post as each contest starts, after its reminders."""
+        """Choose whether each contest gets a post as it starts, after its
+        reminders.
+
+        Examples:
+            /kcpc contests start-posts on
+            ;kcpc contests start-posts off
+        """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
         on = state == 'on'
@@ -516,16 +593,24 @@ class KcpcContests(KcpcCog):
         )
         await _reply(ctx, success_embed(text))
 
-    @commands.hybrid_command(name='results', brief='Post contest results')  # type: ignore[arg-type]
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        name='results',
+        brief="Choose whether members' rating changes are posted after contests",
+    )
     @app_commands.describe(
-        state="on to post members' rating changes after contests, off not to"
+        state="on to post members' rating changes after contests, off to stop"
     )
     @kcpc_admin_only()
     async def set_results_posts(
         self, ctx: commands.Context[Any], state: Literal['on', 'off']
     ) -> None:
-        """Turn on or off a post of members' rating changes after each
-        Codeforces and AtCoder contest they take part in.
+        """Choose whether members' rating changes are posted after each
+        Codeforces and AtCoder contest they take part in. The posts ping
+        nobody.
+
+        Examples:
+            /kcpc contests results on
+            ;kcpc contests results off
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -539,8 +624,12 @@ class KcpcContests(KcpcCog):
     async def sync_now(self, ctx: commands.Context[Any]) -> None:
         """Sync every contest source now, and say how each went.
 
-        That is Codeforces, AtCoder and ICPC, and with clist.by's credentials
-        set, CodeChef, LeetCode, TopCoder and the ICPC World Finals too.
+        The sources are Codeforces, AtCoder and ICPC, and with clist.by's
+        credentials set, CodeChef, LeetCode, TopCoder and the ICPC World Finals.
+
+        Examples:
+            /kcpc contests sync
+            ;kcpc contests sync
         """
         await ctx.defer(ephemeral=True)
         reports = await self._sync_sources(*self._sources)
@@ -938,11 +1027,16 @@ def _web_link(text: str | None) -> str | None:
 
 
 def _platform_key(text: str) -> str:
-    """A platform a member chose, by its key."""
+    """The key of a platform a member chose, by its key or by the name that
+    /contests upcoming's choices show, such as Club for manual.
+    """
     key = text.strip().lower()
-    if key not in PLATFORMS:
+    if key in PLATFORMS:
+        return key
+    named = _PLATFORMS_BY_NAME.get(key)
+    if named is None:
         raise KcpcUserError(_UNKNOWN_PLATFORM)
-    return key
+    return named
 
 
 def _platform_keys(text: str) -> tuple[str, ...]:

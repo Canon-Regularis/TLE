@@ -62,7 +62,8 @@ class KcpcCog(commands.Cog):
     ``services`` gives the running KCPC services. Errors from the cog's
     commands get one reply each: a ``KcpcUserError`` shows its message, a bug
     gets an apology and a logged traceback, and discord.py's own errors are
-    left to TLE's ``bot_error_handler``.
+    left to TLE's ``bot_error_handler``. A slash command whose interaction
+    has expired gets no reply.
 
     If a KCPC extension fails to load, the bot logs it and carries on without
     it. discord.py runs ``cog_load`` before it registers anything, and never
@@ -104,10 +105,23 @@ class KcpcCog(commands.Cog):
 
 
 async def _send_alert(ctx: commands.Context[Any], text: str) -> None:
+    # discord.py would send the reply to an expired interaction as a message
+    # in the channel, for everyone to see, so it gets none. Only a real True
+    # from is_expired counts; getattr, as not every stand-in for a context
+    # has the attribute.
+    interaction: discord.Interaction | None = getattr(ctx, 'interaction', None)
+    if interaction is not None and interaction.is_expired() is True:
+        logger.info(
+            'Dropped the reply to the error in command %s: the interaction expired',
+            ctx.command,
+        )
+        return
     try:
         # Ephemeral for slash commands; prefix commands ignore it.
         await ctx.send(embed=alert_embed(text), ephemeral=True)
-    except discord.HTTPException as exc:
+    except (discord.HTTPException, commands.CommandError) as exc:
+        # A CommandError: e.g. TLE's context refusing to post a private answer
+        # publicly.
         logger.warning(
             'Could not reply to the error in command %s: %s', ctx.command, exc
         )

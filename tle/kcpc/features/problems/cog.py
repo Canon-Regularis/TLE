@@ -229,8 +229,9 @@ _EDITORIALS_UNCHECKED = (
     "the task's editorials, and the official one if there is one by then."
 )
 _ROTATION_HINT = (
-    'Set it with `/kcpc weekly rotation cf easy, ac medium, cf medium graphs, ac '
-    'hard`, or go back to the default with `/kcpc weekly rotation default`.'
+    'Set it with `/kcpc weekly rotation entries:codeforces easy, atcoder medium, '
+    'codeforces medium graphs, atcoder hard`, or go back to the default with '
+    '`/kcpc weekly rotation entries:default`.'
 )
 _EMPTY_QUEUE = 'Empty. Add a problem with `/kcpc weekly queue`.'
 # The lines of a list that preview cut short, before and after what it shows.
@@ -261,6 +262,8 @@ _SOLUTION_TOO_OLD = (
 # How /kcpc weekly rotation and preview mark the entry the next post picks by,
 # which on a Friday morning is the entry of that day's post.
 _NEXT_POST_MARK = '(next post)'
+# The brief of /weekly current, which the prefix twin ;weekly current shares.
+_CURRENT_BRIEF = "Show this week's problem"
 
 # How each outcome of a post-now's post is told. {post} names the post, as in
 # "this week's problem, **X**", and {subject} names it to begin a sentence:
@@ -416,12 +419,12 @@ class KcpcProblems(KcpcCog):
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
-    @commands.hybrid_command(brief='A random problem by topic and difficulty')  # type: ignore[arg-type]
+    @commands.hybrid_command(brief='Get a random problem by topic and difficulty')  # type: ignore[arg-type]
     @commands.guild_only()
     @app_commands.describe(
         topic='any, a group such as graphs, or a Codeforces tag such as dp',
         difficulty='easy, medium, hard or expert, or a rating from 800 to 3500',
-        platform='Codeforces if left out',
+        platform='The platform to pick from; Codeforces if left out',
     )
     @app_commands.autocomplete(
         topic=topic_autocomplete, difficulty=difficulty_autocomplete
@@ -433,12 +436,17 @@ class KcpcProblems(KcpcCog):
         difficulty: commands.Range[str, 1, _MAX_DIFFICULTY_LENGTH],
         platform: Literal['codeforces', 'atcoder'] = 'codeforces',
     ) -> None:
-        """Pick a random problem about a topic, as hard as you ask.
+        """Get a random problem about a topic, as hard as you ask, leaving out
+        those you solved on your linked account.
 
-        Ratings are on Codeforces' scale on both platforms. Problems you solved
-        on the account you linked with /link are left out, as far as can be
-        told within 10 seconds. As a prefix command, quote a topic of several
-        words: ;randproblem "binary search" 1600
+        Ratings are on Codeforces' scale on both platforms. AtCoder problems
+        have no topics, so use any for them.
+
+        Examples:
+            /randproblem topic:graphs difficulty:medium
+            /randproblem topic:any difficulty:1600 platform:atcoder
+            ;randproblem dp hard
+            ;randproblem "binary search" 1600
         """
         guild = _guild(ctx)
         # Checked before deferring: after a public defer, Discord shows the
@@ -467,34 +475,59 @@ class KcpcProblems(KcpcCog):
         message = _picked_message(picked, wanted, exclusion.footer)
         await ctx.send(embed=to_embed(message))
 
-    @commands.hybrid_group(fallback='current', brief="This week's problem")  # type: ignore[arg-type]
+    @commands.hybrid_group(fallback='current', brief=_CURRENT_BRIEF)  # type: ignore[arg-type]
     @commands.guild_only()
     async def weekly(self, ctx: commands.Context[Any]) -> None:
-        """Show this server's weekly problem, and its solution once it is out."""
+        """Show this server's weekly problem, and its solution once it is out.
+
+        A new problem goes out every Friday at noon, in the club's time zone,
+        with the solution of the one before.
+
+        Examples:
+            /weekly current
+            ;weekly
+        """
         await self._show_current(ctx)
 
     # The slash command is the group's fallback, which prefix commands lack.
     @commands.hybrid_command(  # type: ignore[arg-type]
-        name='current', with_app_command=False, brief="This week's problem"
+        name='current', with_app_command=False, brief=_CURRENT_BRIEF
     )
     async def current(self, ctx: commands.Context[Any]) -> None:
-        """Show this server's weekly problem, and its solution once it is out."""
+        """Show this server's weekly problem, and its solution once it is out.
+
+        A new problem goes out every Friday at noon, in the club's time zone,
+        with the solution of the one before.
+
+        Examples:
+            /weekly current
+            ;weekly current
+        """
         await self._show_current(ctx)
 
-    @commands.hybrid_command(name='history', brief='Earlier weekly problems')  # type: ignore[arg-type]
+    @commands.hybrid_command(name='history', brief='List the earlier weekly problems')  # type: ignore[arg-type]
     async def history(self, ctx: commands.Context[Any]) -> None:
-        """List this server's weekly problems, newest first, with their solutions."""
+        """List this server's weekly problems, newest first, with their
+        solutions.
+
+        Examples:
+            /weekly history
+            ;weekly history
+        """
         guild = _guild(ctx)
         rows = await self._weekly.history(guild.id)
         now = self.services.clock.now()
         await send_pages(ctx, self._history_pages(rows, now))
 
     @commands.hybrid_group(  # type: ignore[arg-type]
-        name='weekly', brief='The weekly problem: queue, solutions, rotation'
+        name='weekly',
+        brief='Queue weekly problems, set solutions and choose the rotation',
     )
     @kcpc_admin_only()
     async def weekly_admin(self, ctx: commands.Context[Any]) -> None:
-        """Queue problems, set solutions, choose the rotation, and post now."""
+        """Queue weekly problems, set solution links, choose the rotation,
+        preview the next post, or post this week's problem now.
+        """
         # Only ;kcpc weekly gets here: Discord can't run a slash group.
         await ctx.send_help(ctx.command)
 
@@ -502,18 +535,24 @@ class KcpcProblems(KcpcCog):
     @app_commands.describe(
         problem='A Codeforces problem such as 1520D, an AtCoder one such as '
         'abc300_d, or its link',
-        solution='A link to its solution, if you have one (an http or https link)',
+        solution='A link to its solution, http or https; the editorial, or its '
+        'contest page, if left out',
     )
     @kcpc_admin_only()
     async def queue_problem(
         self, ctx: commands.Context[Any], problem: str, solution: str | None = None
     ) -> None:
-        """Queue a problem: the queue's oldest is posted before the rotation picks.
+        """Queue a problem for a coming week: queued problems go out, oldest
+        first, before the rotation picks any.
 
-        A problem the server has had, or has queued, can't be queued again,
-        unless its post never went out. Without a link to its solution, its
-        solution post links AtCoder's official editorial, or the Codeforces
-        contest's page, which lists the editorial.
+        A problem this server has had, or has queued, can't be queued again.
+        Without a link, the solution post links AtCoder's official editorial,
+        or a Codeforces problem's contest page, which lists its editorial.
+
+        Examples:
+            /kcpc weekly queue 1520D
+            /kcpc weekly queue problem:abc300_d solution:https://example.com/abc300d
+            ;kcpc weekly queue https://codeforces.com/contest/1520/problem/D
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -560,7 +599,12 @@ class KcpcProblems(KcpcCog):
     @app_commands.autocomplete(problem=queued_autocomplete)
     @kcpc_admin_only()
     async def unqueue_problem(self, ctx: commands.Context[Any], problem: str) -> None:
-        """Take a problem out of this server's queue."""
+        """Take a problem out of this server's queue.
+
+        Examples:
+            /kcpc weekly unqueue 1520D
+            ;kcpc weekly unqueue abc300_d
+        """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
         ref = parse_problem_ref(problem)
@@ -588,7 +632,7 @@ class KcpcProblems(KcpcCog):
         name='solution', brief="Set a weekly problem's solution link"
     )
     @app_commands.describe(
-        url='The link to the solution (an http or https link)',
+        url='The link to the solution, http or https',
         week="The problem's Friday, YYYY-MM-DD; the latest whose solution is to "
         'come if left out',
     )
@@ -596,11 +640,16 @@ class KcpcProblems(KcpcCog):
     async def set_solution(
         self, ctx: commands.Context[Any], url: str, week: str | None = None
     ) -> None:
-        """Set the link that a weekly problem's solution post gives.
+        """Set the link that a weekly problem's solution post gives, in place of
+        the editorial it would link.
 
-        It replaces the Codeforces contest's page, or the AtCoder editorial
-        the bot found. A solution that was posted keeps its link, and one that
-        won't be posted takes none.
+        Without a week, it is the latest problem whose solution is still to
+        come. A solution that is already posted keeps its link.
+
+        Examples:
+            /kcpc weekly solution https://example.com/editorial
+            /kcpc weekly solution url:https://example.com/editorial week:2026-10-09
+            ;kcpc weekly solution https://example.com/editorial 2026-10-09
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -629,7 +678,8 @@ class KcpcProblems(KcpcCog):
 
     @commands.hybrid_command(name='rotation', brief='Show or set the weekly rotation')  # type: ignore[arg-type]
     @app_commands.describe(
-        entries='Such as: cf easy, ac medium, cf medium graphs, ac hard; or default'
+        entries='Such as codeforces easy, atcoder hard, or default; the rotation '
+        'is shown if left out'
     )
     @kcpc_admin_only()
     async def set_rotation(
@@ -638,13 +688,18 @@ class KcpcProblems(KcpcCog):
         *,
         entries: commands.Range[str, 1, _MAX_ROTATION_LENGTH] | None = None,
     ) -> None:
-        """Show or set the rotation: the platform, band and topic of each week.
+        """Show or set the rotation: the platform, band and topic of each
+        week's problem, when the queue is empty.
 
-        Entries are 'platform band [topic]', separated by commas: cf or ac;
-        easy, medium, hard or expert; a topic, any if left out (and always on
-        AtCoder). The weeks take them in turn, by the calendar; default goes
-        back to the default rotation. As a prefix command the entries take the
-        rest of the message: ;kcpc weekly rotation cf easy, ac medium, ac hard
+        Each entry is a platform (codeforces or atcoder; cf or ac for short), a
+        band (easy, medium, hard or expert) and, on Codeforces, an optional
+        topic. Commas separate the entries, which the weeks take in turn;
+        default goes back to the default rotation.
+
+        Examples:
+            /kcpc weekly rotation
+            /kcpc weekly rotation entries:codeforces medium dp, atcoder hard
+            ;kcpc weekly rotation default
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -676,14 +731,16 @@ class KcpcProblems(KcpcCog):
         lines = _rotation_lines(plan.rotation, plan.entry)
         await _reply(ctx, success_embed(f'{heading}\n{lines}'))
 
-    @commands.hybrid_command(name='preview', brief='What the next weekly post will be')  # type: ignore[arg-type]
+    @commands.hybrid_command(name='preview', brief='Preview the next weekly post')  # type: ignore[arg-type]
     @kcpc_admin_only()
     async def preview(self, ctx: commands.Context[Any]) -> None:
-        """Show when and where the next weekly post goes, and what it holds.
+        """Show when and where the next weekly post goes, and what it holds:
+        this week's solution, the next problem or how it will be picked, the
+        queue and the rotation.
 
-        That is this week's problem and the link its solution post will give,
-        the next problem, or how it will be picked, then the queue and the
-        rotation.
+        Examples:
+            /kcpc weekly preview
+            ;kcpc weekly preview
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -708,9 +765,12 @@ class KcpcProblems(KcpcCog):
     async def post_now(self, ctx: commands.Context[Any]) -> None:
         """Post this week's problem now, after any solution that is due.
 
-        For a server that has just turned the weekly problem on: the job posts
-        at the next Friday's slot, and this posts the week's problem before
-        then. Running it again posts nothing twice.
+        Use it when the weekly problem has just been turned on, rather than
+        wait for Friday. Running it again posts nothing twice.
+
+        Examples:
+            /kcpc weekly post-now
+            ;kcpc weekly post-now
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)

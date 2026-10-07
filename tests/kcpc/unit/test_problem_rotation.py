@@ -119,8 +119,8 @@ class TestParseRotation:
             parse_rotation(text, KNOWN_TAGS)
 
         assert str(raised.value) == (
-            'Give at least one entry, such as: cf easy, ac medium, cf medium '
-            'graphs, ac hard'
+            'Give at least one entry, such as: codeforces easy, atcoder medium, '
+            'codeforces medium graphs, atcoder hard'
         )
 
     def test_a_rotation_has_at_most_a_year_of_entries(self) -> None:
@@ -139,12 +139,13 @@ class TestParseRotation:
         [
             (
                 'cf easy, cf',
-                "Entry 2 ('cf') needs a platform and a band, such as cf medium graphs.",
+                "Entry 2 ('cf') needs a platform and a band, such as codeforces "
+                'medium graphs.',
             ),
             (
                 'topcoder easy',
-                "Entry 1 ('topcoder easy') has no platform I know: use cf "
-                '(Codeforces) or ac (AtCoder).',
+                "Entry 1 ('topcoder easy') has no platform I know: use codeforces "
+                'or atcoder (cf or ac for short).',
             ),
             (
                 'cf easy, ac medium, cf hardest',

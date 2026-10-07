@@ -16,7 +16,7 @@ class ContestCacheError(CacheError):
 
 class ContestNotFound(ContestCacheError):
     def __init__(self, contest_id: int) -> None:
-        super().__init__(f'Contest with id `{contest_id}` not found')
+        super().__init__(f'Contest with ID `{contest_id}` not found')
         self.contest_id = contest_id
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime as dt
 import functools
 import json
@@ -9,10 +10,11 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from matplotlib import pyplot as plt
 
-from tle import constants
+from tle.access.cog import RATED_VC_STAFF_WARNING, RATED_VC_WARNING
 from tle.util import (
     codeforces_api as cf,
     codeforces_common as cf_common,
@@ -25,7 +27,7 @@ from tle.util import (
     table,
     tasks,
 )
-from tle.util.cache import CacheError, RanklistNotMonitored
+from tle.util.cache import CacheError, ContestNotFound, RanklistNotMonitored
 
 _CONTESTS_PER_PAGE = 5
 _CONTEST_PAGINATE_WAIT_TIME = 5 * 60
@@ -35,6 +37,29 @@ _FINISHED_CONTESTS_LIMIT = 5
 _WATCHING_RATED_VC_WAIT_TIME = 5 * 60  # seconds
 _RATED_VC_EXTRA_TIME = 10 * 60  # seconds
 _MIN_RATED_CONTESTANTS_FOR_RATED_VC = 50
+
+NO_REMINDERS_TEXT = "Contest reminders aren't set up in this server."
+REMINDER_CHANNEL_GONE_TEXT = (
+    'The channel for contest reminders no longer exists. Ask an admin to set '
+    'reminders up again.'
+)
+REMINDER_ROLE_GONE_TEXT = (
+    'The role that contest reminders ping no longer exists. Ask an admin to set '
+    'reminders up again.'
+)
+# The reminder role is one that members give themselves, so the bot refuses
+# roles that it must not hand out (see discord_common.self_assignable_problem),
+# and takes it away only if that can't raise their rights
+# (self_removable_problem).
+UNSUITABLE_REMINDER_ROLE_TEXT = (
+    "That role can't be the reminder role: {problem}. Members give it to "
+    'themselves with `/remind on`, so choose a role just for pings.'
+)
+UNASSIGNABLE_REMINDER_ROLE_TEXT = (
+    "I can't change who has the reminder role: {problem}. Ask an admin to "
+    'choose a role just for pings.'
+)
+RATED_VC_CHANNEL_SET_TEXT = 'This is now the rated virtual contest channel.'
 
 
 class ContestCogError(commands.CommandError):
@@ -115,7 +140,10 @@ async def _send_reminder_at(
     embed = discord_common.cf_color_embed(description=desc)
     for name, value in _get_embed_fields_from_contests(contests):
         embed.add_field(name=name, value=value)
-    await channel.send(role.mention, embed=embed)
+    # The bot pings no role unless a message allows it: this one pings the
+    # reminder role, and nobody else.
+    mentions = discord.AllowedMentions(roles=[role], everyone=False, users=False)
+    await channel.send(role.mention, embed=embed, allowed_mentions=mentions)
 
 
 class Contests(commands.Cog):
@@ -234,7 +262,9 @@ class Contests(commands.Cog):
         empty_msg: str,
     ) -> None:
         if contests is None:
-            raise ContestCogError('Contest list not present')
+            raise ContestCogError(
+                "The contest list isn't loaded yet. Try again in a minute."
+            )
         if len(contests) == 0:
             await ctx.send(embed=discord_common.embed_neutral(empty_msg))
             return
@@ -247,13 +277,23 @@ class Contests(commands.Cog):
             ctx=ctx,
         )
 
-    @commands.hybrid_group(brief='Commands for listing contests', fallback='show')
+    @commands.hybrid_group(
+        brief='Show the Codeforces contest list commands', fallback='show'
+    )
     async def clist(self, ctx: commands.Context) -> None:
+        """Show the commands that list Codeforces contests: those to come, those
+        running now and those that finished recently.
+        """
         await ctx.send_help(ctx.command)
 
-    @clist.command(brief='List future contests')
+    @clist.command(brief='List upcoming Codeforces contests')
     async def future(self, ctx: commands.Context) -> None:
-        """List future contests on Codeforces."""
+        """List the Codeforces contests that haven't started yet, soonest first.
+
+        Examples:
+            /clist future
+            ;clist future
+        """
         await self._send_contest_list(
             ctx,
             self.future_contests,
@@ -261,10 +301,15 @@ class Contests(commands.Cog):
             empty_msg='No future contests scheduled',
         )
 
-    @clist.command(brief='List active contests')
+    @clist.command(brief='List the Codeforces contests running now')
     async def active(self, ctx: commands.Context) -> None:
-        """List active contests on Codeforces, namely those in coding phase,
-        pending system test or in system test."""
+        """List the Codeforces contests running now, including those still in
+        system testing.
+
+        Examples:
+            /clist active
+            ;clist active
+        """
         await self._send_contest_list(
             ctx,
             self.active_contests,
@@ -272,9 +317,15 @@ class Contests(commands.Cog):
             empty_msg='No contests currently active',
         )
 
-    @clist.command(brief='List recent finished contests')
+    @clist.command(brief='List recently finished Codeforces contests')
     async def finished(self, ctx: commands.Context) -> None:
-        """List recently concluded contests on Codeforces."""
+        """List the 5 Codeforces contests that finished most recently, latest
+        first.
+
+        Examples:
+            /clist finished
+            ;clist finished
+        """
         await self._send_contest_list(
             ctx,
             self.finished_contests,
@@ -282,76 +333,131 @@ class Contests(commands.Cog):
             empty_msg='No finished contests found',
         )
 
-    @commands.hybrid_group(brief='Commands for contest reminders', fallback='show')
+    @commands.hybrid_group(
+        brief='Show the Codeforces contest reminder commands', fallback='show'
+    )
     async def remind(self, ctx: commands.Context) -> None:
+        """Show the commands for contest reminders, which ping a role before each
+        Codeforces contest. Take the role with /remind on to be pinged.
+        """
         await ctx.send_help(ctx.command)
 
-    @remind.command(brief='Set reminder settings', with_app_command=False)
-    @commands.has_role(constants.TLE_ADMIN)
+    @remind.command(
+        brief='Post Codeforces contest reminders in this channel, pinging a role',
+        usage='<role> <minutes...>',
+        with_app_command=False,
+    )
     async def here(
         self, ctx: commands.Context, role: discord.Role, *before: int
     ) -> None:
-        """Sets reminder channel to current channel, role to the given role,
-        and reminder times to the given values in minutes."""
+        """Post Codeforces contest reminders in this channel, pinging the role
+        you give. Each number after the role is a reminder, that many minutes
+        before the contest. Members take the role themselves with /remind on,
+        so choose a role just for pings.
+
+        Examples:
+            ;remind here @Contests 60 10
+        """
+        if isinstance(ctx.channel, discord.Thread):
+            raise ContestCogError(discord_common.NOT_IN_A_THREAD_MESSAGE)
+        problem = discord_common.self_assignable_problem(role, ctx.guild.me)
+        if problem is not None:
+            raise ContestCogError(UNSUITABLE_REMINDER_ROLE_TEXT.format(problem=problem))
         if not role.mentionable:
-            raise ContestCogError('The role for reminders must be mentionable')
+            raise ContestCogError(
+                "Reminders can't ping that role. Allow anyone to mention it "
+                '(Server Settings → Roles), then try again.'
+            )
         if not before or any(before_mins <= 0 for before_mins in before):
-            raise ContestCogError('Please provide valid `before` values')
+            raise ContestCogError(
+                'Give one or more times to post reminders, each a number of '
+                'minutes above 0.'
+            )
         before_sorted = sorted(before, reverse=True)
         await self.bot.user_db.set_reminder_settings(
             ctx.guild.id, ctx.channel.id, role.id, json.dumps(before_sorted)
         )
         await ctx.send(
-            embed=discord_common.embed_success('Reminder settings saved successfully')
+            embed=discord_common.embed_success(
+                'Reminder settings saved. `/remind settings` shows them.'
+            )
         )
         await self._reschedule_tasks(ctx.guild.id)
 
-    @remind.command(brief='Clear all reminder settings')
-    @commands.has_role(constants.TLE_ADMIN)
+    @remind.command(brief='Stop posting contest reminders in this server')
     async def clear(self, ctx: commands.Context) -> None:
+        """Stop posting contest reminders in this server, and forget their
+        channel, role and times.
+
+        Examples:
+            ;remind clear
+        """
         await self.bot.user_db.clear_reminder_settings(ctx.guild.id)
         await ctx.send(embed=discord_common.embed_success('Reminder settings cleared'))
         await self._reschedule_tasks(ctx.guild.id)
 
-    @remind.command(brief='Show reminder settings')
+    @remind.command(brief='Show where and when contest reminders are posted')
     async def settings(self, ctx: commands.Context) -> None:
-        """Shows the role, channel and before time settings."""
+        """Show the channel that contest reminders are posted in, the role they
+        ping and how many minutes before each contest they come.
+
+        Examples:
+            /remind settings
+            ;remind settings
+        """
         settings = await self.bot.user_db.get_reminder_settings(ctx.guild.id)
         if settings is None:
-            await ctx.send(embed=discord_common.embed_neutral('Reminder not set'))
+            await ctx.send(embed=discord_common.embed_neutral(NO_REMINDERS_TEXT))
             return
         channel_id, role_id, before = settings
         channel_id, role_id, before = int(channel_id), int(role_id), json.loads(before)
         channel, role = ctx.guild.get_channel(channel_id), ctx.guild.get_role(role_id)
         if channel is None:
-            raise ContestCogError(
-                'The channel set for reminders is no longer available'
-            )
+            raise ContestCogError(REMINDER_CHANNEL_GONE_TEXT)
         if role is None:
-            raise ContestCogError('The role set for reminders is no longer available')
+            raise ContestCogError(REMINDER_ROLE_GONE_TEXT)
         before_str = ', '.join(str(before_mins) for before_mins in before)
         embed = discord_common.embed_success('Current reminder settings')
         embed.add_field(name='Channel', value=channel.mention)
         embed.add_field(name='Role', value=role.mention)
-        embed.add_field(name='Before', value=f'At {before_str} mins before contest')
+        embed.add_field(
+            name='Before', value=f'{before_str} minutes before each contest'
+        )
         await ctx.send(embed=embed)
 
     async def _get_remind_role(self, guild: discord.Guild) -> discord.Role:
+        """The role that contest reminders ping, which members give themselves
+        and take away again.
+
+        ``ContestCogError`` if reminders aren't set up, or if the role is gone.
+        Whether the bot may change who has it is checked by each command, every
+        time: the role may have changed since an admin chose it, for example by
+        gaining permissions.
+        """
         settings = await self.bot.user_db.get_reminder_settings(guild.id)
         if settings is None:
-            raise ContestCogError('Reminders are not enabled.')
+            raise ContestCogError(NO_REMINDERS_TEXT)
         _, role_id, _ = settings
         role = guild.get_role(int(role_id))
         if role is None:
-            raise ContestCogError('The role set for reminders is no longer available.')
+            raise ContestCogError(REMINDER_ROLE_GONE_TEXT)
         return role
 
-    @remind.command(brief='Subscribe to contest reminders')
+    @remind.command(brief='Get pinged before Codeforces contests')
     async def on(self, ctx: commands.Context) -> None:
-        """Subscribes you to contest reminders. Use ';remind settings' to see
-        the current settings.
+        """Give yourself the role that contest reminders ping, so that they ping
+        you before each Codeforces contest.
+
+        Examples:
+            /remind on
+            ;remind on
         """
         role = await self._get_remind_role(ctx.guild)
+        problem = discord_common.self_assignable_problem(role, ctx.guild.me)
+        if problem is not None:
+            raise ContestCogError(
+                UNASSIGNABLE_REMINDER_ROLE_TEXT.format(problem=problem)
+            )
         if role in ctx.author.roles:
             embed = discord_common.embed_neutral(
                 'You are already subscribed to contest reminders'
@@ -365,15 +471,28 @@ class Contests(commands.Cog):
             )
         await ctx.send(embed=embed)
 
-    @remind.command(brief='Unsubscribe from contest reminders')
+    @remind.command(brief='Stop getting pinged before Codeforces contests')
     async def off(self, ctx: commands.Context) -> None:
-        """Unsubscribes you from contest reminders."""
+        """Take away your contest reminder role, so that reminders stop pinging
+        you.
+
+        Examples:
+            /remind off
+            ;remind off
+        """
         role = await self._get_remind_role(ctx.guild)
         if role not in ctx.author.roles:
             embed = discord_common.embed_neutral(
                 'You are not subscribed to contest reminders'
             )
         else:
+            # Only what would raise the member's rights stops this, such as
+            # one of TLE's roles: losing a ping role's permissions doesn't.
+            problem = discord_common.self_removable_problem(role, ctx.guild.me)
+            if problem is not None:
+                raise ContestCogError(
+                    UNASSIGNABLE_REMINDER_ROLE_TEXT.format(problem=problem)
+                )
             await ctx.author.remove_roles(
                 role, reason='User unsubscribed from contest reminders'
             )
@@ -558,7 +677,7 @@ class Contests(commands.Cog):
     ) -> discord.Embed:
         contest = ranklist.contest
         embed = discord_common.cf_color_embed(title=contest.name, url=contest.url)
-        embed.set_author(name='VC Standings')
+        embed.set_author(name='Virtual contest standings')
         now = time.time()
         if vc_start_time and vc_end_time:
             en = '\N{EN SPACE}'
@@ -570,37 +689,43 @@ class Contests(commands.Cog):
             embed.add_field(name='Tick tock', value=msg, inline=False)
         return embed
 
-    @commands.command(brief='Show ranklist for given handles and/or server members')
+    # The cooldowns of ranklist, ratedvc and vcrating count a use only once the
+    # command's arguments are parsed, and a refusal that comes before any
+    # request to Codeforces gives the use back: a mistake costs no wait.
+    # Ranklist's cooldown is the whole server's, so it would hold everyone
+    # back.
+    @commands.command(
+        brief="Show a Codeforces contest's standings for this server or given handles",
+        usage='<contest_id> [handles...] [+server] [+official]',
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 30, commands.BucketType.guild)
     async def ranklist(
         self, ctx: commands.Context, contest_id: int, *args: str
     ) -> None:
-        """
-        Shows ranklist for the contest with given contest id. If handles contains
-        '+server', all server members are included. No handles defaults to '+server'.
-        Use '+official' for only showing rated participants for the round
+        """Show the standings of a Codeforces contest for this server's members,
+        or for the handles you give. Name a member as !name, and add +server to
+        include this server's members too. Add +official to show only official
+        contestants, leaving out virtual and unofficial ones.
+
+        Examples:
+            ;ranklist 1950
+            ;ranklist 1950 tourist !alice
+            ;ranklist 1950 +official
         """
         (show_official,), handles = cf_common.filter_flags(args, ['+official'])
         handles = await cf_common.resolve_handles(
             ctx, self.member_converter, handles, maxcnt=None, default_to_all_server=True
         )
-        contest = self.bot.cf_cache.contest_cache.get_contest(contest_id)
-        wait_msg = await ctx.channel.send('Generating ranklist, please wait...')
-        ranklist = None
+        contest = self._get_contest(ctx, contest_id)
+        wait_msg = await ctx.send('Generating ranklist, please wait...')
         try:
-            ranklist = self.bot.cf_cache.ranklist_cache.get_ranklist(
-                contest, show_official
-            )
-        except RanklistNotMonitored:
-            if contest.phase == 'BEFORE':
-                raise ContestCogError(
-                    f'Contest `{contest.id} | {contest.name}` has not started'
-                )
-            ranklist = await self.bot.cf_cache.ranklist_cache.generate_ranklist(
-                contest.id, fetch_changes=True, show_unofficial=not show_official
-            )
-
-        await wait_msg.delete()
-        await ctx.channel.send(embed=self._make_contest_embed_for_ranklist(ranklist))
+            ranklist = await self._get_ranklist(ctx, contest, show_official)
+        finally:
+            # Gone whether the ranklist came or not.
+            with contextlib.suppress(discord.HTTPException):
+                await wait_msg.delete()
+        await ctx.send(embed=self._make_contest_embed_for_ranklist(ranklist))
         await self._show_ranklist(
             channel=ctx.channel,
             contest_id=contest_id,
@@ -608,6 +733,35 @@ class Contests(commands.Cog):
             ranklist=ranklist,
             ctx=ctx,
         )
+
+    def _get_contest(self, ctx: commands.Context, contest_id: int) -> Any:
+        """The contest ``contest_id`` in the bot's Codeforces contest list.
+
+        If the list has no such contest, ``ContestNotFound``, and the use that
+        the cooldown of ``ctx``'s command counted is given back.
+        """
+        try:
+            return self.bot.cf_cache.contest_cache.get_contest(contest_id)
+        except ContestNotFound:
+            discord_common.undo_cooldown(ctx)
+            raise
+
+    async def _get_ranklist(
+        self, ctx: commands.Context, contest: Any, show_official: bool
+    ) -> Any:
+        """The ranklist of ``contest``: the one the cache keeps up to date, or
+        else a new one from Codeforces.
+        """
+        try:
+            return self.bot.cf_cache.ranklist_cache.get_ranklist(contest, show_official)
+        except RanklistNotMonitored:
+            if contest.phase == 'BEFORE':
+                # Codeforces wasn't asked anything.
+                discord_common.undo_cooldown(ctx)
+                raise ContestCogError(f"`{contest.name}` hasn't started yet.")
+            return await self.bot.cf_cache.ranklist_cache.generate_ranklist(
+                contest.id, fetch_changes=True, show_unofficial=not show_official
+            )
 
     async def _show_ranklist(
         self,
@@ -637,9 +791,7 @@ class Contests(commands.Cog):
             handle_standings.append((handle, standing))
 
         if not handle_standings:
-            error = (
-                f'None of the handles are present in the ranklist of `{contest.name}`'
-            )
+            error = f'None of these handles are in the standings of `{contest.name}`.'
             if vc:
                 await channel.send(
                     embed=discord_common.embed_alert(error), delete_after=delete_after
@@ -667,26 +819,50 @@ class Contests(commands.Cog):
         )
 
     @commands.command(
-        brief='Start a rated vc.', usage='<contest_id> <@user1 @user2 ...>'
+        brief='Start a rated virtual contest for the members you name',
+        usage='<contest_id> <members...>',
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, 60, commands.BucketType.user)
     async def ratedvc(
         self, ctx: commands.Context, contest_id: int, *members: discord.Member
     ) -> None:
+        """Replay a past Codeforces contest as a rated virtual contest for the
+        members you name, yourself included if you take part. It must be a
+        rated contest that none of you has submitted to. Use it in the rated
+        virtual contest channel, where the standings follow every 5 minutes.
+
+        Examples:
+            ;ratedvc 1950 @alice @bob
+        """
         ratedvc_channel_id = await self.bot.user_db.get_rated_vc_channel(ctx.guild.id)
-        if not ratedvc_channel_id or ctx.channel.id != ratedvc_channel_id:
-            raise ContestCogError('You must use this command in ratedvc channel.')
+        if not ratedvc_channel_id:
+            discord_common.undo_cooldown(ctx)
+            raise ContestCogError(
+                'There is no rated virtual contest channel yet. Ask an admin to '
+                'set one.'
+            )
+        if ctx.channel.id != ratedvc_channel_id:
+            discord_common.undo_cooldown(ctx)
+            raise ContestCogError(
+                f'Use this command in <#{ratedvc_channel_id}>, the rated virtual '
+                'contest channel.'
+            )
         if not members:
-            raise ContestCogError('Missing members')
-        contest = self.bot.cf_cache.contest_cache.get_contest(contest_id)
+            discord_common.undo_cooldown(ctx)
+            raise ContestCogError(
+                'Name the members who take part, yourself included if you do.'
+            )
+        contest = self._get_contest(ctx, contest_id)
         try:
             (await cf.contest.ratingChanges(contest_id=contest_id))[
                 _MIN_RATED_CONTESTANTS_FOR_RATED_VC - 1
             ]
         except (cf.RatingChangesUnavailableError, IndexError):
             error = (
-                f'`{contest.name}` was not rated for at least'
-                f' {_MIN_RATED_CONTESTANTS_FOR_RATED_VC}'
-                ' contestants or the ratings changes are not published yet.'
+                f"`{contest.name}` can't be a rated virtual contest: fewer than "
+                f'{_MIN_RATED_CONTESTANTS_FOR_RATED_VC} contestants were rated in '
+                "it, or its rating changes aren't out yet."
             )
             raise ContestCogError(error)
 
@@ -700,15 +876,15 @@ class Contests(commands.Cog):
                     for member_id in intersection
                 ]
             )
-            error = f'{busy_members} are registered in ongoing ratedvcs.'
+            error = f'Already in a rated virtual contest: {busy_members}.'
             raise ContestCogError(error)
 
         handles = await cf_common.members_to_handles(members, ctx.guild.id)
         visited_contests = await cf_common.get_visited_contests(handles)
         if contest_id in visited_contests:
             raise ContestCogError(
-                f'Some of the handles: {", ".join(handles)}'
-                ' have submissions in the contest'
+                f'Some of these handles have submitted to `{contest.name}` '
+                f'already: {", ".join(handles)}.'
             )
         start_time = time.time()
         finish_time = start_time + contest.durationSeconds + _RATED_VC_EXTRA_TIME
@@ -730,9 +906,9 @@ class Contests(commands.Cog):
         await ctx.send(embed=embed)
         embed = discord_common.embed_alert(
             f'You have {int(finish_time - start_time) // 60}'
-            ' minutes to complete the vc!'
+            ' minutes to finish the contest!'
         )
-        embed.set_footer(text='GL & HF')
+        embed.set_footer(text='Good luck, and have fun!')
         await ctx.send(embed=embed)
 
     async def _make_vc_rating_changes_embed(
@@ -784,9 +960,9 @@ class Contests(commands.Cog):
         embed = discord_common.cf_color_embed(
             title=contest.name, url=contest.url, description=desc
         )
-        embed.set_author(name='VC Results')
+        embed.set_author(name='Virtual contest results')
         embed.add_field(
-            name='Rating Changes',
+            name='Rating changes',
             value='\n'.join(rating_changes_str) or 'No rating changes',
             inline=False,
         )
@@ -879,53 +1055,109 @@ class Contests(commands.Cog):
         for rated_vc_id in ongoing_rated_vcs:
             await self._watch_rated_vc(rated_vc_id)
 
-    @commands.hybrid_command(
-        brief='Unregister this user from an ongoing ratedvc', usage='@user'
+    @commands.hybrid_command(brief='Take a member out of their rated virtual contest')
+    @app_commands.describe(
+        user='The member to take out of the rated virtual contest they are in'
     )
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
     async def _unregistervc(self, ctx: commands.Context, user: discord.Member) -> None:
-        """Unregister this user from an ongoing ratedvc."""
+        """Take a member out of the rated virtual contest they are in, so that
+        it doesn't change their rating.
+
+        Examples:
+            /_unregistervc user:@alice
+            ;_unregistervc @alice
+        """
         ongoing_vc_member_ids = await self._get_ongoing_vc_participants()
         if str(user.id) not in ongoing_vc_member_ids:
-            raise ContestCogError(f'{user.mention} has no ongoing ratedvc!')
+            raise ContestCogError(f"{user.mention} isn't in a rated virtual contest.")
         await self.bot.user_db.remove_last_ratedvc_participation(user.id)
         await ctx.send(
             embed=discord_common.embed_success(
-                f'Successfully unregistered {user.mention} from the ongoing vc.'
+                f'Took {user.mention} out of their rated virtual contest.'
             )
         )
 
-    @commands.hybrid_command(brief='Set the rated vc channel to the current channel')
-    @commands.has_role(constants.TLE_ADMIN)
+    @commands.hybrid_command(
+        brief='Make this channel the rated virtual contest channel'
+    )
     async def set_ratedvc_channel(self, ctx: commands.Context) -> None:
-        """Sets the rated vc channel to the current channel."""
-        await self.bot.user_db.set_rated_vc_channel(ctx.guild.id, ctx.channel.id)
-        await ctx.send(
-            embed=discord_common.embed_success('Rated VC channel saved successfully')
-        )
+        """Make this channel the one where ;ratedvc starts rated virtual
+        contests and posts their standings. Choose a bot channel other than
+        the staff channel: ;ratedvc works only in bot channels, and members
+        can't read the staff channel.
 
-    @commands.hybrid_command(brief='Get the rated vc channel')
+        Examples:
+            /set_ratedvc_channel
+            ;set_ratedvc_channel
+        """
+        if isinstance(ctx.channel, discord.Thread):
+            raise ContestCogError(discord_common.NOT_IN_A_THREAD_MESSAGE)
+        await self.bot.user_db.set_rated_vc_channel(ctx.guild.id, ctx.channel.id)
+        lines = [RATED_VC_CHANNEL_SET_TEXT]
+        warning = self._ratedvc_warning(ctx.channel, ctx.guild.id)
+        if warning is not None:
+            lines.append(warning)
+        await ctx.send(embed=discord_common.embed_success('\n\n'.join(lines)))
+
+    def _ratedvc_warning(self, channel: Any, guild_id: int) -> str | None:
+        """Why members can't use ;ratedvc in ``channel``, or None if they can.
+
+        The access rules let it work in bot channels and in the staff channel,
+        which members can't read. Without an access service, it works in
+        every channel.
+        """
+        access = getattr(self.bot, 'access', None)
+        if access is None:
+            return None
+        spot = access.spot(channel, guild_id, slash=False)
+        place = spot.channel_id
+        if place is not None and place == spot.staff_channel:
+            return RATED_VC_STAFF_WARNING.format(channel=channel.mention)
+        if place is not None and place in spot.bot_channels:
+            return None
+        return RATED_VC_WARNING.format(channel=channel.mention)
+
+    @commands.hybrid_command(brief='Show the rated virtual contest channel')
     async def get_ratedvc_channel(self, ctx: commands.Context) -> None:
-        """Gets the rated vc channel."""
+        """Show the channel where ;ratedvc starts rated virtual contests and
+        posts their standings.
+
+        Examples:
+            /get_ratedvc_channel
+            ;get_ratedvc_channel
+        """
         channel_id = await self.bot.user_db.get_rated_vc_channel(ctx.guild.id)
         channel = ctx.guild.get_channel(channel_id)
         if channel is None:
-            raise ContestCogError('There is no rated vc channel')
-        embed = discord_common.embed_success('Current rated vc channel')
+            raise ContestCogError('There is no rated virtual contest channel.')
+        embed = discord_common.embed_success('Rated virtual contest channel')
         embed.add_field(name='Channel', value=channel.mention)
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(brief='Show vc ratings')
+    @commands.hybrid_command(
+        brief="List this server's members by rated virtual contest rating"
+    )
     async def vcratings(self, ctx: commands.Context) -> None:
+        """List this server's members by their rated virtual contest rating,
+        highest first. Members who haven't finished a rated virtual contest
+        aren't listed.
+
+        Examples:
+            /vcratings
+            ;vcratings
+        """
         users = []
-        for member_id, handle in await self.bot.user_db.get_handles_for_guild(
-            ctx.guild.id
-        ):
-            member = await self.member_converter.convert(ctx, str(member_id))
-            rating = await self.bot.user_db.get_vc_rating(
-                member_id, default_if_not_exist=False
-            )
-            users.append((member, handle, rating))
+        # Finding every member can take longer than the 3 seconds a slash
+        # command has to answer, so typing defers the answer first.
+        async with ctx.typing():
+            for member_id, handle in await self.bot.user_db.get_handles_for_guild(
+                ctx.guild.id
+            ):
+                member = await self.member_converter.convert(ctx, str(member_id))
+                rating = await self.bot.user_db.get_vc_rating(
+                    member_id, default_if_not_exist=False
+                )
+                users.append((member, handle, rating))
         # Filter only rated users. (Those who entered at least one rated vc.)
         users = [
             (member, handle, rating)
@@ -952,10 +1184,12 @@ class Contests(commands.Cog):
 
             table_str = f'```\n{t}\n```'
             embed = discord_common.cf_color_embed(description=table_str)
-            return 'VC Ratings', embed
+            return 'Virtual contest ratings', embed
 
         if not users:
-            raise ContestCogError('There are no active VCers.')
+            raise ContestCogError(
+                'Nobody in this server has a rated virtual contest rating yet.'
+            )
 
         pages = [
             make_page(chunk, k)
@@ -970,14 +1204,23 @@ class Contests(commands.Cog):
         )
 
     @commands.command(
-        brief='Plot vc rating for a list of at most 5 users', usage='@user1 @user2 ..'
+        brief='Plot the rated virtual contest ratings of up to 5 members',
+        usage='[members...]',
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def vcrating(self, ctx: commands.Context, *members: discord.Member) -> None:
-        """Plots VC rating for at most 5 users."""
+        """Plot the rated virtual contest ratings of up to 5 members over time,
+        or yours if you name nobody.
+
+        Examples:
+            ;vcrating
+            ;vcrating @alice @bob
+        """
         assert isinstance(ctx.author, discord.Member)
         members = members or (ctx.author,)
         if len(members) > 5:
-            raise ContestCogError('Cannot plot more than 5 VCers at once.')
+            raise ContestCogError('Name at most 5 members.')
         plot_data = defaultdict(list)
 
         min_rating = 1100
@@ -986,7 +1229,9 @@ class Contests(commands.Cog):
         for member in members:
             rating_history = await self.bot.user_db.get_vc_rating_history(member.id)
             if not rating_history:
-                raise ContestCogError(f'{member.mention} has no vc history.')
+                raise ContestCogError(
+                    f"{member.mention} hasn't finished a rated virtual contest yet."
+                )
             for vc_id, rating in rating_history:
                 vc = await self.bot.user_db.get_rated_vc(vc_id)
                 date = dt.datetime.fromtimestamp(vc.finish_time)
@@ -1019,7 +1264,7 @@ class Contests(commands.Cog):
         plt.legend(labels, loc='upper left', prop=gc.fontprop)
 
         discord_file = gc.get_current_figure_as_file()
-        embed = discord_common.cf_color_embed(title='VC rating graph')
+        embed = discord_common.cf_color_embed(title='Virtual contest ratings')
         discord_common.attach_image(embed, discord_file)
         discord_common.set_author_footer(embed, ctx.author)
         await ctx.send(embed=embed, file=discord_file)

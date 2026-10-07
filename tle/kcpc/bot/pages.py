@@ -18,7 +18,9 @@ from tle.kcpc.bot.views import KcpcView
 logger = logging.getLogger(__name__)
 
 PAGE_TIMEOUT = 5 * 60.0  # seconds
-NOT_YOUR_PAGES = 'Only the member who ran the command can turn its pages.'
+# The same words as TLE's paginator (tle.util.paginator), which KCPC can't
+# import: members see one refusal, whichever paginator a reply uses.
+NOT_YOUR_PAGES = 'Only the person who asked can turn these pages.'
 
 
 class PageView(KcpcView):

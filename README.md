@@ -2,7 +2,9 @@
 
 TLE is a feature-packed Discord bot aimed at competitive programmers.
 It can recommend problems, show stats & graphs, run duels on your server
-and manage starboards – all with a single prefix `;`.
+and manage starboards, with slash commands and the `;` prefix. Each
+server's admins choose where its commands answer publicly, and can limit
+who may use each one (see §3).
 
 If you have Docker ≥ 24 (or Docker Desktop on Win/Mac) you are ready to
 go.
@@ -15,13 +17,57 @@ go.
 |-----|--------------|
 | **Codeforces** | problem / contest recommender, rating changes, user look-ups |
 | **Contests** | shows upcoming & live contests |
+| **Dueling** | duels between members on Codeforces problems, with duel ratings |
 | **Graphs** | rating distributions, solved-set histograms, etc. |
-| **Handles** | link Discord users to CF handles |
-| **Starboard** | pins popular messages to a channel |
-| **CacheControl** | warm-up & manage local caches |
+| **Handles** | link Discord users to Codeforces handles, rank roles |
+| **Meta** | how the bot is doing; the bot owner's restart and server list |
+| **Starboard** | reposts popular messages in a channel |
+| **CacheControl** | the bot owner's commands that reload the Codeforces caches |
+| **Help**, **Access** | `/help` for everyone, and `/access` for admins (see §3) |
 
 All graphs require cairo + pango; the Docker image already contains
 everything.
+
+### Notes on TLE's commands
+
+- **Cooldowns.** Heavy commands, which ask Codeforces for a lot or draw plots,
+  can be used only so often by each member: `/gitgud`, `/upsolve`, `;gimme`
+  and `/duel complete` once every 10 seconds; `;stalk`, `;mashup`, `;vc`,
+  `;fullsolve`, `;teamrate`, `;vcrating`, `;duel challenge`, `;duel rating`,
+  `/gudgitters` and each plot once every 20 seconds; `;ratedvc` once a minute. `;ranklist`
+  works once every 30 seconds in each server. Used too soon, a command says
+  when it works again, and `/help` shows each command's cooldown. A mistyped
+  command doesn't count, nor does one refused before it asks Codeforces
+  anything, such as `/gitgud` while you have a challenge, `;ratedvc` outside
+  its channel or `;ranklist` of a contest the bot doesn't know.
+- **Ping roles.** `/role` gives or takes the roles named **Duelist** and
+  **Virtual Contestant**. Create them just for pings: no permission beyond
+  @everyone's, below the bot's highest role, and no channel overwrites, or
+  `/role` refuses them. The same goes for the contest reminder role that
+  `;remind here` sets: it refuses any other, and `/remind on` refuses a
+  stored role that has become unsuitable. `/remind off` refuses only a role
+  whose removal could raise a member's rights, such as one of TLE's roles or
+  one that a channel denies permissions. Reminders ping that role and nobody
+  else.
+- **The trusted role** is the one `TLE_TRUSTED` names (by ID or name).
+  `/handle refer`, `;handle grandfather` and a handle rated 1900 or more
+  before 11 September 2024 give it. Rank roles are named after Codeforces
+  ranks, such as Expert.
+- **Rated virtual contests.** `;ratedvc` works only in its channel, which
+  must be a bot channel that members can read, so not the staff channel;
+  `/set_ratedvc_channel` and `/access show` warn when it isn't.
+- **Duels.** `/duel recent` and `/duel ongoing` show only duels between
+  members of this server. The Accept, Decline and Withdraw buttons under a
+  challenge follow who may use `duel accept`, `duel decline` and
+  `duel withdraw`, and whether this server switched them off, but not
+  channels. `/duel selfregister` needs a Codeforces handle linked first, with
+  `/link codeforces`.
+- **Starboard.** Messages in the staff channel and its threads, in private
+  threads, and in channels that some readers of the starboard channel can't
+  see are never reposted.
+- **The bot owner's commands.** `;meta guilds` sends the list of the bot's
+  servers by direct message, never to a channel; `;meta kill` stops the bot;
+  `;cache …` reloads the Codeforces caches that every server shares.
 
 ### KCPC club features
 
@@ -51,20 +97,29 @@ problem, `/randproblem`, `/weekly` and `/kcpc weekly`), `kcpc.algo` (the
 algorithm of the month, `/algo` and `/kcpc algo`) and `kcpc.notify`
 (`/notify`). KCPC's own settings are all optional: `KCPC_TIMEZONE`,
 `KCPC_DB_PATH`, `HTTP_USER_AGENT`, `LUMA_CALENDAR_ID`, `ICPC_CONTEST_CODES`,
-`CLIST_USERNAME` and `CLIST_API_KEY` (see §3 and `.env.example`).
+`CLIST_USERNAME` and `CLIST_API_KEY` (see §5 and `.env.example`).
 
 Server admins set KCPC up with `/kcpc` (or `;kcpc`). It needs the Manage
 Server permission or the `TLE_ADMIN` role. Discord only shows `/kcpc` to
 members with Manage Server, so give admins who only have the role access
-under Server Settings → Integrations.
+under Server Settings → Integrations (see §3). Like most staff commands,
+`;kcpc` works in the staff channel only. `/kcpc` answers only you, wherever
+you use it.
 
 ```text
-/kcpc show                          every feature's settings in this server
-/kcpc channel workshops #workshops  where a feature posts (checks the bot can)
-/kcpc role workshops @Workshops     a pings-only role its posts mention (optional)
-/kcpc enable workshops              turn it on (/kcpc disable turns it off)
-/kcpc status                        database, jobs, post counts and recent skips
+/kcpc show                            every feature's settings in this server
+/kcpc channel workshops #workshops    where a feature posts (checks the bot can)
+/kcpc role workshops role:@Workshops  a pings-only role its posts mention (optional)
+/kcpc enable workshops                turn it on (/kcpc disable turns it off)
+/kcpc status                          post counts and recent skips (the bot owner also sees jobs)
 ```
+
+`/kcpc status` is for developers (`TLE_DEVELOPER`) as well as admins, and
+works in the staff channel alone: developers without Manage Server use
+`;kcpc status` there, or `/kcpc status` once an admin shows `/kcpc` to the
+developer role (Server Settings → Integrations, see §3). Only the bot owner
+sees KCPC's extensions, jobs and their last errors, on `/kcpc status`, which
+answers privately.
 
 The features are `algo`, `contests`, `weekly` and `workshops`.
 
@@ -74,7 +129,7 @@ To have the bot remind a server of the club's workshops:
 
 ```text
 /kcpc channel workshops #workshops          where the reminders go
-/kcpc role workshops @Workshops             a pings-only role they mention
+/kcpc role workshops role:@Workshops        a pings-only role they mention
 /kcpc workshops calendar <ID or iCal link>  the club's Luma calendar
 /kcpc enable workshops                      start reminding
 ```
@@ -106,7 +161,7 @@ the ping role (Server Settings → Roles). As any member can have it, the ping
 role must be just for pings, and `/notify` refuses any other: a role with a
 permission that @everyone lacks, one that changes what members can do in a
 channel (such as a member or verified role), or one of TLE's roles (admin,
-moderator, trusted or purgatory).
+moderator, trusted, purgatory or developer).
 
 #### Contest reminders
 
@@ -114,7 +169,7 @@ To have the bot remind a server of upcoming contests:
 
 ```text
 /kcpc channel contests #contests                 where the reminders go
-/kcpc role contests @Contests                    a pings-only role they mention
+/kcpc role contests role:@Contests               a pings-only role they mention
 /kcpc contests platforms codeforces atcoder      which platforms (all by default)
 /kcpc contests start-posts on                    also post as each contest starts
 /kcpc contests results off                       no results posts (on by default)
@@ -126,21 +181,21 @@ The platforms are `codeforces`, `atcoder`, `codechef`, `leetcode`,
 follows all of them until it picks some with `/kcpc contests platforms`. The
 bot reads Codeforces every 5 minutes (from TLE's own copy of its contest
 list), AtCoder every 30 minutes, icpc.global every 6 hours and clist.by (see
-below) every 30 minutes; `/kcpc contests sync` reads them all at once. It
-reminds members an hour before each contest, with one message for contests
-that start together, such as a Div. 1 and a Div. 2 round, and with start posts
-on, it posts again as they start. If a contest they were reminded of moves, is
+below) every 30 minutes; the bot owner's `/kcpc contests sync` reads them all
+at once. It reminds members an hour before each contest, with one message for
+contests that start together, such as a Div. 1 and a Div. 2 round, and with
+start posts on, it posts again as they start. If a contest they were reminded of moves, is
 cancelled or comes back, it tells them. A Codeforces, AtCoder, CodeChef,
 LeetCode or TopCoder contest that drops off its site's list before it starts
 counts as cancelled once three reads in a row have missed it, the last at least
 20 minutes after it was last listed. One that has started never does: AtCoder
 drops contests from its list as they start. ICPC contests, the regionals and
 the World Finals, are never cancelled this way, because the bot reads only some
-ICPC contests; an admin can still move one with `/kcpc contests settime`.
+ICPC contests; the bot owner can still move one with `/kcpc contests settime`.
 
 CodeChef, LeetCode, TopCoder and the ICPC World Finals come from clist.by,
 which lists the contests of many sites, once `CLIST_USERNAME` and
-`CLIST_API_KEY` are set (see §3). To get a key, sign up for a free account at
+`CLIST_API_KEY` are set (see §5). To get a key, sign up for a free account at
 [clist.by](https://clist.by), then open its API documentation page,
 <https://clist.by/api/v4/doc/>, which shows your username and API key. The
 World Finals count as `icpc` contests. Without the key, the `codechef`,
@@ -148,13 +203,13 @@ World Finals count as `icpc` contests. Without the key, the `codechef`,
 server's platforms with `/kcpc contests platforms`. CodeChef's events that
 aren't contests, such as its Placement Prep Weekends, are left out.
 
-ICPC contests come from icpc.global: those in `ICPC_CONTEST_CODES` (see §3).
+ICPC contests come from icpc.global: those in `ICPC_CONTEST_CODES` (see §5).
 icpc.global gives only the dates of their events, so each is listed by its
-event's first day, as "time TBA", and gets no reminders until an admin sets
-the contest's own time with `/kcpc contests settime`. Until then, a contest
-whose event lasts several days, such as NWERC (27-29 November 2026), drops out
-of `/contests upcoming` from that first day. Admins can also add the club's
-own contests:
+event's first day, as "time TBA", and gets no reminders until the bot owner
+sets the contest's own time with `/kcpc contests settime`. Until then, a
+contest whose event lasts several days, such as NWERC (27-29 November 2026),
+drops out of `/contests upcoming` from that first day. The bot owner can also
+add the club's own contests:
 
 ```text
 /kcpc contests settime <contest> <start> [duration]  set a contest's time
@@ -175,10 +230,12 @@ of moves or is removed, they are told.
 KCPC is built for one club, so all the servers the bot is in share its
 contests. A club contest, or a time set with `settime`, reaches every server
 that follows the contest's platform (`manual` for club contests, which servers
-follow unless they pick platforms without it). So an admin of any server the
-bot is in can add, retime or remove contests in all of them. Keep the bot in
-the club's own servers only (in the Discord Developer Portal, under Bot, turn
-off Public Bot), and try these commands with a separate test bot.
+follow unless they pick platforms without it). That is why
+`/kcpc contests add`, `settime`, `remove` and `sync` are the bot owner's
+commands (see §3), which work in any channel; they stay in the slash list of
+`/kcpc`, but refuse everyone else. Keep the bot in the club's own servers
+only (`ALLOWED_GUILD_IDS`, and in the Discord Developer Portal, under Bot,
+turn off Public Bot), and try these commands with a separate test bot.
 
 Members can use:
 
@@ -255,7 +312,11 @@ its Organization on Codeforces (<https://codeforces.com/settings/social>),
 save, then press Verify under the reply (or use `/link verify`). The token
 lasts 10 minutes, and `/link` again gives a new one. Once the account is
 linked, remove the token from the profile again. A handle can be linked to
-only one member of a server.
+only one member of a server. Each `/link` command can be used once every 10
+seconds by each member, and the Verify button follows `/link verify`'s rule:
+who may use it, and whether this server switched it off, but not channels.
+Verifying, with the button or `/link verify`, also works once every 10
+seconds for each member, as each try asks the site for the profile.
 
 Links stay when a member leaves the server, for if they come back. An AtCoder
 account that a member who left had linked is free, though: whoever proves it
@@ -284,12 +345,13 @@ rank, so the server needs TLE's rank roles, and the bot needs the Manage Roles
 permission with its highest role above them. If the role for a rated
 account's rank is missing, `/link codeforces` says so before giving a token. A
 member who already has a Codeforces handle can't link another, and
-`/unlink codeforces` can't remove it: admins and moderators (`TLE_ADMIN`,
-`TLE_MODERATOR`) change it with `/handle set` and remove it with
-`/handle remove`. TLE keeps the handle of a member who leaves, for if they come
-back, so nobody else can link it until it is removed. Where Codeforces OAuth is
-set up, TLE's `;handle identify` links a Codeforces account too. AtCoder links
-are KCPC's own, and TLE's features don't use them.
+`/unlink codeforces` can't remove it: moderators and admins (`TLE_MODERATOR`,
+`TLE_ADMIN`) change it with `;handle set` and remove it with
+`;handle remove`, which have no slash form. TLE keeps the handle of a member
+who leaves, for if they come back, so nobody else can link it until it is
+removed. Where Codeforces OAuth is set up, TLE's `/handle identify` links a
+Codeforces account too, telling the member privately how it went. AtCoder
+links are KCPC's own, and TLE's features don't use them.
 
 #### Weekly problem and /randproblem
 
@@ -297,7 +359,7 @@ To have the bot post a weekly problem in a server:
 
 ```text
 /kcpc channel weekly #weekly-problem   where the problems and solutions go
-/kcpc role weekly @Weekly              a pings-only role each problem mentions
+/kcpc role weekly role:@Weekly         a pings-only role each problem mentions
 /kcpc enable weekly                    start posting
 ```
 
@@ -370,7 +432,7 @@ A rotation has 1 to 52 entries, separated by commas or semicolons, each a
 platform (`cf` or `codeforces`, `ac` or `atcoder`), a band and a topic (`any`
 if left out), as in `cf easy, ac medium, cf medium graphs, ac hard`. Topics
 are those of `/randproblem` (below); an AtCoder entry's can only be `any`.
-`/kcpc weekly rotation default` goes back to the default rotation, and
+`/kcpc weekly rotation entries:default` goes back to the default rotation, and
 without entries the command shows the rotation, marking the entry of the next
 post. `preview` shows when and where the next problem posts (or why it won't),
 what it will be (the queued problem, or the rotation's entry), this week's
@@ -415,7 +477,7 @@ To have the bot post an algorithm of the month in a server:
 
 ```text
 /kcpc channel algo #algorithms   where the topics go
-/kcpc role algo @Algo            a pings-only role each topic mentions
+/kcpc role algo role:@Algo       a pings-only role each topic mentions
 /kcpc enable algo                start posting
 ```
 
@@ -485,11 +547,13 @@ docker compose up -d
 ```
 
 That’s it.  
-The bot will appear online in your Discord server; use
-`;help` inside Discord to explore commands.
+The bot will appear online in your Discord server. Give the server a staff
+channel and a bot channel with `/access` (step 4 of §4), then use `/help`
+inside Discord to explore commands.
 
 Compose restarts the bot after a crash or a reboot (`restart: unless-stopped`),
-so `;meta kill` restarts it; stop it with `docker compose stop`.
+so the bot owner's `;meta kill` restarts it; stop it with
+`docker compose stop`.
 
 ### Updating to a new release
 
@@ -499,24 +563,300 @@ docker compose build --pull    # fetch newer base images
 docker compose up -d           # recreate the container on the new image
 ```
 
+Coming from a version without the access rules of §3, follow the steps of
+§4 too.
+
 ---
 
-## 3 · Environment variables ( `.env` )
+## 3 · Access: where commands work, and who may use them
+
+Every command has a rule: who may use it, and where it answers. Each
+server's admins choose its bot channels and its staff channel with
+`/access`, and can tighten any command's rule there.
+
+### Bot channels and the staff channel
+
+- **Bot channels** are where member commands answer publicly. Add them with
+  `/access bot-channels add`. Elsewhere, member slash commands still work but
+  answer only the member who used them, and member `;` commands are refused
+  with a short note, deleted after 20 seconds.
+- Commands that involve or ping other members work in bot channels alone,
+  slash or not: `;duel challenge`, `/duel accept`, `decline`, `withdraw`,
+  `draw`, `complete`, `invalidate` and `ranklist`, `;ratedvc`, `;ranklist`,
+  `/vcratings`, `/gudgitters`, `;handle list`, `/handle refer` and `/rank`.
+- **The staff channel** is where most staff commands work. Set it with
+  `/access staff-channel`, and let only staff read it. It counts as a bot
+  channel too. Outside it, staff slash commands answer only you and staff `;`
+  commands are refused. A few moderator commands, such as `;handle set` and
+  `/_nogud`, work in any bot channel, and a few, such as `/kcpc status`, work
+  in the staff channel alone.
+- A few setup commands act on the channel they are used in, such as
+  `/starboard here` and `/set_ratedvc_channel`, so they work in any channel.
+  They refuse threads: a thread closes after a while, and the bot then can't
+  find it.
+- A thread counts as the channel it is in.
+- Until a server has a bot channel, no channel is one: slash commands answer
+  privately everywhere, and member `;` commands are refused. Until it has a
+  staff channel, or once its staff channel is deleted, staff `;` commands are
+  refused too, except `;access` and its subcommands, which then work in any
+  channel, so that an admin can set one.
+
+### Who is who
+
+| Level | Who passes |
+| --- | --- |
+| Everyone | every member of the server |
+| Trusted | members with the role `TLE_TRUSTED` names, and moderators |
+| Moderator | members with the role `TLE_MODERATOR` names, and admins |
+| Admin | members with the role `TLE_ADMIN` names, or with the Manage Server permission |
+| Developer | members with the role `TLE_DEVELOPER` names (by ID), and admins |
+| Bot owner | the owner of the bot's application in the Discord Developer Portal, or the admins and developers of the team that owns it |
+
+- Staff are moderators, developers, admins and the bot owner.
+- Being the bot owner doesn't make you an admin, nor does being an admin make
+  you the bot owner. The owner's commands concern every server the bot is in:
+  `;meta kill`, `;meta guilds`, `;cache …` and the club contests
+  (`/kcpc contests add`, `settime`, `remove` and `sync`). They work in any
+  channel, for the owner alone; the club contest commands also need the owner
+  to be an admin of the server they are used in (Manage Server or the
+  `TLE_ADMIN` role).
+- The bot finds its owners when it starts, so changes to the application's
+  team take effect after a restart.
+- `/help` with a command says who may use it, and where.
+
+### What members see
+
+- `/help` answers only the member who asked, and lists the commands they can
+  use where they ask.
+- A member slash command outside the bot channels answers privately: Discord
+  marks the answer "Only you can see this".
+- `;` commands work in bot channels only, and most staff ones in the staff
+  channel alone. A refused `;` command with a slash form says so: "Or use
+  `/x` here: only you will see the answer."
+- Members don't see staff commands in their slash lists. The trees of
+  moderators' commands (`/_nogud`, `/_unregistervc`, `/roleupdate`) need
+  Manage Messages to be seen, and the other staff trees (`/access`, `/kcpc`,
+  `/starboard`, `/set_ratedvc_channel`, `/_updatestatus`) need Manage Server.
+  Staff commands in members' groups, such as `;handle set`, have no slash
+  form, and neither has `;cache`.
+- A command that a member may not use gets no answer at all on `;`, as if it
+  didn't exist, and a private "You can't use this command." on slash.
+  Refusals never name a role or an ID, and never show members the staff
+  channel.
+- On `;`, refusals are deleted after 20 seconds, and cooldown notes once the
+  command works again.
+- Only the member who asked can turn the pages of a paged answer.
+- A private answer that comes more than 15 minutes after its slash command is
+  dropped, never posted for everyone to see.
+
+### /access, for admins
+
+```text
+/access show                                  the settings, and what is wrong with them
+/access bot-channels add #bot-commands        make a channel a bot channel (25 at most)
+/access bot-channels remove #general          make it an ordinary channel again
+/access staff-channel channel:#staff          set the staff channel; with no channel, clear it
+/access limit command:duel register off:yes   limit a command in this server
+/access reset command:duel register           clear a command's limits; all clears every limit
+```
+
+- Discord shows `/access` only to members with Manage Server, and its answers
+  are private. Admins by role alone use `;access …` in the staff channel, or
+  see the Integrations note below.
+- Until there is a staff channel, or once it is deleted, `;access`'s
+  subcommands work in any channel. `;access` itself then only points to
+  `/access show` and `/access staff-channel`, as its answer would be public.
+- `/access show` lists the bot channels, the staff channel, the developer role
+  and every limit. It warns about: no bot channel or staff channel; a staff
+  channel that @everyone can read; channels that no longer exist;
+  `TLE_ADMIN`, `TLE_MODERATOR`, `TLE_TRUSTED` or `TLE_DEVELOPER` matching no
+  role here, several, or @everyone (by the server's ID or by name), which
+  never counts; `;ratedvc`'s channel outside the bot channels; and
+  settings that aren't stored (under `--nodb`). It notes when
+  `ALLOWED_GUILD_IDS` isn't set.
+
+#### Limits
+
+A limit tightens a command's rule in one server; it never loosens it.
+
+```text
+/access limit command:duel register off:yes   switch ;duel register off
+/access limit command:gitgud where:bot-only   /gitgud in bot channels alone, slash too
+/access limit command:plot who:trusted        the plot commands for trusted members
+/access limit command:rank private:yes        /rank answers only the member who uses it
+/access reset command:all                     clear every limit
+```
+
+- `who` (`trusted`, `moderator`, `developer` or `admin`): only those members,
+  and admins, may use it.
+- `where` (`bot`, `bot-only`, `staff` or `staff-only`): where it answers
+  publicly. Elsewhere, its slash command answers privately, and the `-only`
+  places refuse it there too.
+- `private: yes`: its slash answers are always private, and its `;` form
+  stops working. A command without a slash form refuses this.
+- `off: yes`: the command is switched off in this server.
+- `subcommands`: whether a limit on a group covers its subcommands. It does
+  when you name the group, so `command:duel off:yes` switches off every duel
+  command. A slash fallback, such as `clist show`, or a twin, such as
+  `contests upcoming`, limits the group's own command alone, unless you add
+  `subcommands:yes`.
+- Each `/access limit` merges into the command's limit: the options you leave
+  out stay as they are. Where several limits apply, members must pass every
+  `who`, the strictest `where` wins, and `private` and `off` apply if any
+  limit sets them.
+- `/help`, `/access` and the bot owner's commands take no limits.
+- Limits don't change members' slash lists, which are the same in every
+  server. To hide a command there too, see the Integrations note below.
+
+### /help
+
+```text
+/help                       the commands you can use here
+/help command:clist future  how to use one command
+;help gitgud                the same, for everyone in the channel to see
+```
+
+- `/help` lists the commands you can use where you ask, a page for each
+  category, with the form that works there: `/x`, or `;x` alone. Only you see
+  the answer, and only you can turn its pages.
+- `/help` with a command shows what it does, how to type it, its options and
+  examples, who may use it and where, what it does in this channel, and its
+  cooldown. Admins also see its default rule and this server's limits on it.
+- A group's help lists its subcommands, and marks those that work only
+  elsewhere, such as "(bot channels only)".
+- `;help` answers the whole channel, so it lists only the commands for
+  everyone. For any other command it says "Use `/help x` for this command."
+- As you type, `/help` suggests the commands you can use where you are.
+
+### Integrations: staff slash commands for moderators
+
+Discord shows a hidden slash command only to members with the permission it
+needs: Manage Messages for the moderators' trees, Manage Server for the rest.
+A moderator, developer or admin who has only the role doesn't see them, but
+can use the `;` forms in the staff channel. To show them the slash commands
+too, open
+Server Settings → Integrations → the bot, choose the command, and add the
+role. This changes only who sees the command: the access rules still decide
+who may use it.
+
+### Manage Server counts as admin
+
+Members with the Manage Server permission are admins, whatever their roles,
+for TLE's commands as well as KCPC's: they can use `/access`, `/starboard`,
+`;handle grandfather` and every other admin command. Give Manage Server to
+admins alone.
+
+### When something is wrong
+
+The rules fail closed:
+
+- A command missing from the rule table is for the bot owner alone, in the
+  staff channel, and the bot logs a warning when it starts.
+- If a server's stored access settings can't be read, every command but
+  `/access`, `/help` and the bot owner's is refused there until an admin uses
+  `/access reset all`, which clears every limit and repairs them; then set the
+  bot channels and the staff channel again, as their settings were lost too.
+  The log names the server. A stored limit that can't be read switches its
+  command off.
+- If the bot can't read the access settings at all when it starts, such as
+  when a row of the `access_settings` table in `user.db` has a guild ID that
+  isn't one, every server refuses every command but `/access`, `/help` and
+  the bot owner's, and no server's settings can be changed, so that nothing
+  is written over settings that were never read. The log says why: the bot
+  owner fixes or deletes the bad row in `user.db`, then restarts the bot.
+- Under `--nodb`, the settings are kept in memory and lost when the bot stops;
+  `/access` says so.
+
+---
+
+## 4 · Upgrading
+
+After deploying the version with these access rules, do this once:
+
+1. In the Discord Developer Portal, open the bot's application. Under Bot,
+   turn off **Public Bot**, so that only you can add the bot to a server. If
+   others look after the bot with you, add them to the application's team, as
+   admins or developers: the bot owner's commands are for its owner and those
+   team members alone. They can use the club contest commands only in servers
+   where they are admins.
+2. In `.env`, set `TLE_ADMIN`, `TLE_MODERATOR` and `TLE_TRUSTED` to role IDs,
+   and `TLE_DEVELOPER` to the ID of a developer role, if you want one (see
+   §5).
+3. Optionally, set `ALLOWED_GUILD_IDS` to the club's servers (see §5).
+4. Restart the bot (`docker compose up -d --build`). Then, in each server:
+
+   ```text
+   /access staff-channel channel:#staff
+   /access bot-channels add #bot-commands
+   /access show
+   ```
+
+   An admin who has the admin role but not Manage Server doesn't see
+   `/access`: they can type `;access staff-channel #staff` in any channel,
+   then `;access bot-channels add #bot-commands` in the staff channel.
+
+Until then, no channel is a bot channel: slash commands answer only the member
+who used them, and member `;` commands are refused with a note saying so.
+
+What else changes:
+
+- Members with Manage Server are admins for TLE's commands too.
+- `;meta kill`, `;meta guilds`, `;cache` and the club contest commands are the
+  bot owner's alone, no longer every admin's.
+- Staff commands leave members' slash lists. Discord can take a minute to
+  update them; until then, a command it still shows answers "This command has
+  changed. Try again in a minute."
+- The bot pings neither @everyone nor roles unless a message allows it, as
+  contest reminders do for their role.
+- Slash commands work in servers alone, and the bot installs in servers alone.
+
+---
+
+## 5 · Environment variables ( `.env` )
 
 | Variable | Required | Example | Description |
 |----------|----------|---------|-------------|
 | `BOT_TOKEN` | ✅ | `MTEz…` | Discord bot token from the Dev Portal |
 | `LOGGING_COG_CHANNEL_ID` | ✅ | `123456789012345678` | channel where uncaught errors are sent |
 | `ALLOW_DUEL_SELF_REGISTER` | ❌ | `true` | let users self-register for duels |
-| `TLE_ADMIN` | ❌ | `Admin` | role name that can run admin cmds |
-| `TLE_MODERATOR` | ❌ | `Moderator` | role name that can run mod cmds |
+| `ALLOWED_GUILD_IDS` | ❌ | `123456789012345678,234567890123456789` | the servers the bot may be used in, by ID; unset, any server (see below) |
+| `TLE_ADMIN` | ❌ | `123456789012345678` | the admin role, by ID (recommended, see below) or name; unset, the role named `Admin` |
+| `TLE_MODERATOR` | ❌ | `234567890123456789` | the moderator role, by ID (recommended) or name; unset, the role named `Moderator` |
+| `TLE_TRUSTED` | ❌ | `345678901234567890` | the trusted role, by ID (recommended) or name; unset, the role named `Trusted` |
+| `TLE_PURGATORY` | ❌ | `Purgatory` | the purgatory role, by ID or name; unset, the role named `Purgatory` |
+| `TLE_DEVELOPER` | ❌ | `456789012345678901` | the developer role, by ID only; unset, there is none (see below) |
 | `DISABLED_EXTENSIONS` | ❌ | `tle.duel,tle.graphs` | extensions, or families (`tle`, `kcpc`), to switch off |
 | `KCPC_TIMEZONE` | ❌ | `Europe/London` | the club's time zone, for schedules and times admins type |
 | `KCPC_DB_PATH` | ❌ | `data/db/kcpc.db` | where the KCPC database lives |
 | `HTTP_USER_AGENT` | ❌ | `KCPC-bot (+https://…)` | User-Agent of KCPC's requests to other sites |
 | `LUMA_CALENDAR_ID` | ❌ | `cal-…` | default Luma calendar (its ID), for servers that haven't set one |
-| `ICPC_CONTEST_CODES` | ❌ | `UKIEPC,Northwestern-Europe-2027` | icpc.global contests to track, by abbreviation; icpc.global gives their dates, admins set their times (`/kcpc contests settime`) |
+| `ICPC_CONTEST_CODES` | ❌ | `UKIEPC,Northwestern-Europe-2027` | icpc.global contests to track, by abbreviation; icpc.global gives their dates, the bot owner sets their times (`/kcpc contests settime`) |
 | `CLIST_USERNAME`, `CLIST_API_KEY` | ❌ | | clist.by username and API key; with both set, the bot also tracks CodeChef, LeetCode, TopCoder and the ICPC World Finals (see §1) |
+
+Give `TLE_ADMIN`, `TLE_MODERATOR` and `TLE_TRUSTED` as role IDs: a name
+matches a role of that name in every server the bot is in, whoever made it.
+To copy a role's ID, turn on Developer Mode in Discord (User Settings →
+Advanced), then right-click the role under Server Settings → Roles.
+`TLE_DEVELOPER` takes an ID only; a name is ignored, with a warning when the
+bot starts. Members with the developer role can use the developer commands,
+`;kcpc status` and `;meta git`, in the staff channel, which admins can use
+too; with no developer role, only admins can. §3 says what each role may do;
+`/access show` warns when a role setting matches no role in the server,
+several, or @everyone, which never counts: don't give the server's ID as a
+role's.
+
+`ALLOWED_GUILD_IDS` keeps the bot to the servers it lists, by ID (with
+Developer Mode on, right-click a server's icon to copy its ID). The bot
+doesn't start if an item isn't an ID. In any other server, its commands are
+refused: `;` commands get no reply, and slash commands a short private notice.
+If the bot is added to a server that isn't listed, it leaves at once, with a
+warning in the log. When it starts, it only logs the servers it is already in
+that aren't listed, and stays in them, so a mistyped ID can't make it leave
+yours.
+In those servers, what was set up before, such as reminders, keeps working,
+but no one there can change it: remove the bot from them yourself. Also turn
+off Public Bot in the Discord Developer Portal (under Bot), so that only you
+can add the bot to a server.
 
 Feel free to add any extra variables your cogs consume; Compose passes
 every key in `.env` to the container. Run without Docker, the bot reads
@@ -524,16 +864,17 @@ every key in `.env` to the container. Run without Docker, the bot reads
 
 ---
 
-## 4 · Data folder
+## 6 · Data folder
 
 `docker compose` mounts `./data` into the container. It holds:
 
-* `db/user.db`: TLE's server data, such as members' Codeforces handles (those
-  linked with `/link codeforces` too), duels, reminder settings and
-  starboards.
-* `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
-  bot has read (and the contests and times admins have set), members' AtCoder
-  links and the links waiting to be verified, the ratings last read for
+- `db/user.db`: TLE's server data, such as members' Codeforces handles (those
+  linked with `/link codeforces` too), duels, reminder settings, starboards
+  and each server's access settings (its bot channels, staff channel and
+  limits).
+- `db/kcpc.db`: each server's KCPC settings, the workshops and contests the
+  bot has read (and the contests and times the bot owner has set), members'
+  AtCoder links and the links waiting to be verified, the ratings last read for
   `/profile` and `/rank`, each server's weekly problems and queue and its
   algorithms of the month, when results posts started and the contests whose
   results the bot has worked on since (members' rating changes, and the
@@ -544,12 +885,12 @@ every key in `.env` to the container. Run without Docker, the bot reads
   it. If you set `KCPC_DB_PATH`, these files are there instead; under Docker,
   keep that path inside `data/`, or they are lost when the container is
   recreated.
-* `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
-  but an admin has to refill the rating changes and problemsets with
+- `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
+  but the bot owner has to refill the rating changes and problemsets with
   `;cache ratingchanges all` and `;cache problemsets all`.
-* `misc/contest_writers.json`: an optional list of contest writers, made with
+- `misc/contest_writers.json`: an optional list of contest writers, made with
   `extra/scrape_cf_contest_writers.py`.
-* `temp/`: images the bot is drawing.
+- `temp/`: images the bot is drawing.
 
 Only `db/cache.db` (then refill it as above) and `temp/` are safe to delete.
 Keep the rest and back it up: losing `kcpc.db` loses every server's KCPC
@@ -563,7 +904,7 @@ next to each one, and a copy of the database file alone can miss them.
 
 ---
 
-## 5 · Local development (optional)
+## 7 · Local development (optional)
 
 You can hack on the code without touching your system Python:
 
@@ -581,7 +922,7 @@ docker run --rm -v $PWD:/app -w /app python:3.11-slim \
 
 ---
 
-## 6 · Repository layout
+## 8 · Repository layout
 
 ```sh
 .
@@ -589,14 +930,14 @@ docker run --rm -v $PWD:/app -w /app python:3.11-slim \
 ├─ compose.yaml            # single-service compose file
 ├─ requirements.txt        # runtime Python deps (no pins)
 ├─ .env.example            # template for your secrets
-├─ data/                   # databases & caches, see §4 (git-ignored)
+├─ data/                   # databases & caches, see §6 (git-ignored)
 ├─ tle/ …                  # bot source code
 └─ extra/ fonts.conf …     # helper resources
 ```
 
 ---
 
-## 7 · Contributing
+## 9 · Contributing
 
 Pull requests are welcome!  
 Before opening a PR, please
@@ -606,6 +947,6 @@ Before opening a PR, please
 
 ---
 
-## 8 · License
+## 10 · License
 
 MIT ― see `LICENSE`.

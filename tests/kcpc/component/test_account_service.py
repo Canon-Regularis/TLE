@@ -355,7 +355,7 @@ async def test_a_codeforces_handle_another_member_has_is_refused_unasked(
     # Moderators free a Codeforces handle, as it is TLE's.
     assert str(raised.value) == (
         'The handle fakecoder is already linked to someone else in this server. '
-        'If it is yours, ask an Admin or Moderator to remove it with /handle remove.'
+        'If it is yours, ask a moderator or admin to remove it with `;handle remove`.'
     )
     assert codeforces.asked == []
     assert await repo.get_challenge(GUILD, MEMBER, CODEFORCES) is None
@@ -371,10 +371,10 @@ async def test_a_member_with_a_codeforces_handle_cant_link_another(
             GUILD, MEMBER, CODEFORCES, 'FakeCoder', current_handle='Old_Coder'
         )
 
-    # TLE's rule, as /handle identify words it.
+    # TLE's rule, as /handle identify has it: staff change the handle.
     assert str(raised.value) == (
         r'Your Codeforces handle is already set to Old\_Coder. '
-        'Ask an Admin or Moderator if you wish to change it.'
+        'To change it, ask a moderator or admin.'
     )
     assert codeforces.asked == []
     assert await repo.get_challenge(GUILD, MEMBER, CODEFORCES) is None

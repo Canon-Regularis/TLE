@@ -1,12 +1,19 @@
-"""Component tests for tle.util.db.user_db_conn — async in-memory aiosqlite."""
+"""Component tests for tle.util.db.user_db_conn — async aiosqlite, mostly in memory."""
+
+import asyncio
+import sqlite3
+from contextlib import asynccontextmanager, closing
 
 import pytest
 
 from tle.util.db.user_db_conn import (
+    DatabaseDisabledError,
     Duel,
     DuelType,
+    DummyUserDbConn,
     Gitgud,
     UniqueConstraintFailed,
+    UserDbConn,
     Winner,
 )
 
@@ -34,6 +41,7 @@ class TestTableCreation:
             'starboard_config_v1',
             'starboard_emoji_v1',
             'starboard_message_v1',
+            'access_settings',
         }
         assert expected.issubset(table_names)
 
@@ -545,6 +553,13 @@ class TestStarboard:
         entry = await user_db.get_starboard_entry('guild1', 'nonexistent')
         assert entry is None
 
+    async def test_a_channel_without_the_emoji_is_no_entry(self, user_db):
+        # /starboard here before /starboard add, or after /starboard delete:
+        # the listener asks at every reaction, which must not raise.
+        await user_db.set_starboard_channel('guild1', 'star', '123456')
+        entry = await user_db.get_starboard_entry('guild1', 'star')
+        assert entry is None
+
     async def test_remove_emoji(self, user_db):
         await user_db.add_starboard_emoji('guild1', 'star', 5, 0xFFAA10)
         rc = await user_db.remove_starboard_emoji('guild1', 'star')
@@ -585,3 +600,165 @@ class TestStarboard:
         await user_db.set_starboard_channel('guild1', 'star', '123456')
         rc = await user_db.clear_starboard_channel('guild1', 'star')
         assert rc == 1
+
+
+@asynccontextmanager
+async def opened(path):
+    """A UserDbConn on the database file at path, closed afterwards."""
+    db = UserDbConn(str(path))
+    await db.connect()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+def committed_access_rows(path):
+    """The access_settings rows an independent connection sees: the committed ones."""
+    with closing(sqlite3.connect(path)) as reader:
+        query = 'SELECT guild_id, settings FROM access_settings ORDER BY guild_id'
+        return reader.execute(query).fetchall()
+
+
+class TestAccessSettings:
+    async def test_table_columns(self, user_db):
+        cursor = await user_db.conn.execute('PRAGMA table_info(access_settings)')
+        columns = [
+            (col.name, col.type, col.notnull, col.pk) for col in await cursor.fetchall()
+        ]
+        assert columns == [('guild_id', 'TEXT', 0, 1), ('settings', 'TEXT', 1, 0)]
+
+    async def test_empty(self, user_db):
+        assert await user_db.get_all_access_settings() == []
+
+    async def test_set_and_get(self, user_db):
+        assert await user_db.set_access_settings(123, '{"version": 1}') is None
+        assert await user_db.get_all_access_settings() == [(123, '{"version": 1}')]
+
+    async def test_set_replaces_only_that_server(self, user_db):
+        await user_db.set_access_settings(1, 'first')
+        await user_db.set_access_settings(2, 'other')
+        await user_db.set_access_settings(1, 'second')
+        assert await user_db.get_all_access_settings() == [(1, 'second'), (2, 'other')]
+
+    async def test_sorted_by_guild_id_as_a_number(self, user_db):
+        # Neither the insertion order nor the text order ('10' < '9') is this one.
+        largest = 2**63 - 1
+        for guild_id in (10, largest, 9):
+            await user_db.set_access_settings(guild_id, f'settings of {guild_id}')
+        assert await user_db.get_all_access_settings() == [
+            (9, 'settings of 9'),
+            (10, 'settings of 10'),
+            (largest, f'settings of {largest}'),
+        ]
+
+    async def test_guild_id_stored_as_decimal_text(self, user_db):
+        # As in the other tables, so a hand-written query finds the row.
+        await user_db.set_access_settings(2**63 - 1, '{}')
+        cursor = await user_db.conn.execute(
+            'SELECT guild_id, typeof(guild_id) AS kind FROM access_settings'
+        )
+        row = await cursor.fetchone()
+        assert (row.guild_id, row.kind) == ('9223372036854775807', 'text')
+
+    @pytest.mark.parametrize(
+        'settings',
+        [
+            '',
+            '{"version": 1, "limits": {"duel *": {"off": true}}}',
+            'Ünïcödé "quotes" \\ backslash\nnewline',
+            "'); DROP TABLE access_settings; --",
+            '{}' + ' ' * 200_000,
+        ],
+        ids=['empty', 'json', 'unicode', 'sql', 'large'],
+    )
+    async def test_settings_kept_exactly(self, user_db, settings):
+        await user_db.set_access_settings(7, settings)
+        assert await user_db.get_all_access_settings() == [(7, settings)]
+
+    async def test_write_is_committed_when_it_returns(self, tmp_path):
+        # Callers update their memory next, so the database must already hold it.
+        path = tmp_path / 'user.db'
+        async with opened(path) as db:
+            await db.set_access_settings(5, '{"version": 1}')
+            assert committed_access_rows(path) == [('5', '{"version": 1}')]
+
+    async def test_concurrent_writes_are_all_committed(self, tmp_path):
+        path = tmp_path / 'user.db'
+        guild_ids = range(1, 21)
+        async with opened(path) as db:
+            await asyncio.gather(
+                *(db.set_access_settings(g, f'settings of {g}') for g in guild_ids)
+            )
+            assert await db.get_all_access_settings() == [
+                (g, f'settings of {g}') for g in guild_ids
+            ]
+            assert len(committed_access_rows(path)) == len(guild_ids)
+
+    async def test_settings_survive_a_restart(self, tmp_path):
+        path = tmp_path / 'user.db'
+        async with opened(path) as db:
+            await db.set_access_settings(5, 'kept')
+        async with opened(path) as db:
+            assert await db.get_all_access_settings() == [(5, 'kept')]
+
+    async def test_older_database_gains_the_table(self, tmp_path):
+        # A database from before access settings: every other table, with its data.
+        path = tmp_path / 'user.db'
+        async with opened(path) as db:
+            await db.set_handle(1, 2, 'tourist')
+            await db.conn.execute('DROP TABLE access_settings')
+            await db.conn.commit()
+        async with opened(path) as db:
+            assert await db.get_all_access_settings() == []
+            assert await db.get_handle(1, 2) == 'tourist'
+
+    @pytest.mark.parametrize(
+        ('guild_id', 'settings'),
+        [
+            ('123', '{}'),
+            (True, '{}'),
+            (123.0, '{}'),
+            (None, '{}'),
+            (123, None),
+            (123, b'{}'),
+            (123, {'version': 1}),
+        ],
+    )
+    async def test_refuses_other_types(self, user_db, guild_id, settings):
+        with pytest.raises(TypeError):
+            await user_db.set_access_settings(guild_id, settings)
+        assert await user_db.get_all_access_settings() == []
+
+    @pytest.mark.parametrize(
+        ('guild_id', 'settings'),
+        [
+            ('guild1', '{}'),
+            (' 1', '{}'),
+            ('01', '{}'),
+            ('+1', '{}'),
+            ('1.0', '{}'),
+            (None, '{}'),
+            ('1', b'{}'),
+        ],
+    )
+    async def test_a_row_it_cannot_have_written_fails_the_read(
+        self, user_db, guild_id, settings
+    ):
+        # Only hand edits make these; skipping one could drop a server's limits.
+        await user_db.set_access_settings(2, '{}')
+        await user_db.conn.execute(
+            'INSERT INTO access_settings (guild_id, settings) VALUES (?, ?)',
+            (guild_id, settings),
+        )
+        with pytest.raises(ValueError, match='access_settings'):
+            await user_db.get_all_access_settings()
+
+
+class TestDummyUserDb:
+    async def test_access_settings_need_the_database(self):
+        dummy = DummyUserDbConn()
+        with pytest.raises(DatabaseDisabledError):
+            await dummy.get_all_access_settings()
+        with pytest.raises(DatabaseDisabledError):
+            await dummy.set_access_settings(1, '{}')

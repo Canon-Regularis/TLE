@@ -1,11 +1,22 @@
 """Tests for DuelChallengeView in tle.cogs.duel."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
+from discord.ext import commands
 
 from tle.cogs.duel import DuelChallengeView
 from tle.util.db.user_db_conn import Duel
+
+# Each button, the command whose access rule it follows, the duelist it is
+# for, and what anyone else who presses it is told.
+BUTTONS = [
+    ('accept_button', 'duel accept', 2002, 'Only the challenged user can accept.'),
+    ('decline_button', 'duel decline', 2002, 'Only the challenged user can decline.'),
+    ('withdraw_button', 'duel withdraw', 1001, 'Only the challenger can withdraw.'),
+]
 
 
 def _make_view(timeout=300):
@@ -29,7 +40,19 @@ def _make_interaction(user_id, guild=None, channel=None):
     interaction.response = AsyncMock()
     interaction.guild = guild or MagicMock()
     interaction.channel = channel or AsyncMock()
+    # A bot without an access service, which lets every press through.
+    interaction.client = MagicMock(spec=commands.Bot)
     return interaction
+
+
+def _with_access(interaction, *, allowed):
+    """Give the bot of ``interaction`` an access service that allows the press,
+    or refuses it, as if it had told the member why.
+    """
+    access = MagicMock()
+    access.component_allowed = AsyncMock(return_value=allowed)
+    interaction.client = SimpleNamespace(access=access)
+    return access
 
 
 class TestDuelChallengeViewInit:
@@ -314,3 +337,58 @@ class TestOnTimeout:
 
         # cancel_duel returned 0, so no expiry alert
         message.channel.send.assert_not_awaited()
+
+
+class TestButtonsAskTheAccessRules:
+    """Each button first asks the bot's access service whether the member may
+    use its command, and does nothing more if not.
+    """
+
+    @pytest.mark.parametrize(('button', 'command', 'user_id', 'other'), BUTTONS)
+    async def test_a_refused_press_changes_nothing(
+        self, button, command, user_id, other
+    ):
+        view = _make_view()
+        # The duelist the button is for, whom nothing else would stop.
+        interaction = _make_interaction(user_id=user_id)
+        access = _with_access(interaction, allowed=False)
+
+        with patch('tle.cogs.duel.asyncio.sleep', new_callable=AsyncMock):
+            await getattr(view, button).callback(interaction)
+
+        access.component_allowed.assert_awaited_once_with(interaction, command)
+        # The service has answered the press; the button adds nothing.
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.channel.send.assert_not_awaited()
+        view.bot.user_db.start_duel.assert_not_awaited()
+        view.bot.user_db.cancel_duel.assert_not_awaited()
+        assert not any(item.disabled for item in view.children)
+
+    @pytest.mark.parametrize(('button', 'command', 'user_id', 'other'), BUTTONS)
+    async def test_an_allowed_press_goes_on_as_before(
+        self, button, command, user_id, other
+    ):
+        view = _make_view()
+        interaction = _make_interaction(user_id=9999)  # neither duelist
+        access = _with_access(interaction, allowed=True)
+
+        await getattr(view, button).callback(interaction)
+
+        access.component_allowed.assert_awaited_once_with(interaction, command)
+        interaction.response.send_message.assert_awaited_once_with(
+            other, ephemeral=True
+        )
+
+    @pytest.mark.parametrize(('button', 'command', 'user_id', 'other'), BUTTONS)
+    async def test_without_an_access_service_every_press_goes_on(
+        self, button, command, user_id, other
+    ):
+        view = _make_view()
+        interaction = _make_interaction(user_id=9999)
+
+        await getattr(view, button).callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once_with(
+            other, ephemeral=True
+        )

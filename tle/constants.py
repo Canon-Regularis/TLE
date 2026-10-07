@@ -1,7 +1,10 @@
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Before any setting below is read. Variables already in the environment (e.g.
 # set by Docker) win over .env.
@@ -43,10 +46,28 @@ def _get_role_from_env(name: str, default: str) -> str | int:
         return value
 
 
+def _get_role_id_from_env(name: str) -> int | None:
+    """The role ID in ``name``, or None if it is unset or blank.
+
+    A value that isn't an ID, such as a role's name, is logged and ignored.
+    """
+    value = os.environ.get(name, '').strip()
+    if not value:
+        return None
+    # Digits only (int() would also take a sign, underscores or another script's
+    # digits), and at most 20, as a Discord ID is a 64-bit number.
+    if value.isascii() and value.isdigit() and len(value) <= 20:
+        return int(value)
+    logger.warning('%s must be a role ID, not %r, so it is ignored', name, value)
+    return None
+
+
 TLE_ADMIN = _get_role_from_env('TLE_ADMIN', 'Admin')
 TLE_MODERATOR = _get_role_from_env('TLE_MODERATOR', 'Moderator')
 TLE_TRUSTED = _get_role_from_env('TLE_TRUSTED', 'Trusted')
 TLE_PURGATORY = _get_role_from_env('TLE_PURGATORY', 'Purgatory')
+# By ID only, and with no default: unset, there is no developer role.
+TLE_DEVELOPER = _get_role_id_from_env('TLE_DEVELOPER')
 
 _DEFAULT_COLOR = 0xFFAA10
 _DEFAULT_STAR = '\N{WHITE MEDIUM STAR}'

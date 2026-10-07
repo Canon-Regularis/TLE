@@ -6,6 +6,7 @@ patched, so no test reaches it.
 """
 
 import datetime as dt
+import html
 import logging
 from types import ModuleType
 from typing import Any
@@ -24,7 +25,7 @@ from tle.util.handle_linking import HandleLinkError, HandleTakenError
 GUILD_ID = 1_100_000_000_000_000_001
 MEMBER_ID = 1_200_000_000_000_000_001
 OTHER_MEMBER_ID = 1_200_000_000_000_000_002
-CHANNEL_ID = 1_300_000_000_000_000_001
+TRUSTED_ROLE_ID = 1_300_000_000_000_000_001
 HANDLE = 'Fake_Coder'  # a made-up account, in Codeforces' case
 EXPERT = 1700
 LOGGER_NAME = 'test.handle_linking'
@@ -174,7 +175,10 @@ class TestRankRoleFor:
         remove_guild_role(guild, 'Expert')
         with pytest.raises(HandleLinkError) as excinfo:
             handle_linking.rank_role_for(guild, codeforces_user(EXPERT))
-        assert str(excinfo.value) == 'Role for rank `Expert` not present in the server'
+        # A sentence, as OAuth's reply quotes it within one of its own.
+        assert str(excinfo.value) == (
+            'Role for rank `Expert` not present in the server.'
+        )
 
 
 class TestLinkHandle:
@@ -372,6 +376,29 @@ class TestMaybeAddTrustedRole:
         await handle_linking.maybe_add_trusted_role(linked_member, user_db=user_db)
 
         linked_member.add_roles.assert_not_awaited()
+
+    async def test_the_trusted_role_may_be_set_by_its_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        user_db: UserDbConn,
+        guild: MagicMock,
+        linked_member: MagicMock,
+        rating_history: AsyncMock,
+    ) -> None:
+        # TLE_TRUSTED holds the role's id, and the role has another name.
+        veterans = make_role('Veterans')
+        guild.roles = [*guild.roles, veterans]
+        guild.get_role.side_effect = {TRUSTED_ROLE_ID: veterans}.get
+        monkeypatch.setattr(constants, 'TLE_TRUSTED', TRUSTED_ROLE_ID)
+        rating_history.return_value = [
+            rating_change(1900, TRUSTED_CUTOFF - dt.timedelta(days=1))
+        ]
+
+        await handle_linking.maybe_add_trusted_role(linked_member, user_db=user_db)
+
+        linked_member.add_roles.assert_awaited_once_with(
+            veterans, reason=TRUSTED_REASON
+        )
 
     async def test_a_trusted_member_is_not_checked_again(
         self,
@@ -604,7 +631,9 @@ class TestHandlesCog:
         with pytest.raises(handles.HandleCogError) as excinfo:
             await cog.set.callback(cog, ctx, member, 'fake_coder')
 
-        assert str(excinfo.value) == 'Role for rank `Expert` not present in the server'
+        assert str(excinfo.value) == (
+            'Role for rank `Expert` not present in the server.'
+        )
         assert await handle_of(user_db) is None
         assert await user_db.fetch_cf_user(HANDLE) is None
         ctx.send.assert_not_awaited()
@@ -646,7 +675,7 @@ class TestHandlesCog:
         assert await handle_of(user_db) is None
         assert linked.roles == [roles['Workshops']]
         embed = ctx.send.await_args.kwargs['embed']
-        assert embed.description == f'Removed {HANDLE} from database'
+        assert embed.description == f'Unlinked `{HANDLE}`.'
 
     async def test_handle_remove_frees_the_handle_of_a_member_who_left(
         self, cog: Any, ctx: MagicMock, guild: MagicMock, user_db: UserDbConn
@@ -663,7 +692,7 @@ class TestHandlesCog:
         guild.get_member.assert_called_once_with(OTHER_MEMBER_ID)
         ctx.send.assert_awaited_once()
         embed = ctx.send.await_args.kwargs['embed']
-        assert embed.description == f'Removed {HANDLE} from database'
+        assert embed.description == f'Unlinked `{HANDLE}`.'
 
 
 @pytest.fixture
@@ -680,27 +709,63 @@ def oauth_flow(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def bot(user_db: UserDbConn, guild: MagicMock, member: MagicMock) -> MagicMock:
-    """A bot without TLE's Handles cog, in whose guild ``member`` is."""
+    """A bot without TLE's Handles cog, in whose guild ``member`` is.
+
+    Direct messages to the member are recorded.
+    """
     bot = MagicMock(spec=commands.Bot)
     bot.user_db = user_db
     bot.get_guild.return_value = guild
     guild.get_member.return_value = member
     bot.get_cog.return_value = None
-    bot.get_channel.return_value = None
+    bot.get_user.return_value = member
+    member.send = AsyncMock()
     return bot
 
 
-async def oauth_callback(bot: MagicMock) -> Any:
-    """Codeforces redirecting the member back, after they authorized the bot."""
+@pytest.fixture
+def interaction() -> MagicMock:
+    """The interaction of a /handle identify, whose followups are recorded."""
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.followup = MagicMock(spec=discord.Webhook)
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
+async def oauth_callback(
+    bot: MagicMock, interaction: discord.Interaction | None = None
+) -> Any:
+    """Codeforces redirecting the member back, after they authorized the bot.
+
+    The member signed in with /handle identify, whose ``interaction`` is
+    kept, or without one with ;handle identify.
+    """
     store = oauth.OAuthStateStore()
-    state = store.create(MEMBER_ID, GUILD_ID, CHANNEL_ID)
+    state = store.create(MEMBER_ID, GUILD_ID, interaction=interaction)
     server = oauth.OAuthServer(bot, store, port=0)
     server._session = MagicMock()  # what start() opens, used only by exchange_code
     request = make_mocked_request('GET', f'/callback?state={state}&code=test-code')
     return await server._handle_callback(request)
 
 
-@pytest.mark.usefixtures('oauth_flow')
+def oauth_logs(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == oauth.__name__
+    ]
+
+
+LINKED = (
+    f'Handle for <@{MEMBER_ID}> successfully set to'
+    f' **[{HANDLE}](https://codeforces.com/profile/{HANDLE})**'
+)
+NOT_TOLD = f'Could not tell user {MEMBER_ID} how linking their Codeforces account went'
+
+
+# The success page names the linked account with the profile embed of the
+# Handles cog, which needs gi.
+@pytest.mark.usefixtures('oauth_flow', 'handles')
 class TestOAuthCallback:
     async def test_links_through_handle_linking(
         self,
@@ -718,32 +783,197 @@ class TestOAuthCallback:
         assert member.roles == [roles['Expert']]
         bot.get_cog.assert_not_called()
 
-    async def test_a_failed_link_changes_nothing_and_says_so_as_before(
+    async def test_after_slash_identify_only_the_member_is_told_it_worked(
+        self, bot: MagicMock, member: MagicMock, interaction: MagicMock
+    ) -> None:
+        await oauth_callback(bot, interaction)
+
+        interaction.followup.send.assert_awaited_once()
+        sent = interaction.followup.send.await_args.kwargs
+        assert sent['ephemeral'] is True
+        assert sent['embed'].description == LINKED
+        member.send.assert_not_awaited()
+        bot.get_channel.assert_not_called()
+
+    async def test_after_prefix_identify_the_member_is_told_by_direct_message(
+        self, bot: MagicMock, member: MagicMock
+    ) -> None:
+        await oauth_callback(bot)
+
+        bot.get_user.assert_called_once_with(MEMBER_ID)
+        member.send.assert_awaited_once()
+        assert member.send.await_args.kwargs['embed'].description == LINKED
+        bot.get_channel.assert_not_called()
+
+    @pytest.mark.parametrize('slash', [False, True], ids=['prefix', 'slash'])
+    @pytest.mark.parametrize(
+        ('cause', 'reason'),
+        [
+            ('no rank role', 'Role for rank `Expert` not present in the server.'),
+            (
+                'handle taken',
+                f'The handle `{HANDLE}` is already associated with another user.',
+            ),
+        ],
+    )
+    async def test_a_link_refused_for_a_reason_tells_the_member_why_privately(
         self,
         bot: MagicMock,
         guild: MagicMock,
+        member: MagicMock,
+        interaction: MagicMock,
         user_db: UserDbConn,
         caplog: pytest.LogCaptureFixture,
+        slash: bool,
+        cause: str,
+        reason: str,
     ) -> None:
-        remove_guild_role(guild, 'Expert')
-        channel = MagicMock(spec=discord.TextChannel)
-        bot.get_channel.return_value = channel
+        # Trying again fails the same way, so the member used to be sent round
+        # in circles: the reason is what a moderator needs to sort it out.
+        if cause == 'no rank role':
+            remove_guild_role(guild, 'Expert')
+        else:
+            # Such as a member who left: TLE keeps their handle.
+            await user_db.set_handle(OTHER_MEMBER_ID, GUILD_ID, HANDLE)
+
+        with caplog.at_level(logging.INFO, logger=oauth.__name__):
+            response = await oauth_callback(bot, interaction if slash else None)
+
+        assert await handle_of(user_db) is None
+        send = interaction.followup.send if slash else member.send
+        send.assert_awaited_once()
+        told = (
+            f"I couldn't link your Codeforces account: {reason} Ask a moderator "
+            'to sort it out.'
+        )
+        assert send.await_args.kwargs['embed'].description == told
+        if slash:
+            assert send.await_args.kwargs['ephemeral'] is True
+            member.send.assert_not_awaited()
+        bot.get_channel.assert_not_called()
+        # The page says it too, as plain text.
+        assert html.escape(told.replace('`', '')) in response.text
+        assert 'try the command again' not in response.text
+        # Not an error of the bot's.
+        assert oauth_logs(caplog) == [
+            (
+                logging.INFO,
+                f'Could not link the Codeforces account of user {MEMBER_ID}: {reason}',
+            )
+        ]
+
+    @pytest.mark.parametrize('slash', [False, True], ids=['prefix', 'slash'])
+    async def test_an_unexpected_failure_says_to_try_again_privately(
+        self,
+        bot: MagicMock,
+        member: MagicMock,
+        interaction: MagicMock,
+        user_db: UserDbConn,
+        caplog: pytest.LogCaptureFixture,
+        slash: bool,
+    ) -> None:
+        # The bot has left the server since the member signed in, say.
+        bot.get_guild.return_value = None
 
         with caplog.at_level(logging.ERROR, logger=oauth.__name__):
-            response = await oauth_callback(bot)
+            response = await oauth_callback(bot, interaction if slash else None)
 
         assert 'An error occurred. Please try the command again in Discord.' in (
             response.text
         )
         assert await handle_of(user_db) is None
-        bot.get_channel.assert_called_once_with(CHANNEL_ID)
-        channel.send.assert_awaited_once()
-        assert channel.send.await_args.args == (f'<@{MEMBER_ID}>',)
-        embed = channel.send.await_args.kwargs['embed']
-        assert embed.description == (
-            'Something went wrong during Codeforces account linking. Please try again.'
+        send = interaction.followup.send if slash else member.send
+        send.assert_awaited_once()
+        assert send.await_args.kwargs['embed'].description == (
+            "I couldn't link your Codeforces account. Try `/handle identify` again, "
+            'or ask a moderator if it keeps failing.'
         )
+        if slash:
+            assert send.await_args.kwargs['ephemeral'] is True
+            member.send.assert_not_awaited()
+        bot.get_channel.assert_not_called()
         [record] = [r for r in caplog.records if r.name == oauth.__name__]
         assert record.getMessage() == 'OAuth callback error'
         assert record.exc_info is not None
-        assert isinstance(record.exc_info[1], HandleLinkError)
+        assert str(record.exc_info[1]) == 'Guild not found'
+
+    @pytest.mark.parametrize(
+        'slash', [False, True], ids=['direct messages closed', 'interaction expired']
+    )
+    async def test_a_message_that_cannot_be_sent_is_only_logged(
+        self,
+        bot: MagicMock,
+        member: MagicMock,
+        interaction: MagicMock,
+        user_db: UserDbConn,
+        caplog: pytest.LogCaptureFixture,
+        slash: bool,
+    ) -> None:
+        # The message is sent once the link is made, outside the linking's try:
+        # failing to send it neither undoes the link nor tells the member that
+        # linking failed, and nothing is posted anywhere else.
+        refused = discord.Forbidden(MagicMock(status=403, reason='Forbidden'), 'no')
+        expired = discord.NotFound(MagicMock(status=404, reason='Not Found'), 'gone')
+        member.send.side_effect = refused
+        interaction.followup.send.side_effect = expired
+
+        with caplog.at_level(logging.INFO, logger=oauth.__name__):
+            response = await oauth_callback(bot, interaction if slash else None)
+
+        assert response.text == oauth._SUCCESS_HTML
+        assert await handle_of(user_db) == HANDLE
+        send = interaction.followup.send if slash else member.send
+        send.assert_awaited_once()
+        error = expired if slash else refused
+        assert oauth_logs(caplog) == [(logging.INFO, f'{NOT_TOLD}: {error}')]
+        bot.get_channel.assert_not_called()
+
+    async def test_a_member_the_bot_cannot_find_is_not_told(
+        self,
+        bot: MagicMock,
+        user_db: UserDbConn,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        bot.get_user.return_value = None
+
+        with caplog.at_level(logging.INFO, logger=oauth.__name__):
+            response = await oauth_callback(bot)
+
+        assert response.text == oauth._SUCCESS_HTML
+        assert await handle_of(user_db) == HANDLE
+        assert oauth_logs(caplog) == [
+            (logging.INFO, f'{NOT_TOLD}: they are not in any server of the bot')
+        ]
+
+    async def test_an_unexpected_failure_to_tell_is_logged_and_the_link_stays(
+        self,
+        bot: MagicMock,
+        interaction: MagicMock,
+        user_db: UserDbConn,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        bug = RuntimeError('broken')
+        interaction.followup.send.side_effect = bug
+
+        with caplog.at_level(logging.INFO, logger=oauth.__name__):
+            response = await oauth_callback(bot, interaction)
+
+        assert response.text == oauth._SUCCESS_HTML
+        assert await handle_of(user_db) == HANDLE
+        [record] = [r for r in caplog.records if r.name == oauth.__name__]
+        assert (record.levelno, record.getMessage()) == (logging.ERROR, NOT_TOLD)
+        assert record.exc_info is not None and record.exc_info[1] is bug
+
+    async def test_the_error_in_the_link_is_shown_escaped(self, bot: MagicMock) -> None:
+        # Anyone can open the callback, with any error.
+        server = oauth.OAuthServer(bot, oauth.OAuthStateStore(), port=0)
+        request = make_mocked_request(
+            'GET', '/callback?error=%3Cscript%3Ealert(1)%3C/script%3E'
+        )
+
+        response = await server._handle_callback(request)
+
+        assert '<script>' not in response.text
+        assert 'Authorization denied: &lt;script&gt;alert(1)&lt;/script&gt;' in (
+            response.text
+        )

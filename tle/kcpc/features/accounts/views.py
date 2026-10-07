@@ -5,7 +5,8 @@ and the challenge it checks is in the database. So the cog registers
 ``VerifyLinkButton`` with ``Bot.add_dynamic_items``, and discord.py makes a new
 button from the custom ID whenever one is pressed, on a message sent before a
 restart too. Pressing it does what ``/link verify <platform>`` does, through
-the accounts cog.
+the accounts cog, and the bot's access rules treat a press as a use of that
+command (see ``_allowed``).
 """
 
 import re
@@ -19,6 +20,8 @@ from tle.kcpc.core.errors import KcpcDisabledError, KcpcUserError
 
 # The name of the accounts cog, which the button runs the verification through.
 ACCOUNTS_COG = 'KcpcAccounts'
+# The command that a press of the button counts as, for the access rules.
+VERIFY_COMMAND = 'link verify'
 # A Discord ID has at most 20 digits.
 VERIFY_TEMPLATE = r'kcpc:link:(?P<platform>codeforces|atcoder):(?P<user_id>[0-9]{1,20})'
 NOT_YOUR_LINK = 'Only the member who is linking this account can verify it.'
@@ -32,6 +35,22 @@ class LinkVerifier(Protocol):
         self, guild: discord.Guild, member: discord.Member, platform: str
     ) -> discord.Embed:
         """Verify the account the member is linking; the reply to show them."""
+        ...
+
+
+class AccessGate(Protocol):
+    """What the Verify button needs of the bot's access service.
+
+    KCPC never imports the service: it reaches it as the bot's ``access``
+    attribute, which a bot without access rules doesn't have.
+    """
+
+    async def component_allowed(
+        self, interaction: discord.Interaction[Any], name: str
+    ) -> bool:
+        """Whether the member may press a button of command ``name``; if not,
+        they have been told why, privately.
+        """
         ...
 
 
@@ -65,6 +84,8 @@ class VerifyLinkButton(
         # discord.py only logs what a dynamic item's callback raises, without
         # calling View.on_error, so the button replies to its own errors.
         try:
+            if not await _allowed(interaction):
+                return
             # A button's deferral is ephemeral only if it's "thinking".
             await interaction.response.defer(ephemeral=True, thinking=True)
             if interaction.user.id != self.user_id:
@@ -86,6 +107,20 @@ def verify_view(platform: str, user_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(VerifyLinkButton(platform, user_id))
     return view
+
+
+async def _allowed(interaction: discord.Interaction[Any]) -> bool:
+    """Whether the access rules let the member press Verify, as they would let
+    them use /link verify; if not, the access service has told them why.
+
+    Who may use the command counts, and whether this server switched it off,
+    but not the channel (see the service's ``component_allowed``). A bot
+    without an access service lets every press through.
+    """
+    access: AccessGate | None = getattr(interaction.client, 'access', None)
+    if access is None:
+        return True
+    return await access.component_allowed(interaction, VERIFY_COMMAND)
 
 
 def _verifier(client: discord.Client) -> LinkVerifier:

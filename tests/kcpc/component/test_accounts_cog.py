@@ -7,7 +7,9 @@ rank roles and all. Only Discord and the sites are mocked: AtCoder's profile
 pages by FakeAtCoder, Codeforces by FakeCodeforces in place of TLE's
 ``cf.user.info``. Most tests call a command's callback with a mocked context.
 The button is pressed by calling its callback, and once, after a restart,
-through discord.py's own dispatch of dynamic items. The users are made up.
+through discord.py's own dispatch of dynamic items. The bot has no access
+service unless a test gives it one, a stand-in or TLE's own, which then counts
+each press as a use of /link verify. The users are made up.
 """
 
 import asyncio
@@ -26,11 +28,14 @@ from discord.ext.commands.view import StringView
 
 from tests.kcpc.conftest import CLOCK_START
 from tle import constants
+from tle.access.rules import Limit, Who
+from tle.access.service import OFF_TEXT, AccessService
 from tle.config import Settings
 from tle.kcpc.bot.checks import NotKcpcAdmin
 from tle.kcpc.bot.embeds import ALERT_COLOR, KCPC_COLOR, SUCCESS_COLOR
 from tle.kcpc.bot.pages import PageView
 from tle.kcpc.bot.publisher import DiscordPublisher
+from tle.kcpc.bot.views import UNEXPECTED_ERROR_MESSAGE
 from tle.kcpc.core.clock import FakeClock
 from tle.kcpc.core.db import Database
 from tle.kcpc.core.errors import ExternalServiceError, KcpcUserError
@@ -59,6 +64,7 @@ from tle.kcpc.features.accounts.repo import (
 )
 from tle.kcpc.features.accounts.views import (
     NOT_YOUR_LINK,
+    VERIFY_COMMAND,
     VERIFY_TEMPLATE,
     VerifyLinkButton,
 )
@@ -67,6 +73,7 @@ from tle.kcpc.platforms.atcoder.profile import PROFILE_URL, AtCoderProfile
 from tle.kcpc.services import KcpcServices
 from tle.util import codeforces_api as cf
 from tle.util.db.user_db_conn import UserDbConn
+from tle.util.discord_common import NOT_ALLOWED_MESSAGE
 
 if TYPE_CHECKING:
     # discord.py's payload types are for type checking: at run time, importing
@@ -81,6 +88,7 @@ ADMIN = 1_300_000_000_000_000_003
 LEFT = 1_600_000_000_000_000_002  # not in the guild any more
 MESSAGE = 1_400_000_000_000_000_001
 NOW = CLOCK_START
+SECOND = timedelta(seconds=1)
 MINUTE = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
 TOKEN = 'kcpc-a1b2c3'  # the first token each test hands out
@@ -750,7 +758,7 @@ async def test_link_codeforces_refuses_a_member_who_has_a_handle(
 
     assert str(raised.value) == (
         'Your Codeforces handle is already set to OldCoder. '
-        'Ask an Admin or Moderator if you wish to change it.'
+        'To change it, ask a moderator or admin.'
     )
     ctx.send.assert_not_awaited()
     assert await repo.get_challenge(GUILD, MEMBER, 'codeforces') is None
@@ -787,7 +795,7 @@ async def test_link_codeforces_refuses_a_handle_a_member_who_left_has(
     assert await user_db.get_handles_for_guild(GUILD) == []
     codeforces.add('FakeCoder')
 
-    with pytest.raises(HandleTaken, match='ask an Admin or Moderator to remove it'):
+    with pytest.raises(HandleTaken, match='ask a moderator or admin to remove it'):
         await run(bot, 'link codeforces', ctx, 'fakecoder')
 
     assert codeforces.asked == []
@@ -808,7 +816,7 @@ async def test_link_codeforces_refuses_an_account_without_a_rank_role_here(
         await run(bot, 'link codeforces', ctx, 'fakecoder')
 
     # As TLE refuses it, but before the member has edited their profile.
-    assert str(raised.value) == 'Role for rank `Expert` not present in the server'
+    assert str(raised.value) == 'Role for rank `Expert` not present in the server.'
     ctx.send.assert_not_awaited()
     assert await repo.get_challenge(GUILD, MEMBER, 'codeforces') is None
     # An unrated account needs no rank role.
@@ -935,6 +943,7 @@ async def test_until_the_bot_has_every_member_nobody_counts_as_having_left(
     member: MagicMock,
     repo: AccountRepo,
     atcoder: FakeAtCoder,
+    clock: FakeClock,
 ) -> None:
     atcoder.add('FakeAtCoder')
     theirs = LinkedAccount(
@@ -959,11 +968,34 @@ async def test_until_the_bot_has_every_member_nobody_counts_as_having_left(
     assert f'<@{LEFT}>' in str(reply(ranked, ephemeral=False).description)
     # Once the bot has every member, the holder has left, and the token holds.
     server.guild.chunked = True
+    await clock.advance(10 * SECOND)  # a member verifies once every 10 seconds
     await run(bot, 'link verify', ctx, 'atcoder')
     assert reply(ctx, ephemeral=True).colour == discord.Colour(SUCCESS_COLOR)
+    linked_at = NOW + 10 * SECOND
     assert await repo.links_for_guild(GUILD, 'atcoder') == [
-        LinkedAccount(GUILD, MEMBER, 'atcoder', 'FakeAtCoder', 'affiliation-token', NOW)
+        LinkedAccount(
+            GUILD, MEMBER, 'atcoder', 'FakeAtCoder', 'affiliation-token', linked_at
+        )
     ]
+
+
+def sent_at(
+    bot: commands.Bot, server: Server, author: MagicMock, args: str, sent: datetime
+) -> commands.Context[commands.Bot]:
+    """The context of a prefix command that ``author`` sent at ``sent``, with
+    ``args`` after the command's name.
+
+    The time counts for the commands' cooldowns, which discord.py reads from
+    the message.
+    """
+    message = MagicMock(
+        spec=discord.Message,
+        guild=server.guild,
+        author=author,
+        created_at=sent,
+        edited_at=None,
+    )
+    return commands.Context(message=message, bot=bot, view=StringView(args), prefix=';')
 
 
 async def test_link_works_as_a_prefix_command_and_its_errors_get_a_reply(
@@ -972,10 +1004,7 @@ async def test_link_works_as_a_prefix_command_and_its_errors_get_a_reply(
     atcoder.add('FakeAtCoder')
 
     async def invoke(args: str) -> AsyncMock:
-        message = MagicMock(spec=discord.Message, guild=server.guild, author=member)
-        context: commands.Context[commands.Bot] = commands.Context(
-            message=message, bot=bot, view=StringView(args), prefix=';'
-        )
+        context = sent_at(bot, server, member, args, NOW)
         send = AsyncMock()
         context.send = send  # type: ignore[method-assign]
         link = command_named(bot, 'link')
@@ -998,6 +1027,58 @@ async def test_link_works_as_a_prefix_command_and_its_errors_get_a_reply(
         f"The token {TOKEN} isn't in the Affiliation of FakeAtCoder yet. "
         'Put it there at <https://atcoder.jp/settings>, save, then verify again.'
     )
+
+
+@pytest.mark.parametrize(
+    ('name', 'args'),
+    [
+        ('link codeforces', 'FakeCoder'),
+        ('link atcoder', 'FakeAtCoder'),
+        ('link verify', 'atcoder'),
+    ],
+)
+async def test_each_member_can_use_each_link_command_once_every_10_seconds(
+    bot: KcpcBot, server: Server, member: MagicMock, name: str, args: str
+) -> None:
+    # Each use asks Codeforces or AtCoder for a profile. discord.py applies a
+    # command's cooldown as it prepares to run it, on prefix and slash alike.
+    command = command_named(bot, name)
+    other = server.add_member(OTHER_MEMBER, 'Other Member')
+
+    await command.prepare(sent_at(bot, server, member, args, NOW))
+    with pytest.raises(commands.CommandOnCooldown) as raised:
+        await command.prepare(sent_at(bot, server, member, args, NOW + 9 * SECOND))
+    # Another member isn't held up, and the member can go again once the 10
+    # seconds are over.
+    await command.prepare(sent_at(bot, server, other, args, NOW + 9 * SECOND))
+    await command.prepare(sent_at(bot, server, member, args, NOW + 11 * SECOND))
+
+    assert raised.value.retry_after == pytest.approx(1)
+    assert raised.value.type is commands.BucketType.user
+
+
+async def test_a_cog_loaded_again_starts_without_cooldowns(
+    bot: KcpcBot,
+    services: KcpcServices,
+    user_db: UserDbConn,
+    server: Server,
+    member: MagicMock,
+) -> None:
+    # Each copy of a command that discord.py makes for a cog has cooldowns of
+    # its own, as after the bot restarts.
+    await command_named(bot, 'link verify').prepare(
+        sent_at(bot, server, member, 'atcoder', NOW)
+    )
+    await bot.remove_cog('KcpcAccounts')
+    again = await make_bot(services, user_db)
+    try:
+        await load_accounts(again)
+
+        await command_named(again, 'link verify').prepare(
+            sent_at(again, server, member, 'atcoder', NOW + SECOND)
+        )
+    finally:
+        await again.close()
 
 
 # /link verify
@@ -1202,6 +1283,8 @@ async def test_pressing_verify_links_the_account(
     button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
     atcoder.add('FakeAtCoder', affiliation=TOKEN)
     interaction = make_interaction(bot, server, member)
+    # Without TLE's access service, as KCPC runs on its own, no rules apply.
+    assert getattr(bot, 'access', None) is None
 
     await button.callback(interaction)
 
@@ -1246,6 +1329,58 @@ async def test_a_verify_button_that_fails_says_why(
     await button.callback(interaction)
 
     assert followup(interaction).description == str(DOWN)
+
+
+async def test_quick_presses_of_verify_ask_atcoder_once(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    atcoder: FakeAtCoder,
+    clock: FakeClock,
+) -> None:
+    # Each check asks for the profile, through limits that every member of
+    # every server shares, so the button keeps to /link verify's rate.
+    atcoder.add('FakeAtCoder')
+    atcoder.add('OtherAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    other = server.add_member(OTHER_MEMBER, 'Other Member')
+    others = await start_linking(bot, server, other, 'atcoder', 'OtherAtCoder')
+    first, again = (make_interaction(bot, server, member) for _ in range(2))
+
+    await button.callback(first)
+    await button.callback(again)
+    await others.callback(make_interaction(bot, server, other))
+
+    # The first finds no token yet; the second asks nothing, and says when to
+    # try again. Another member isn't held up.
+    assert str(followup(first).description).startswith(f"The token {TOKEN} isn't")
+    assert followup(again).description == 'You can verify again in 10 seconds.'
+    # Each once as its link started, then as each member verified.
+    assert atcoder.fetched == ['FakeAtCoder', 'OtherAtCoder'] * 2
+    await clock.advance(10 * SECOND)
+    await button.callback(make_interaction(bot, server, member))
+    assert atcoder.fetched[-1] == 'FakeAtCoder' and len(atcoder.fetched) == 5
+
+
+async def test_verify_and_its_button_share_one_rate(
+    bot: KcpcBot,
+    ctx: MagicMock,
+    server: Server,
+    member: MagicMock,
+    atcoder: FakeAtCoder,
+    clock: FakeClock,
+) -> None:
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    with pytest.raises(KcpcUserError, match="isn't in the Affiliation"):
+        await run(bot, 'link verify', ctx, 'atcoder')
+    await clock.advance(9 * SECOND)
+    press = make_interaction(bot, server, member)
+
+    await button.callback(press)
+
+    assert followup(press).description == 'You can verify again in 1 second.'
+    assert atcoder.fetched == ['FakeAtCoder', 'FakeAtCoder']
 
 
 async def test_a_codeforces_link_is_completed_if_discord_refuses_the_rank_roles(
@@ -1369,6 +1504,157 @@ async def test_a_restart_mid_verification_still_verifies_through_discord_py(
         await restarted.close()
 
 
+# Verify and the bot's access rules
+
+
+class FakeAccess:
+    """The bot's access service, as the Verify button asks it: every press
+    gets ``allowed``, and the service records what it was asked.
+    """
+
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.asked: list[tuple[discord.Interaction, str]] = []
+
+    async def component_allowed(
+        self, interaction: discord.Interaction, name: str
+    ) -> bool:
+        self.asked.append((interaction, name))
+        return self.allowed
+
+
+async def test_a_press_counts_as_a_use_of_link_verify_for_the_access_rules(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    repo: AccountRepo,
+    atcoder: FakeAtCoder,
+) -> None:
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    atcoder.add('FakeAtCoder', affiliation=TOKEN)
+    access = FakeAccess(allowed=True)
+    bot.access = access
+    interaction = make_interaction(bot, server, member)
+
+    await button.callback(interaction)
+
+    assert access.asked == [(interaction, VERIFY_COMMAND)]
+    assert VERIFY_COMMAND == 'link verify'
+    assert followup(interaction).colour == discord.Colour(SUCCESS_COLOR)
+    assert await repo.get_link(GUILD, MEMBER, 'atcoder') is not None
+
+
+async def test_a_press_the_access_rules_refuse_goes_no_further(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    repo: AccountRepo,
+    atcoder: FakeAtCoder,
+) -> None:
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    atcoder.add('FakeAtCoder', affiliation=TOKEN)
+    bot.access = FakeAccess(allowed=False)
+    interaction = make_interaction(bot, server, member)
+
+    await button.callback(interaction)
+
+    # The service has told the member why, so the button sends nothing.
+    interaction.response.defer.assert_not_awaited()
+    interaction.response.send_message.assert_not_awaited()
+    interaction.followup.send.assert_not_awaited()
+    assert atcoder.fetched == ['FakeAtCoder']  # only when the link started
+    assert await repo.get_link(GUILD, MEMBER, 'atcoder') is None
+    assert await repo.get_challenge(GUILD, MEMBER, 'atcoder') is not None
+
+
+def refusal(interaction: MagicMock) -> discord.Embed:
+    """The private answer to a press, before anything deferred it."""
+    interaction.response.defer.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once_with(
+        embed=ANY, ephemeral=True
+    )
+    embed = interaction.response.send_message.await_args.kwargs['embed']
+    assert isinstance(embed, discord.Embed)
+    return embed
+
+
+@pytest.mark.parametrize('key', ['link verify', 'link *'])
+async def test_a_press_is_refused_where_this_server_switched_link_verify_off(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    repo: AccountRepo,
+    atcoder: FakeAtCoder,
+    key: str,
+) -> None:
+    # The real access service, with a limit on the command or on its group.
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    atcoder.add('FakeAtCoder', affiliation=TOKEN)
+    access = AccessService(bot)
+    switched_off = Limit(off=True)
+    await access.change(GUILD, lambda settings: settings.with_limit(key, switched_off))
+    bot.access = access
+    interaction = make_interaction(bot, server, member)
+    interaction.guild_id = GUILD
+
+    await button.callback(interaction)
+
+    assert refusal(interaction).description == OFF_TEXT
+    assert atcoder.fetched == ['FakeAtCoder']
+    assert await repo.get_link(GUILD, MEMBER, 'atcoder') is None
+
+
+async def test_a_press_by_a_member_whom_a_limit_leaves_out_is_refused(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    repo: AccountRepo,
+    atcoder: FakeAtCoder,
+) -> None:
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    atcoder.add('FakeAtCoder', affiliation=TOKEN)
+    member.guild_permissions = discord.Permissions.none()
+    access = AccessService(bot)
+    moderators = Limit(who=Who.MODERATOR)
+    await access.change(
+        GUILD, lambda settings: settings.with_limit('link verify', moderators)
+    )
+    bot.access = access
+    interaction = make_interaction(bot, server, member)
+    interaction.guild_id = GUILD
+
+    await button.callback(interaction)
+
+    assert refusal(interaction).description == NOT_ALLOWED_MESSAGE
+    assert await repo.get_link(GUILD, MEMBER, 'atcoder') is None
+
+
+async def test_a_press_whose_access_check_fails_is_refused(
+    bot: KcpcBot,
+    server: Server,
+    member: MagicMock,
+    repo: AccountRepo,
+    atcoder: FakeAtCoder,
+) -> None:
+    atcoder.add('FakeAtCoder')
+    button = await start_linking(bot, server, member, 'atcoder', 'FakeAtCoder')
+    atcoder.add('FakeAtCoder', affiliation=TOKEN)
+    access = MagicMock()
+    access.component_allowed = AsyncMock(side_effect=RuntimeError('rules missing'))
+    bot.access = access
+    interaction = make_interaction(bot, server, member)
+
+    await button.callback(interaction)
+
+    # Logged as a bug, and nothing is verified.
+    assert refusal(interaction).description == UNEXPECTED_ERROR_MESSAGE
+    assert await repo.get_link(GUILD, MEMBER, 'atcoder') is None
+
+
 # /unlink
 
 
@@ -1403,10 +1689,11 @@ async def test_unlink_codeforces_points_to_the_moderators(
     with pytest.raises(KcpcUserError) as raised:
         await run(bot, 'unlink', ctx, 'codeforces')
 
+    # ;handle remove has no slash form: the slash list leaves out staff
+    # commands in members' groups.
     assert str(raised.value) == (
-        "Your Codeforces handle is shared with TLE's commands, such as gitgud, "
-        'duels and rank roles, so an Admin or Moderator unlinks it, with '
-        '/handle remove.'
+        'Your Codeforces handle is also used by gitgud, duels and rank roles, so '
+        'a moderator or admin unlinks it, with `;handle remove`.'
     )
     assert await user_db.get_handle(MEMBER, GUILD) == 'FakeCoder'
 

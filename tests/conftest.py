@@ -6,6 +6,19 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def fresh_refusal_throttle():
+    """Clears the error handler's throttle of prefix refusals before each test.
+
+    It lets a member at most one prefix refusal in a server every
+    ``REFUSAL_THROTTLE_SECONDS``, on the real clock, so a refusal sent in one
+    test would otherwise silence one in the next.
+    """
+    from tle.util import discord_common
+
+    discord_common.refusal_throttle.clear()
+
+
 @pytest.fixture
 async def user_db():
     from tle.util.db.user_db_conn import UserDbConn

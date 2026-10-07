@@ -97,6 +97,8 @@ _POST_STATES = {
     DeliveryStatus.CLAIMED: "Posted, but Discord hasn't confirmed it yet.",
     DeliveryStatus.SKIPPED: 'Refused by Discord: {reason}.',
 }
+# The brief of /algo current, which the prefix twin ;algo current shares.
+_CURRENT_BRIEF = 'Show the algorithm of the month'
 
 # How each outcome of a post is told. {post} names the post with its month, as
 # in "October's topic, **X**", and {subject} names it to begin a sentence:
@@ -187,29 +189,54 @@ class KcpcAlgo(KcpcCog):
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
-    @commands.hybrid_group(fallback='current', brief="This month's algorithm")  # type: ignore[arg-type]
+    @commands.hybrid_group(fallback='current', brief=_CURRENT_BRIEF)  # type: ignore[arg-type]
     @commands.guild_only()
     async def algo(self, ctx: commands.Context[Any]) -> None:
-        """Show this server's algorithm of the month, and where to read about it."""
+        """Show this server's algorithm of the month, and where to read about
+        it.
+
+        A new topic goes out on the 1st of each month at noon, in the club's
+        time zone.
+
+        Examples:
+            /algo current
+            ;algo
+        """
         await self._show_current(ctx)
 
     # The slash command is the group's fallback, which prefix commands lack.
     @commands.hybrid_command(  # type: ignore[arg-type]
-        name='current', with_app_command=False, brief="This month's algorithm"
+        name='current', with_app_command=False, brief=_CURRENT_BRIEF
     )
     async def current(self, ctx: commands.Context[Any]) -> None:
-        """Show this server's algorithm of the month, and where to read about it."""
+        """Show this server's algorithm of the month, and where to read about
+        it.
+
+        A new topic goes out on the 1st of each month at noon, in the club's
+        time zone.
+
+        Examples:
+            /algo current
+            ;algo current
+        """
         await self._show_current(ctx)
 
-    @commands.hybrid_command(name='history', brief='Earlier algorithms of the month')  # type: ignore[arg-type]
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        name='history', brief='List the earlier algorithms of the month'
+    )
     async def history(self, ctx: commands.Context[Any]) -> None:
-        """List this server's algorithms of the month, newest first."""
+        """List this server's algorithms of the month, newest first.
+
+        Examples:
+            /algo history
+            ;algo history
+        """
         guild = _guild(ctx)
         picks = await self._service.history(guild.id)
         await send_pages(ctx, self._history_pages(picks))
 
     @commands.hybrid_group(  # type: ignore[arg-type]
-        name='algo', brief='The algorithm of the month: reroll, post, preview'
+        name='algo', brief='Reroll, post or preview the algorithm of the month'
     )
     @kcpc_admin_only()
     async def algo_admin(self, ctx: commands.Context[Any]) -> None:
@@ -225,6 +252,10 @@ class KcpcAlgo(KcpcCog):
         The topic replaced counts as one the server hasn't had, so it can come
         up again. Without a topic this month yet, this posts one, as post-now
         does.
+
+        Examples:
+            /kcpc algo reroll
+            ;kcpc algo reroll
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -241,9 +272,12 @@ class KcpcAlgo(KcpcCog):
     async def post_now(self, ctx: commands.Context[Any]) -> None:
         """Post this month's topic now, if it hasn't gone out.
 
-        For a server that has just turned the feature on: the job posts on the
-        next 1st, and this posts the month's topic before then. Running it
-        again posts nothing twice.
+        Use it when the algorithm of the month has just been turned on, rather
+        than wait for the 1st. Running it again posts nothing twice.
+
+        Examples:
+            /kcpc algo post-now
+            ;kcpc algo post-now
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -257,12 +291,18 @@ class KcpcAlgo(KcpcCog):
         )
         await _reply(ctx, await self._post_reply(result))
 
-    @commands.hybrid_command(name='preview', brief='When the next topic goes out')  # type: ignore[arg-type]
+    @commands.hybrid_command(  # type: ignore[arg-type]
+        name='preview', brief="Preview the algorithm of the month's next post"
+    )
     @kcpc_admin_only()
     async def preview(self, ctx: commands.Context[Any]) -> None:
         """Show when and where the next topic goes, this month's topic and
         whether it went out, and how many topics are left before the list
         starts over.
+
+        Examples:
+            /kcpc algo preview
+            ;kcpc algo preview
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)

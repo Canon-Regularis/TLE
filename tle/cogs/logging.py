@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 
+import discord
 from discord.ext import commands
 
 from tle.util import ansi, discord_common
@@ -15,6 +16,9 @@ _ANSI_BY_LEVEL = {
     logging.ERROR: ansi.ANSI_RED,
     logging.CRITICAL: ansi.ANSI_BOLD_RED,
 }
+# The log channel's messages ping nobody, although a logged command or error
+# can name members, roles or @everyone.
+_NO_PINGS = discord.AllowedMentions.none()
 
 
 class Logging(commands.Cog, logging.Handler):
@@ -53,7 +57,7 @@ class Logging(commands.Cog, logging.Handler):
                         parts.append(f'Original Command: {message_content}')
                     if jump_url:
                         parts.append(f'Jump Url: {jump_url}')
-                    await channel.send('\n'.join(parts))
+                    await channel.send('\n'.join(parts), allowed_mentions=_NO_PINGS)
                 color = _ANSI_BY_LEVEL.get(record.levelno, ansi.ANSI_WHITE)
                 colored_msg = f'{color}{msg}{ansi.RESET}'
                 discord_msg_char_limit = 2000
@@ -61,9 +65,13 @@ class Logging(commands.Cog, logging.Handler):
                 char_limit = discord_msg_char_limit - len(wrapper)
                 too_long = len(colored_msg) > char_limit
                 colored_msg = colored_msg[:char_limit]
-                await channel.send(f'```ansi\n{colored_msg}```')
+                await channel.send(
+                    f'```ansi\n{colored_msg}```', allowed_mentions=_NO_PINGS
+                )
                 if too_long:
-                    await channel.send('`Check logs for full stack trace`')
+                    await channel.send(
+                        '`Check logs for full stack trace`', allowed_mentions=_NO_PINGS
+                    )
             except Exception:
                 self.handleError(record)
 
