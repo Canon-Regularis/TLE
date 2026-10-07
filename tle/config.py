@@ -1,7 +1,7 @@
 """Bot settings read from the environment (see .env.example and README.md).
 
-TLE's older settings live in ``tle.constants``; new ones are read here, once, by
-``Settings.from_env()`` at startup.
+TLE's roles and older settings live in ``tle.constants``; new ones are read
+here, once, by ``Settings.from_env()`` at startup.
 """
 
 import os
@@ -25,6 +25,7 @@ class Settings:
 
     kcpc_timezone: str = DEFAULT_TIMEZONE
     disabled_extensions: frozenset[str] = frozenset()
+    allowed_guild_ids: frozenset[int] = frozenset()  # empty: any server
     http_user_agent: str = DEFAULT_HTTP_USER_AGENT
     luma_calendar_id: str | None = None
     icpc_contest_codes: tuple[str, ...] = DEFAULT_ICPC_CONTEST_CODES
@@ -56,6 +57,8 @@ class Settings:
         - ``KCPC_TIMEZONE``: an IANA zone name, e.g. ``Europe/London``.
         - ``DISABLED_EXTENSIONS``: comma-separated extension names or families,
           e.g. ``tle.duel,kcpc``; see ``tle.extensions``.
+        - ``ALLOWED_GUILD_IDS``: comma-separated IDs of the servers the bot may
+          be used in; with none, it may be used in any.
         - ``HTTP_USER_AGENT``: the User-Agent of KCPC's requests to other sites,
           except where a host policy sets its own (codeforces.com pages are
           fetched with a browser's User-Agent).
@@ -67,7 +70,8 @@ class Settings:
         Values and list items are stripped, empty list items are dropped, and
         extension names are lowercased. A variable that is unset or blank, or
         a list with no items, keeps its default (None if there is no other).
-        Raises ``ConfigError`` for an unknown time zone.
+        Raises ``ConfigError`` for an unknown time zone, or for an item of
+        ``ALLOWED_GUILD_IDS`` that isn't a server ID.
         """
         env = os.environ if env is None else env
         db_path = _value(env, 'KCPC_DB_PATH')
@@ -76,6 +80,7 @@ class Settings:
             disabled_extensions=frozenset(
                 name.lower() for name in _items(env, 'DISABLED_EXTENSIONS')
             ),
+            allowed_guild_ids=_guild_ids(_items(env, 'ALLOWED_GUILD_IDS')),
             http_user_agent=_value(env, 'HTTP_USER_AGENT') or DEFAULT_HTTP_USER_AGENT,
             luma_calendar_id=_value(env, 'LUMA_CALENDAR_ID'),
             icpc_contest_codes=(
@@ -96,3 +101,16 @@ def _items(env: Mapping[str, str], name: str) -> tuple[str, ...]:
     """The comma-separated items of ``name``, stripped, without empty ones."""
     items = (item.strip() for item in env.get(name, '').split(','))
     return tuple(item for item in items if item)
+
+
+def _guild_ids(items: tuple[str, ...]) -> frozenset[int]:
+    """``items``, the items of ``ALLOWED_GUILD_IDS``, as server IDs.
+
+    Raises ``ConfigError`` for an item that isn't one.
+    """
+    for item in items:
+        # Digits only (int() would also take a sign, underscores or another
+        # script's digits), and at most 20, as a Discord ID is a 64-bit number.
+        if not (item.isascii() and item.isdigit() and len(item) <= 20):
+            raise ConfigError(f"ALLOWED_GUILD_IDS: '{item}' is not a server ID")
+    return frozenset(int(item) for item in items)
