@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from matplotlib import pyplot as plt
 
@@ -25,6 +26,8 @@ _DUEL_EXPIRY_TIME = 5 * 60
 _DUEL_RATING_DELTA = -400
 _DUEL_NO_DRAW_TIME = 10 * 60
 _ELO_CONSTANT = 60
+# The most duels that duel recent lists.
+_RECENT_DUELS = 7
 
 DuelRank = namedtuple('DuelRank', 'low high title title_abbr color_graph color_embed')
 
@@ -63,11 +66,42 @@ def elo_delta(player: float, opponent: float, win: float) -> float:
 
 def check_if_allow_self_register(ctx: commands.Context) -> bool:
     if not constants.ALLOW_DUEL_SELF_REGISTER:
-        raise DuelCogError('Self Registration is not enabled.')
+        raise DuelCogError(
+            'Self-registration is switched off. Ask a moderator to register you.'
+        )
     return True
 
 
+def _are_members(guild: discord.Guild, *user_ids: int) -> bool:
+    """Whether every one of ``user_ids`` is a member of ``guild``.
+
+    The duel tables don't record the server a duel was fought in, so a
+    server's lists of duels hold those whose two duelists are its members.
+    """
+    return all(guild.get_member(user_id) is not None for user_id in user_ids)
+
+
+async def _button_allowed(interaction: discord.Interaction, command: str) -> bool:
+    """Whether the access rules let the member press a button of ``command``,
+    such as 'duel accept'; if not, the access service has told them why.
+
+    A bot without an access service lets every press through.
+    """
+    access = getattr(interaction.client, 'access', None)
+    if access is None:
+        return True
+    return bool(await access.component_allowed(interaction, command))
+
+
 class DuelChallengeView(discord.ui.View):
+    """The Accept, Decline and Withdraw buttons of a challenge to a duel.
+
+    Each button counts as its command (duel accept, duel decline or duel
+    withdraw) for the access rules: who may use it, and whether this server
+    switched it off. Channels don't count, as the challenge was posted where
+    duels are allowed.
+    """
+
     def __init__(
         self,
         bot: commands.Bot,
@@ -96,6 +130,8 @@ class DuelChallengeView(discord.ui.View):
     async def accept_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[Any]
     ) -> None:
+        if not await _button_allowed(interaction, 'duel accept'):
+            return
         if interaction.user.id != self.challengee_id:
             await interaction.response.send_message(
                 'Only the challenged user can accept.',
@@ -138,6 +174,8 @@ class DuelChallengeView(discord.ui.View):
     async def decline_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[Any]
     ) -> None:
+        if not await _button_allowed(interaction, 'duel decline'):
+            return
         if interaction.user.id != self.challengee_id:
             await interaction.response.send_message(
                 'Only the challenged user can decline.',
@@ -162,6 +200,8 @@ class DuelChallengeView(discord.ui.View):
     async def withdraw_button(
         self, interaction: discord.Interaction, button: discord.ui.Button[Any]
     ) -> None:
+        if not await _button_allowed(interaction, 'duel withdraw'):
+            return
         if interaction.user.id != self.challenger_id:
             await interaction.response.send_message(
                 'Only the challenger can withdraw.',
@@ -230,7 +270,8 @@ class Dueling(commands.Cog):
             duelid, win_status, finish_time, winner.id, loser.id, delta, dtype
         )
         if rc == 0:
-            raise DuelCogError('Hey! No cheating!')
+            # Its other duelist ended it first, or it was invalidated.
+            raise DuelCogError('This duel has already ended.')
 
         if dtype == DuelType.UNOFFICIAL:
             return None
@@ -254,48 +295,79 @@ class Dueling(commands.Cog):
         )
         return embed
 
-    @commands.hybrid_group(brief='Duel commands', fallback='show')
+    @commands.hybrid_group(brief='Show the duel commands', fallback='show')
     async def duel(self, ctx: commands.Context) -> None:
-        """Group for commands pertaining to duels"""
+        """Show the duel commands.
+
+        In a duel, two members race to solve the same Codeforces problem, and
+        the first to solve it wins. Register with /duel selfregister, or ask a
+        moderator to register you if self-registration is switched off, then
+        challenge someone with ;duel challenge.
+
+        Examples:
+            /duel show
+            ;duel
+        """
         await ctx.send_help(ctx.command)
 
-    @duel.command(brief='Register a duelist')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @duel.command(brief='Register a member as a duelist')
+    @app_commands.describe(member='The member to register')
     async def register(self, ctx: commands.Context, member: discord.Member) -> None:
-        """Register a duelist"""
+        """Register a member as a duelist, so that they can take part in duels.
+
+        Examples:
+            ;duel register @alice
+        """
         rc = await self.bot.user_db.register_duelist(member.id)
         if rc == 0:
-            raise DuelCogError(f'{member.mention} is already a registered duelist')
+            raise DuelCogError(f'{member.mention} is already a registered duelist.')
         await ctx.send(f'{member.mention} successfully registered as a duelist.')
 
     @duel.command(brief='Register yourself as a duelist')
     @commands.check(check_if_allow_self_register)
     async def selfregister(self, ctx: commands.Context) -> None:
-        """Register yourself as a duelist"""
+        """Register yourself as a duelist, so that you can take part in duels,
+        if the bot allows it; otherwise ask a moderator to register you. Link
+        your Codeforces account with /link codeforces first.
+
+        Examples:
+            /duel selfregister
+        """
         if not await self.bot.user_db.get_handle(ctx.author.id, ctx.guild.id):
             raise DuelCogError(
-                f'{ctx.author.mention}, you cannot register yourself'
-                ' as a duelist without setting your handle.'
+                f'{ctx.author.mention}, link your Codeforces account with'
+                ' `/link codeforces` before you register as a duelist.'
             )
         rc = await self.bot.user_db.register_duelist(ctx.author.id)
         if rc == 0:
-            raise DuelCogError(f'{ctx.author.mention} is already a registered duelist')
-        await ctx.send(f'{ctx.author.mention} successfully registered as a duelist')
+            raise DuelCogError(f'{ctx.author.mention} is already a registered duelist.')
+        await ctx.send(f'{ctx.author.mention} successfully registered as a duelist.')
 
+    # The help quotes the constants above, so it is an f-string passed as
+    # help=, not a docstring. A challenge asks Codeforces for both duelists'
+    # submissions, so it has a cooldown, which a mistyped one doesn't spend.
     @duel.command(
-        brief='Challenge to a duel',
-        usage='opponent [rating] [+tag..] [~tag..]',
+        brief='Challenge a member to a duel',
+        usage='<opponent> [rating] [+tag...] [~tag...]',
         with_app_command=False,
+        cooldown_after_parsing=True,
+        help=f"""Challenge a member to a duel on a Codeforces problem that neither
+        of you has solved, rated about {-_DUEL_RATING_DELTA} below the lower of
+        your Codeforces ratings unless you give a rating. A higher rating, or
+        tags to include (+tag) or leave out (~tag), make the duel unofficial: it
+        changes no duel ratings. The challenge expires after
+        {cf_common.pretty_time_format(_DUEL_EXPIRY_TIME)}.
+
+        Examples:
+            ;duel challenge @alice
+            ;duel challenge @alice 1600
+            ;duel challenge @alice +greedy ~math
+        """,
     )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def challenge(
         self, ctx: commands.Context, opponent: discord.Member, *args: str
     ) -> None:
-        """Challenge another server member to a duel. Problem difficulty will
-        be the lesser of duelist ratings minus 400. You can alternatively
-        specify a different rating. The duel will be unrated if specified
-        rating is above the default value or tags are used to choose a problem.
-        The challenge expires if ignored for 5 minutes.
-        """
         challenger_id = ctx.author.id
         challengee_id = opponent.id
 
@@ -307,7 +379,6 @@ class Dueling(commands.Cog):
             await self.bot.user_db.get_handle(userid, ctx.guild.id)
             for userid in userids
         ]
-        submissions = [await cf.user.status(handle=handle) for handle in handles]
 
         if not await self.bot.user_db.is_duelist(challenger_id):
             raise DuelCogError(
@@ -322,6 +393,8 @@ class Dueling(commands.Cog):
         if await self.bot.user_db.check_duel_challenge(challengee_id):
             raise DuelCogError(f'{opponent.mention} is currently in a duel!')
 
+        # Only now, so that a refused challenge asks Codeforces nothing.
+        submissions = [await cf.user.status(handle=handle) for handle in handles]
         tags = cf_common.parse_tags(args, prefix='+')
         bantags = cf_common.parse_tags(args, prefix='~')
         rating = cf_common.parse_rating(args)
@@ -367,7 +440,7 @@ class Dueling(commands.Cog):
         rstr = f'{rating} rated ' if rating else ''
         if not problems:
             raise DuelCogError(
-                f'No unsolved {rstr} problems left for'
+                f'No unsolved {rstr}problems left for'
                 f' {ctx.author.mention} vs {opponent.mention}.'
             )
 
@@ -402,8 +475,14 @@ class Dueling(commands.Cog):
             view=view,
         )
 
-    @duel.command(brief='Decline a duel')
+    @duel.command(brief='Decline a challenge to a duel')
     async def decline(self, ctx: commands.Context) -> None:
+        """Decline the challenge to a duel that you received. The Decline button
+        under the challenge does the same.
+
+        Examples:
+            /duel decline
+        """
         active = await self.bot.user_db.check_duel_decline(ctx.author.id)
         if not active:
             raise DuelCogError(f'{ctx.author.mention}, you are not being challenged!')
@@ -411,14 +490,18 @@ class Dueling(commands.Cog):
         duelid, challenger = active
         challenger = ctx.guild.get_member(challenger)
         await self.bot.user_db.cancel_duel(duelid, Duel.DECLINED)
-        message = (
-            f'`{ctx.author.mention}` declined a challenge by {challenger.mention}.'
-        )
+        message = f'{ctx.author.mention} declined a challenge by {challenger.mention}.'
         embed = discord_common.embed_alert(message)
         await ctx.send(embed=embed)
 
-    @duel.command(brief='Withdraw a challenge')
+    @duel.command(brief='Withdraw your challenge to a duel')
     async def withdraw(self, ctx: commands.Context) -> None:
+        """Withdraw your challenge to a duel before it is accepted. The Withdraw
+        button under the challenge does the same.
+
+        Examples:
+            /duel withdraw
+        """
         active = await self.bot.user_db.check_duel_withdraw(ctx.author.id)
         if not active:
             raise DuelCogError(f'{ctx.author.mention}, you are not challenging anyone.')
@@ -426,14 +509,19 @@ class Dueling(commands.Cog):
         duelid, challengee = active
         challengee = ctx.guild.get_member(challengee)
         await self.bot.user_db.cancel_duel(duelid, Duel.WITHDRAWN)
-        message = (
-            f'{ctx.author.mention} withdrew a challenge to `{challengee.mention}`.'
-        )
+        message = f'{ctx.author.mention} withdrew a challenge to {challengee.mention}.'
         embed = discord_common.embed_alert(message)
         await ctx.send(embed=embed)
 
-    @duel.command(brief='Accept a duel')
+    @duel.command(brief='Accept a challenge to a duel')
     async def accept(self, ctx: commands.Context) -> None:
+        """Accept the challenge to a duel that you received. The duel and its
+        problem start 15 seconds later. The Accept button under the challenge
+        does the same.
+
+        Examples:
+            /duel accept
+        """
         active = await self.bot.user_db.check_duel_accept(ctx.author.id)
         if not active:
             raise DuelCogError(f'{ctx.author.mention}, you are not being challenged.')
@@ -463,8 +551,16 @@ class Dueling(commands.Cog):
             f'Starting duel: {challenger.mention} vs {ctx.author.mention}', embed=embed
         )
 
-    @duel.command(brief='Complete a duel')
+    @duel.command(brief='End your duel once one of you has solved its problem')
+    @commands.cooldown(1, 10, commands.BucketType.user)
     async def complete(self, ctx: commands.Context) -> None:
+        """End your duel once one of you has solved its problem on Codeforces:
+        the first to solve it wins. An official duel changes both duelists'
+        duel ratings.
+
+        Examples:
+            /duel complete
+        """
         active = await self.bot.user_db.check_duel_complete(ctx.author.id)
         if not active:
             raise DuelCogError(f'{ctx.author.mention}, you are not in a duel.')
@@ -501,8 +597,11 @@ class Dueling(commands.Cog):
                 subs, key=lambda sub: sub.creationTimeSeconds
             ).creationTimeSeconds
 
-        challenger_time = await get_solve_time(challenger_id)
-        challengee_time = await get_solve_time(challengee_id)
+        # Codeforces can take longer to answer than the 3 seconds a slash
+        # command has, so the answer is deferred first.
+        async with ctx.typing():
+            challenger_time = await get_solve_time(challenger_id)
+            challengee_time = await get_solve_time(challengee_id)
 
         if challenger_time == TESTING or challengee_time == TESTING:
             await ctx.send(
@@ -588,7 +687,17 @@ class Dueling(commands.Cog):
         else:
             await ctx.send('Nobody solved the problem yet.')
 
-    @duel.command(brief='Offer/Accept a draw')
+    # The help quotes a constant above, as challenge's does.
+    @duel.command(
+        brief='Offer a draw, or accept the draw offered to you',
+        help=f"""Offer your opponent a draw, or accept the draw they offered. You
+        can offer one once the duel has lasted
+        {cf_common.pretty_time_format(_DUEL_NO_DRAW_TIME)}.
+
+        Examples:
+            /duel draw
+        """,
+    )
     async def draw(self, ctx: commands.Context) -> None:
         active = await self.bot.user_db.check_duel_draw(ctx.author.id)
         if not active:
@@ -629,10 +738,18 @@ class Dueling(commands.Cog):
             embed=embed,
         )
 
-    @duel.command(brief='Show duelist profile')
+    @duel.command(brief="Show a duelist's duel rating and record")
+    @app_commands.describe(member='The duelist whose profile to show; you if left out')
     async def profile(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
+        """Show a duelist's duel rating, their wins, losses and draws, and their
+        fastest and slowest wins.
+
+        Examples:
+            /duel profile
+            /duel profile member:@alice
+        """
         assert isinstance(ctx.author, discord.Member)
         member = member or ctx.author
         if not await self.bot.user_db.is_duelist(member.id):
@@ -735,15 +852,28 @@ class Dueling(commands.Cog):
 
         return [await make_page(chunk) for chunk in paginator.chunkify(data, 7)]
 
-    @duel.command(brief='Print head to head dueling history', aliases=['versushistory'])
+    @duel.command(brief='Show the duels between two members', aliases=['versushistory'])
+    @app_commands.describe(
+        member1='One of the two members; name at least this one',
+        member2='The other member; you if left out',
+    )
     async def vshistory(
         self,
         ctx: commands.Context,
         member1: discord.Member | None = None,
         member2: discord.Member | None = None,
     ) -> None:
+        """Show the duels finished between two members, and how many each won.
+        Name one member to see their duels with you.
+
+        Examples:
+            /duel vshistory member1:@alice
+            /duel vshistory member1:@alice member2:@bob
+        """
         if not member1:
-            raise DuelCogError('You need to specify one or two discord members.')
+            raise DuelCogError(
+                'Name a member to see your duels with them, or two members.'
+            )
 
         assert isinstance(ctx.author, discord.Member)
         member2 = member2 or ctx.author
@@ -771,15 +901,22 @@ class Dueling(commands.Cog):
             ctx=ctx,
         )
 
-    @duel.command(brief='Print user dueling history')
+    @duel.command(brief="Show a member's finished duels")
+    @app_commands.describe(member='The member whose duels to show; you if left out')
     async def history(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
+        """Show a member's finished duels, the newest first.
+
+        Examples:
+            /duel history
+            /duel history member:@alice
+        """
         assert isinstance(ctx.author, discord.Member)
         member = member or ctx.author
         data = await self.bot.user_db.get_duels(member.id)
         message = discord.utils.escape_mentions(
-            f'dueling history of `{member.display_name}`'
+            f'Finished duels of `{member.display_name}`'
         )
         pages = await self._paginate_duels(data, message, ctx.guild.id, False)
         await paginator.paginate(
@@ -790,11 +927,37 @@ class Dueling(commands.Cog):
             ctx=ctx,
         )
 
-    @duel.command(brief='Print recent duels')
+    async def _recent_duels(self, guild: discord.Guild) -> list[Any]:
+        """The latest finished duels between members of ``guild``, at most
+        _RECENT_DUELS of them, the newest first, as the duels table orders
+        them: by start time.
+
+        Each member's duels are read, rather than the latest duels of every
+        server, so that other servers' duels can't crowd this server's out.
+        """
+        found: dict[int, Any] = {}
+        for user_id, _rating in await self.bot.user_db.get_duelists():
+            if guild.get_member(user_id) is None:
+                continue
+            for entry in await self.bot.user_db.get_duels(user_id):
+                duelid, _, _, _, challenger, challengee, _ = entry
+                if _are_members(guild, challenger, challengee):
+                    found[duelid] = entry
+        newest = sorted(
+            found.values(), key=lambda entry: (entry[1], entry[0]), reverse=True
+        )
+        return newest[:_RECENT_DUELS]
+
+    @duel.command(brief="Show this server's most recent duels")
     async def recent(self, ctx: commands.Context) -> None:
-        data = await self.bot.user_db.get_recent_duels()
+        """Show the latest finished duels between members of this server.
+
+        Examples:
+            /duel recent
+        """
+        data = await self._recent_duels(ctx.guild)
         pages = await self._paginate_duels(
-            data, 'list of recent duels', ctx.guild.id, True
+            data, 'Recent duels in this server', ctx.guild.id, True
         )
         await paginator.paginate(
             ctx.channel,
@@ -804,10 +967,21 @@ class Dueling(commands.Cog):
             ctx=ctx,
         )
 
-    @duel.command(brief='Print list of ongoing duels')
+    @duel.command(brief='Show the duels going on in this server')
+    @app_commands.describe(
+        member='The member whose duel to show; every duel in this server if left out'
+    )
     async def ongoing(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
+        """Show the duels going on between members of this server, or only a
+        given member's duel.
+
+        Examples:
+            /duel ongoing
+            /duel ongoing member:@alice
+        """
+
         async def make_line(entry: Any) -> str:
             start_time, name, challenger, challengee = entry
             problem = self.bot.cf_cache.problem_cache.problem_by_name[name]
@@ -824,17 +998,26 @@ class Dueling(commands.Cog):
             )
 
         async def make_page(chunk: Sequence[Any]) -> tuple[str, discord.Embed]:
-            message = 'List of ongoing duels:'
+            message = 'Ongoing duels in this server'
             lines = [await make_line(entry) for entry in chunk]
             log_str = '\n'.join(lines)
             embed = discord_common.cf_color_embed(description=log_str)
             return message, embed
 
-        assert isinstance(ctx.author, discord.Member)
-        member = member or ctx.author
-        data = await self.bot.user_db.get_ongoing_duels()
+        def shown(entry: Any) -> bool:
+            _start_time, _name, challenger, challengee = entry
+            if not _are_members(ctx.guild, challenger, challengee):
+                return False
+            return member is None or member.id in (challenger, challengee)
+
+        duels = await self.bot.user_db.get_ongoing_duels()
+        data = [entry for entry in duels if shown(entry)]
         if not data:
-            raise DuelCogError('There are no ongoing duels.')
+            if member is not None:
+                raise DuelCogError(
+                    f'{member.mention} has no ongoing duel in this server.'
+                )
+            raise DuelCogError('There are no ongoing duels in this server.')
 
         pages = [await make_page(chunk) for chunk in paginator.chunkify(data, 7)]
         await paginator.paginate(
@@ -845,9 +1028,14 @@ class Dueling(commands.Cog):
             ctx=ctx,
         )
 
-    @duel.command(brief='Show duelists')
+    @duel.command(brief="Rank this server's duelists by duel rating")
     async def ranklist(self, ctx: commands.Context) -> None:
-        """Show the list of duelists with their duel rating."""
+        """Rank this server's duelists by duel rating. Only those who have
+        finished a duel are listed.
+
+        Examples:
+            /duel ranklist
+        """
         user_pairs = [
             (ctx.guild.get_member(user_id), rating)
             for user_id, rating in await self.bot.user_db.get_duelists()
@@ -913,26 +1101,41 @@ class Dueling(commands.Cog):
             f' {challengee.mention} has been invalidated.'
         )
 
-    @duel.command(brief='Invalidate the duel')
+    # The help quotes a constant above, as challenge's does.
+    @duel.command(
+        brief='Invalidate your duel if you had solved its problem before it began',
+        help=f"""Invalidate your duel if you had solved its problem before the
+        duel began. An invalid duel has no winner and changes no ratings. You
+        can invalidate a duel only in its first
+        {cf_common.pretty_time_format(_DUEL_INVALIDATE_TIME)}.
+
+        Examples:
+            /duel invalidate
+        """,
+    )
     async def invalidate(self, ctx: commands.Context) -> None:
-        """Declare your duel invalid. Use this if you've solved the problem
-        prior to the duel. You can only use this functionality during the first
-        60 seconds of the duel."""
         active = await self.bot.user_db.check_duel_complete(ctx.author.id)
         if not active:
             raise DuelCogError(f'{ctx.author.mention}, you are not in a duel.')
 
         duelid, challenger_id, challengee_id, start_time, _, _, _, _ = active
         if datetime.datetime.now().timestamp() - start_time > _DUEL_INVALIDATE_TIME:
+            window = cf_common.pretty_time_format(_DUEL_INVALIDATE_TIME)
             raise DuelCogError(
-                f'{ctx.author.mention}, you can no longer invalidate your duel.'
+                f'{ctx.author.mention}, you can invalidate a duel only in its'
+                f' first {window}.'
             )
         await self.invalidate_duel(ctx, duelid, challenger_id, challengee_id)
 
-    @duel.command(brief='Invalidate a duel', usage='[duelist]')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @duel.command(brief="Invalidate a member's ongoing duel")
+    @app_commands.describe(member='A member in the duel to invalidate')
     async def _invalidate(self, ctx: commands.Context, member: discord.Member) -> None:
-        """Declare an ongoing duel invalid."""
+        """Invalidate a member's ongoing duel: it ends with no winner and
+        changes no ratings.
+
+        Examples:
+            ;duel _invalidate @alice
+        """
         active = await self.bot.user_db.check_duel_complete(member.id)
         if not active:
             raise DuelCogError(f'{member.mention} is not in a duel.')
@@ -940,9 +1143,22 @@ class Dueling(commands.Cog):
         duelid, challenger_id, challengee_id, _, _, _, _, _ = active
         await self.invalidate_duel(ctx, duelid, challenger_id, challengee_id)
 
-    @duel.command(brief='Plot rating', usage='[duelist]', with_app_command=False)
+    # Plotting is slow, so it has a cooldown, which a mistyped member doesn't
+    # spend.
+    @duel.command(
+        brief='Plot the duel ratings of up to 5 members',
+        with_app_command=False,
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def rating(self, ctx: commands.Context, *members: discord.Member) -> None:
-        """Plot duelist's rating."""
+        """Plot how the duel ratings of up to 5 members changed over their
+        official duels; yours if you name nobody.
+
+        Examples:
+            ;duel rating
+            ;duel rating @alice @bob
+        """
         assert isinstance(ctx.author, discord.Member)
         members = members or (ctx.author,)
         if len(members) > 5:
