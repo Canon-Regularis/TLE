@@ -73,6 +73,17 @@ def namedtuple_factory(cursor: Any, row: tuple[Any, ...]) -> Any:
     return Row(*row)
 
 
+def _guild_id_from_text(value: object) -> int | None:
+    """Returns the guild id that value holds as str(int) text, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        guild_id = int(value)
+    except ValueError:
+        return None
+    return guild_id if str(guild_id) == value else None
+
+
 # Allowlists for table/column names used in _insert_one/_insert_many
 _VALID_TABLES = frozenset(
     {
@@ -272,6 +283,14 @@ class UserDbConn:
                 PRIMARY KEY (original_msg_id, emoji)
             )
          """)
+
+        # Command access settings: one JSON document per server.
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS access_settings (
+                guild_id TEXT PRIMARY KEY,
+                settings TEXT NOT NULL
+            )
+        """)
 
         # === one-time migration from old tables ===
         cursor = await self.conn.execute(
@@ -694,6 +713,10 @@ class UserDbConn:
             (guild_id, emoji),
         )
         emo = await cursor.fetchone()
+        if not emo:
+            # A channel was set for an emoji that was never added, or was
+            # deleted: nothing to repost with.
+            return None
         return (int(cfg[0]), int(emo[0]), int(emo[1]))
 
     async def add_starboard_emoji(
@@ -1342,6 +1365,40 @@ class UserDbConn:
         cursor = await self.conn.execute(query, (user_id, vc_id))
         await self.conn.commit()
         return cursor.rowcount
+
+    # Access settings
+
+    async def get_all_access_settings(self) -> list[tuple[int, str]]:
+        """Returns every server's (guild id, settings) row, sorted by guild id.
+
+        A row that set_access_settings could not have written raises ValueError
+        instead of being skipped, since skipping it could drop a server's limits.
+        """
+        query = 'SELECT guild_id, settings FROM access_settings'
+        cursor = await self.conn.execute(query)
+        rows: list[tuple[int, str]] = []
+        for guild_id, settings in await cursor.fetchall():
+            parsed = _guild_id_from_text(guild_id)
+            if parsed is None or not isinstance(settings, str):
+                raise ValueError(
+                    f'Unreadable access_settings row for guild {guild_id!r}'
+                )
+            rows.append((parsed, settings))
+        return sorted(rows)
+
+    async def set_access_settings(self, guild_id: int, settings: str) -> None:
+        """Stores a server's access settings, replacing any it had."""
+        # Other types could store a row that makes every later read fail.
+        if type(guild_id) is not int:
+            raise TypeError(f'guild_id must be an int, not {type(guild_id).__name__}')
+        if not isinstance(settings, str):
+            raise TypeError(f'settings must be a str, not {type(settings).__name__}')
+        query = """
+            INSERT OR REPLACE INTO access_settings (guild_id, settings)
+            VALUES (?, ?)
+        """
+        await self.conn.execute(query, (str(guild_id), settings))
+        await self.conn.commit()
 
     async def close(self) -> None:
         if self.conn:
