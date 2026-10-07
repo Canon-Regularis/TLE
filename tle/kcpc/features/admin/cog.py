@@ -2,9 +2,15 @@
 
 Every admin command lives under ``/kcpc`` because Discord can only hide
 top-level commands: the group asks Discord to show it only to members with
-Manage Server, and ``cog_check`` makes sure on every invocation.
+Manage Server. Each command also has a check of its own, which discord.py runs
+on every invocation: ``kcpc_admin_only``, or ``kcpc_status_only`` for
+``/kcpc status``, which TLE's developers may use too. Only the bot owner sees
+KCPC's extensions and jobs in the status, since they concern every server the
+bot is in, and only on ``/kcpc status``, whose answer is private: ``;kcpc
+status`` answers the whole staff channel.
 """
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,7 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from tle.kcpc.bot.admin import permission_names, ping_role_problem
-from tle.kcpc.bot.checks import ensure_kcpc_admin
+from tle.kcpc.bot.checks import kcpc_admin_only, kcpc_status_only
 from tle.kcpc.bot.cog import KcpcCog
 from tle.kcpc.bot.embeds import success_embed, to_embed
 from tle.kcpc.bot.publisher import PostChannel, can_ping_role, missing_post_permissions
@@ -25,9 +31,12 @@ from tle.kcpc.core.scheduler import JobStatus
 from tle.kcpc.core.settings import FeatureSettings, FeatureSpec
 from tle.kcpc.core.timeutil import discord_timestamp
 
+logger = logging.getLogger(__name__)
+
 _MAX_CHOICES = 25  # the most autocomplete suggestions Discord shows
 _RECENT_SKIPS = 5
 _KCPC_MODULE_PREFIX = 'tle.kcpc.'
+_FEATURE_DESCRIPTION = 'The KCPC feature, such as workshops: pick one as you type'
 
 # `/kcpc role`'s optional role. It converts as a plain Role rather than as an
 # Optional one, because a prefix command reads text that names no role as "no
@@ -48,17 +57,21 @@ _MENTION_FIX = (
     '"Mention @everyone, @here and All Roles" permission'
 )
 
+# What /kcpc status says in place of what only the bot owner sees: to others,
+# and to the owner on ;kcpc status, which the staff channel sees.
+OWNER_ONLY_NOTE = (
+    'Extensions, jobs and their last errors are shown only to the bot owner.'
+)
+OWNER_PREFIX_NOTE = "Use /kcpc status to see KCPC's extensions and jobs privately."
+
 
 class KcpcAdmin(KcpcCog):
-    """Admin commands: show, status, channel, role, enable and disable."""
+    """Admin commands: show, status, channel, role, enable and disable.
 
-    async def cog_check(self, ctx: commands.Context[Any]) -> bool:
-        """Admit KCPC admins only, else raise ``NotKcpcAdmin``.
-
-        discord.py runs this for prefix and slash invocations of every command
-        here, so it holds even where an admin has shown /kcpc to other members.
-        """
-        return await ensure_kcpc_admin(ctx)
+    Each has its own check, which discord.py runs for prefix and slash
+    invocations alike, so it holds even where an admin has shown /kcpc to
+    other members.
+    """
 
     async def feature_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -77,10 +90,21 @@ class KcpcAdmin(KcpcCog):
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
-    @commands.hybrid_group(brief='KCPC club settings', fallback='show')  # type: ignore[arg-type]
+    @commands.hybrid_group(  # type: ignore[arg-type]
+        brief="Show this server's settings for every KCPC feature", fallback='show'
+    )
     @app_commands.default_permissions(manage_guild=True)
+    @kcpc_admin_only()
     async def kcpc(self, ctx: commands.Context[Any]) -> None:
-        """Show this server's settings for every KCPC feature."""
+        """Show this server's settings for every KCPC feature.
+
+        Each feature shows whether it is on, its channel and its ping role, with
+        a warning for each setup problem.
+
+        Examples:
+            /kcpc show
+            ;kcpc
+        """
         guild = _guild(ctx)
         services = self.services
         stored = await services.guild_settings.all_for_guild(guild.id)
@@ -99,20 +123,52 @@ class KcpcAdmin(KcpcCog):
         )
         await _reply(ctx, to_embed(message))
 
-    @kcpc.command(brief='KCPC health: database, jobs, post counts and skips')  # type: ignore[arg-type]
+    @kcpc.command(brief='Show KCPC health: post counts and skipped posts')  # type: ignore[arg-type]
+    @kcpc_status_only()
     async def status(self, ctx: commands.Context[Any]) -> None:
-        """Show KCPC's database, jobs, and the server's post counts and recent skips."""
+        """Show how KCPC is doing in this server.
+
+        You see this server's post counts and latest skipped posts, the
+        database's schema version and the time zone. The bot owner also sees
+        KCPC's extensions and jobs, with their last errors, on /kcpc status,
+        whose answer only they see.
+
+        Examples:
+            /kcpc status
+        """
         guild = _guild(ctx)
         services = self.services
         version = await schema_version(services.db)
         counts = await services.ledger.status_counts(guild.id)
         skips = await services.ledger.recent_skips(guild.id, limit=_RECENT_SKIPS)
+        owner = await _is_owner(self.bot, ctx.author)
+        # Only a slash command's answer is private: the staff channel sees the
+        # answer to ;kcpc status, and the internals concern every server.
+        internals = owner and ctx.interaction is not None
+        description: str | None = None
+        if not internals:
+            description = OWNER_PREFIX_NOTE if owner else OWNER_ONLY_NOTE
+        fields = (
+            EmbedField('Database', f'Schema version {version}'),
+            EmbedField('Time zone', services.settings.kcpc_timezone, inline=True),
+            *(self._internals() if internals else ()),
+            EmbedField('Posts in this server', _describe_counts(counts)),
+            EmbedField(
+                'Recently skipped posts',
+                '\n'.join(_describe_skip(record) for record in skips) or 'none',
+            ),
+        )
+        message = OutgoingMessage(
+            title='KCPC status', description=description, fields=fields
+        )
+        await _reply(ctx, to_embed(message))
+
+    def _internals(self) -> tuple[EmbedField, ...]:
+        """KCPC's extensions and jobs, with their last errors, for the bot owner."""
         extensions = sorted(
             name for name in self.bot.extensions if name.startswith(_KCPC_MODULE_PREFIX)
         )
-        fields = (
-            EmbedField('Database', f'`{services.db.path}`, schema version {version}'),
-            EmbedField('Time zone', services.settings.kcpc_timezone, inline=True),
+        return (
             EmbedField(
                 'Extensions',
                 ', '.join(f'`{name}`' for name in extensions) or 'none',
@@ -120,24 +176,25 @@ class KcpcAdmin(KcpcCog):
             ),
             *(
                 EmbedField(f'Job `{job.name}`', _describe_job(job))
-                for job in services.scheduler.status()
-            ),
-            EmbedField('Posts in this server', _describe_counts(counts)),
-            EmbedField(
-                'Recently skipped posts',
-                '\n'.join(_describe_skip(record) for record in skips) or 'none',
+                for job in self.services.scheduler.status()
             ),
         )
-        await _reply(ctx, to_embed(OutgoingMessage(title='KCPC status', fields=fields)))
 
     @kcpc.command(brief='Set the channel a feature posts in')  # type: ignore[arg-type]
+    @app_commands.describe(
+        feature=_FEATURE_DESCRIPTION, channel='The channel its posts go to'
+    )
     @app_commands.autocomplete(feature=feature_autocomplete)
+    @kcpc_admin_only()
     async def channel(
         self, ctx: commands.Context[Any], feature: str, channel: discord.TextChannel
     ) -> None:
         """Set the channel a feature posts in, once the bot can post there.
 
-        The reply warns if the feature's role would not be notified there.
+        The reply warns if posts there would not notify the feature's ping role.
+
+        Examples:
+            /kcpc channel workshops #workshops
         """
         guild = _guild(ctx)
         spec = self._feature(feature)
@@ -154,7 +211,12 @@ class KcpcAdmin(KcpcCog):
         await _reply(ctx, _updated(spec, settings, change, guild))
 
     @kcpc.command(brief="Set or clear the role a feature's posts mention")  # type: ignore[arg-type]
+    @app_commands.describe(
+        feature=_FEATURE_DESCRIPTION,
+        role='A role just for pings, for its posts to mention; none if left out',
+    )
     @app_commands.autocomplete(feature=feature_autocomplete)
+    @kcpc_admin_only()
     async def role(
         self,
         ctx: commands.Context[Any],
@@ -163,9 +225,13 @@ class KcpcAdmin(KcpcCog):
     ) -> None:
         """Set the role a feature's posts mention; without a role, they mention none.
 
-        The bot must be able to notify the role: in the feature's channel once
-        that is set, or server-wide until then. The role must be just for
-        pings, as every member can give it to themselves with /notify.
+        It must be a role just for pings, as every member can give it to
+        themselves with /notify. The bot must be able to notify it: in the
+        feature's channel once that is set, or server-wide until then.
+
+        Examples:
+            /kcpc role workshops role:@Workshops
+            /kcpc role workshops
         """
         guild = _guild(ctx)
         spec = self._feature(feature)
@@ -187,9 +253,15 @@ class KcpcAdmin(KcpcCog):
         await _reply(ctx, _updated(spec, settings, change, guild))
 
     @kcpc.command(brief='Turn a feature on')  # type: ignore[arg-type]
+    @app_commands.describe(feature=_FEATURE_DESCRIPTION)
     @app_commands.autocomplete(feature=feature_autocomplete)
+    @kcpc_admin_only()
     async def enable(self, ctx: commands.Context[Any], feature: str) -> None:
-        """Turn a feature on. It posts once its channel is set too."""
+        """Turn a feature on. It posts once its channel is set too.
+
+        Examples:
+            /kcpc enable workshops
+        """
         guild = _guild(ctx)
         spec = self._feature(feature)
         settings = await self.services.guild_settings.update(
@@ -198,9 +270,15 @@ class KcpcAdmin(KcpcCog):
         await _reply(ctx, _updated(spec, settings, f'{spec.title} is on.', guild))
 
     @kcpc.command(brief='Turn a feature off')  # type: ignore[arg-type]
+    @app_commands.describe(feature=_FEATURE_DESCRIPTION)
     @app_commands.autocomplete(feature=feature_autocomplete)
+    @kcpc_admin_only()
     async def disable(self, ctx: commands.Context[Any], feature: str) -> None:
-        """Turn a feature off. Its settings are kept."""
+        """Turn a feature off. Its settings are kept.
+
+        Examples:
+            /kcpc disable workshops
+        """
         guild = _guild(ctx)
         spec = self._feature(feature)
         settings = await self.services.guild_settings.update(
@@ -218,10 +296,23 @@ async def setup(bot: commands.Bot) -> None:
 
 
 def _guild(ctx: commands.Context[Any]) -> discord.Guild:
-    # cog_check admits server members only, so there is always a guild.
+    # The commands' checks admit server members only, so there is always a
+    # guild.
     if ctx.guild is None:
         raise commands.NoPrivateMessage()
     return ctx.guild
+
+
+async def _is_owner(bot: commands.Bot, user: discord.abc.User) -> bool:
+    """Whether ``user`` owns the bot; False, with a warning, if Discord can't say.
+
+    discord.py asks Discord who owns the bot when it doesn't know yet.
+    """
+    try:
+        return await bot.is_owner(user)
+    except discord.HTTPException as exc:
+        logger.warning('Could not tell whether user %s owns the bot: %s', user.id, exc)
+        return False
 
 
 async def _reply(ctx: commands.Context[Any], embed: discord.Embed) -> None:

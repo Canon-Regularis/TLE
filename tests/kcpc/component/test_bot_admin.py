@@ -1,10 +1,12 @@
-"""Tests for tle.kcpc.bot.admin: feature admin groups attached under /kcpc.
+"""Tests for tle.kcpc.bot.admin: feature admin groups attached under /kcpc, and
+the roles admins may choose to ping.
 
 They run on a real ``commands.Bot`` with the real admin cog, so they also pin
 what the module relies on in discord.py: ``Cog._inject`` runs ``cog_load``
 before it registers the cog's commands, and registers only those without a
-parent; ``HybridGroup.add_command`` nests a hybrid group's slash group too; and
-``Cog._eject`` calls ``cog_unload`` while the group is still attached.
+parent; ``HybridGroup.add_command`` nests a hybrid group's slash group too;
+``Cog._eject`` calls ``cog_unload`` while the group is still attached; and a
+command runs its own checks, never its groups'.
 """
 
 import logging
@@ -21,8 +23,10 @@ from discord.ext.commands.view import StringView
 from tle import constants
 from tle.kcpc.bot.admin import (
     ADMIN_GROUP_NAME,
+    TLE_ROLE_FOR_MEMBERS,
     attach_admin_group,
     detach_admin_group,
+    ping_role_problem,
     withhold_admin_group,
 )
 from tle.kcpc.bot.checks import NotKcpcAdmin, kcpc_admin_only
@@ -34,6 +38,8 @@ ADMIN_LOGGER = 'tle.kcpc.bot.admin'
 KCPC_COMMANDS = {'channel', 'disable', 'enable', 'role', 'status'}
 KCPC_SLASH_COMMANDS = KCPC_COMMANDS | {'show'}
 GUILD_ID = 1_100_000_000_000_000_001
+ROLE_ID = 1_300_000_000_000_000_001
+OTHER_ROLE_ID = 1_300_000_000_000_000_002
 
 
 class Feature(commands.Cog):
@@ -48,6 +54,7 @@ class Feature(commands.Cog):
         self.attached: bool | None = None
         self.registered_at_load: list[str] | None = None
         self.parent_at_unload: object = None
+        self.peeks = 0
 
     async def cog_load(self) -> None:
         self.registered_at_load = sorted(self.bot.all_commands)
@@ -68,11 +75,11 @@ class Feature(commands.Cog):
     async def reset(self, ctx: commands.Context[Any]) -> None:
         pass
 
-    # Without kcpc_admin_only, which test_the_admin_cogs_check_does_not_apply
+    # Without kcpc_admin_only, which test_each_attached_command_needs_its_own_check
     # shows is needed.
     @gadgets.command(brief='Look at the gadgets')  # type: ignore[arg-type]
     async def peek(self, ctx: commands.Context[Any]) -> None:
-        pass
+        self.peeks += 1
 
     @commands.hybrid_command(brief='Say hello')  # type: ignore[arg-type]
     async def hello(self, ctx: commands.Context[Any]) -> None:
@@ -135,16 +142,18 @@ def make_member(*, manage_guild: bool) -> MagicMock:
 
 
 def make_context(
-    bot: commands.Bot, author: MagicMock, *, slash: bool
+    bot: commands.Bot, author: MagicMock, *, slash: bool, arguments: str = ''
 ) -> commands.Context[commands.Bot]:
-    """A real context in a guild; with ``slash``, of a slash command."""
+    """A real context in a guild, given ``arguments`` as text; with ``slash``,
+    of a slash command.
+    """
     guild = MagicMock(spec=discord.Guild, id=GUILD_ID)
     message = MagicMock(spec=discord.Message, guild=guild, author=author)
     interaction = MagicMock(spec=discord.Interaction, client=bot) if slash else None
     context: commands.Context[commands.Bot] = commands.Context(
         message=message,
         bot=bot,
-        view=StringView(''),
+        view=StringView(arguments),
         prefix='/' if slash else ';',
         interaction=interaction,
     )
@@ -246,17 +255,36 @@ async def test_non_admins_are_refused_attached_admin_commands(
 
 
 @pytest.mark.parametrize('slash', [False, True], ids=['prefix', 'slash'])
-async def test_the_admin_cogs_check_does_not_apply_to_attached_commands(
+async def test_each_attached_command_needs_its_own_check(
     monkeypatch: pytest.MonkeyPatch, bot: commands.Bot, feature: Feature, slash: bool
 ) -> None:
-    # The admin cog's cog_check guards only its own commands, so every
-    # attached command needs kcpc_admin_only; peek lacks it.
+    # The admin cog's commands each have kcpc_admin_only, and every attached
+    # command needs it too, since nothing else guards it: peek lacks it.
     monkeypatch.setattr(constants, 'TLE_ADMIN', 'Committee')
     member = make_context(bot, make_member(manage_guild=False), slash=slash)
 
     assert await command_named(bot, 'kcpc gadgets peek').can_run(member)
     with pytest.raises(NotKcpcAdmin):
-        await command_named(bot, 'kcpc status').can_run(member)
+        await command_named(bot, 'kcpc channel').can_run(member)
+    with pytest.raises(NotKcpcAdmin):
+        await kcpc_group(bot).can_run(member)  # ;kcpc, or /kcpc show
+
+
+async def test_a_groups_check_does_not_guard_its_subcommands(
+    monkeypatch: pytest.MonkeyPatch, bot: commands.Bot, feature: Feature
+) -> None:
+    # As discord.py invokes ;kcpc gadgets peek: through /kcpc, whose check
+    # refuses the member when they use ;kcpc itself.
+    monkeypatch.setattr(constants, 'TLE_ADMIN', 'Committee')
+    member = make_member(manage_guild=False)
+    with pytest.raises(NotKcpcAdmin):
+        await kcpc_group(bot).invoke(make_context(bot, member, slash=False))
+
+    await kcpc_group(bot).invoke(
+        make_context(bot, member, slash=False, arguments='gadgets peek')
+    )
+
+    assert feature.peeks == 1
 
 
 async def test_removing_the_cog_detaches_the_group(
@@ -412,3 +440,95 @@ async def test_the_admin_cog_is_the_one_its_extension_adds(bot: commands.Bot) ->
     admin = bot.get_cog('KcpcAdmin')
     assert isinstance(admin, KcpcAdmin)
     assert bot.get_command(ADMIN_GROUP_NAME) is admin.kcpc
+
+
+# The roles admins may choose to ping. /kcpc role and /notify refuse each role
+# that ping_role_problem finds a problem with (see their tests).
+
+
+@pytest.fixture
+def tle_roles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TLE's roles by their default names, and no developer role."""
+    monkeypatch.setattr(constants, 'TLE_ADMIN', 'Admin')
+    monkeypatch.setattr(constants, 'TLE_MODERATOR', 'Moderator')
+    monkeypatch.setattr(constants, 'TLE_TRUSTED', 'Trusted')
+    monkeypatch.setattr(constants, 'TLE_PURGATORY', 'Purgatory')
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', None)
+
+
+def make_role(role_id: int = ROLE_ID, name: str = 'Workshops') -> MagicMock:
+    """A role just for pings, in a server whose @everyone has no permissions."""
+    role = MagicMock(spec=discord.Role, id=role_id)
+    role.name = name  # not MagicMock(name=...), which names the mock itself
+    role.permissions = discord.Permissions.none()
+    role.guild = MagicMock(spec=discord.Guild, id=GUILD_ID, channels=[])
+    role.guild.default_role = MagicMock(
+        spec=discord.Role, permissions=discord.Permissions.none()
+    )
+    return role
+
+
+@pytest.mark.usefixtures('tle_roles')
+def test_a_role_just_for_pings_has_no_problem() -> None:
+    assert ping_role_problem(make_role()) is None
+
+
+@pytest.mark.usefixtures('tle_roles')
+def test_tles_developer_role_is_not_just_for_pings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Members who gave it to themselves could use the developer commands.
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', ROLE_ID)
+
+    assert ping_role_problem(make_role()) == "it is TLE's developer role"
+
+
+@pytest.mark.usefixtures('tle_roles')
+def test_the_developer_role_is_matched_by_id_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', ROLE_ID)
+
+    # Another role, named like the developer role's id.
+    assert ping_role_problem(make_role(OTHER_ROLE_ID, name=str(ROLE_ID))) is None
+
+
+@pytest.mark.usefixtures('tle_roles')
+def test_tles_roles_are_read_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    role = make_role()
+    assert ping_role_problem(role) is None
+
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', ROLE_ID)
+    assert ping_role_problem(role) == "it is TLE's developer role"
+
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', None)
+    monkeypatch.setattr(constants, 'TLE_MODERATOR', ROLE_ID)
+    assert ping_role_problem(role) == "it is TLE's moderator role"
+
+
+@pytest.mark.usefixtures('tle_roles')
+@pytest.mark.parametrize(
+    'setting',
+    ['TLE_ADMIN', 'TLE_MODERATOR', 'TLE_TRUSTED', 'TLE_PURGATORY', 'TLE_DEVELOPER'],
+)
+def test_for_members_the_reason_never_says_which_of_tles_roles_it_is(
+    monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    # /notify's refusals, which members see, say what TLE's own self-service
+    # role commands say; /kcpc role tells admins which role it is.
+    monkeypatch.setattr(constants, setting, ROLE_ID)
+    role = make_role()
+    purpose = setting.removeprefix('TLE_').lower()
+
+    assert ping_role_problem(role) == f"it is TLE's {purpose} role"
+    assert ping_role_problem(role, for_members=True) == TLE_ROLE_FOR_MEMBERS
+    assert TLE_ROLE_FOR_MEMBERS == 'the bot uses it to decide what members may do'
+
+
+@pytest.mark.usefixtures('tle_roles')
+def test_for_members_the_other_reasons_are_the_same() -> None:
+    role = make_role()
+    role.permissions = discord.Permissions(manage_messages=True)
+
+    assert ping_role_problem(role, for_members=True) == 'it grants Manage Messages'
+    assert ping_role_problem(make_role(), for_members=True) is None

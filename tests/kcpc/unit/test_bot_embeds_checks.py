@@ -19,9 +19,13 @@ from discord.ext import commands
 from tle import constants
 from tle.kcpc.bot.checks import (
     NotKcpcAdmin,
+    NotKcpcDeveloper,
     ensure_kcpc_admin,
+    ensure_kcpc_developer,
     is_kcpc_admin,
+    is_kcpc_developer,
     kcpc_admin_only,
+    kcpc_status_only,
 )
 from tle.kcpc.bot.cog import (
     UNEXPECTED_ERROR_MESSAGE,
@@ -62,7 +66,10 @@ from tle.util import discord_common
 E = TypeVar('E', bound=discord.HTTPException)
 
 BATCH = '0123abcd'
+# Real snowflakes are 64-bit, so use big ones.
+GUILD_ID = 1_100_000_000_000_000_001
 ADMIN_ROLE_ID = 1_300_000_000_000_000_001
+DEVELOPER_ROLE_ID = 1_300_000_000_000_000_002
 
 MESSAGE = OutgoingMessage(
     title='Graphs 101',
@@ -295,16 +302,42 @@ def test_the_admin_role_is_read_at_call_time(monkeypatch: pytest.MonkeyPatch) ->
     assert is_kcpc_admin(member)
 
 
+def in_server(member: MagicMock) -> MagicMock:
+    """``member``, in server GUILD_ID, with its default role as members have."""
+    member.guild = MagicMock(spec=discord.Guild, id=GUILD_ID)
+    member.roles = [make_role(GUILD_ID, '@everyone'), *member.roles]
+    return member
+
+
 @pytest.mark.parametrize(
-    'admin_role', ['Admin', 'Committee', 7, ADMIN_ROLE_ID, str(ADMIN_ROLE_ID)]
+    'admin_role',
+    ['Admin', 'Committee', 7, ADMIN_ROLE_ID, str(ADMIN_ROLE_ID), GUILD_ID, '@everyone'],
 )
 def test_the_role_rule_matches_tles(
     monkeypatch: pytest.MonkeyPatch, admin_role: str | int
 ) -> None:
-    member = make_member(make_role(7, 'Committee'), make_role(ADMIN_ROLE_ID, 'Admin'))
+    member = in_server(
+        make_member(make_role(7, 'Committee'), make_role(ADMIN_ROLE_ID, 'Admin'))
+    )
     monkeypatch.setattr(constants, 'TLE_ADMIN', admin_role)
 
     assert is_kcpc_admin(member) == discord_common.has_role(member, admin_role)
+
+
+@pytest.mark.parametrize('value', [GUILD_ID, '@everyone'], ids=['its id', 'its name'])
+@pytest.mark.parametrize('setting', ['TLE_ADMIN', 'TLE_DEVELOPER'])
+def test_the_default_role_makes_nobody_an_admin_or_a_developer(
+    monkeypatch: pytest.MonkeyPatch, setting: str, value: str | int
+) -> None:
+    # Every member has @everyone, whose id is the server's, so a setting that
+    # names it must not let everyone in.
+    monkeypatch.setattr(constants, 'TLE_ADMIN', 'Admin')
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', None)
+    monkeypatch.setattr(constants, setting, value)
+    member = in_server(make_member())
+
+    assert not is_kcpc_admin(member)
+    assert not is_kcpc_developer(member)
 
 
 def make_ctx(author: object) -> MagicMock:
@@ -319,24 +352,28 @@ async def test_ensure_kcpc_admin_passes_an_admin(admin_role_name: str) -> None:
     assert await ensure_kcpc_admin(make_ctx(make_member(manage_guild=True)))
 
 
-async def test_ensure_kcpc_admin_names_the_admin_role(admin_role_name: str) -> None:
+async def test_ensure_kcpc_admin_refuses_others_naming_no_role(
+    admin_role_name: str,
+) -> None:
     with pytest.raises(NotKcpcAdmin) as caught:
         await ensure_kcpc_admin(make_ctx(make_member()))
 
-    assert str(caught.value) == (
-        'You need the Manage Server permission or the Admin role to do that.'
-    )
-    # A CheckFailure, so TLE's bot_error_handler shows the message.
+    assert str(caught.value) == 'Only server admins can do that.'
+    # A CheckFailure, which TLE's bot_error_handler answers with a refusal of
+    # its own: members see that, not this message.
     assert isinstance(caught.value, commands.CheckFailure)
 
 
-async def test_ensure_kcpc_admin_mentions_an_admin_role_given_by_id(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize('admin_role', ['Committee', ADMIN_ROLE_ID], ids=['name', 'id'])
+async def test_ensure_kcpc_admin_never_names_the_admin_role(
+    monkeypatch: pytest.MonkeyPatch, admin_role: str | int
 ) -> None:
-    monkeypatch.setattr(constants, 'TLE_ADMIN', ADMIN_ROLE_ID)
+    monkeypatch.setattr(constants, 'TLE_ADMIN', admin_role)
 
-    with pytest.raises(NotKcpcAdmin, match=f'or the <@&{ADMIN_ROLE_ID}> role to'):
+    with pytest.raises(NotKcpcAdmin) as caught:
         await ensure_kcpc_admin(make_ctx(make_member()))
+
+    assert str(admin_role) not in str(caught.value)
 
 
 def test_kcpc_admin_only_adds_the_admin_check() -> None:
@@ -346,6 +383,124 @@ def test_kcpc_admin_only_adds_the_admin_check() -> None:
         pass
 
     assert settings.checks == [ensure_kcpc_admin]
+
+
+@pytest.fixture
+def developer_role(monkeypatch: pytest.MonkeyPatch, admin_role_name: str) -> int:
+    """TLE's developer role, an id, as TLE_DEVELOPER sets it."""
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', DEVELOPER_ROLE_ID)
+    return DEVELOPER_ROLE_ID
+
+
+def make_developer() -> MagicMock:
+    return make_member(make_role(1, 'Member'), make_role(DEVELOPER_ROLE_ID, 'Devs'))
+
+
+def test_a_member_with_the_developer_role_is_a_developer(developer_role: int) -> None:
+    developer = make_developer()
+
+    assert is_kcpc_developer(developer)
+    # Not an admin, so the admin commands still refuse them.
+    assert not is_kcpc_admin(developer)
+
+
+def test_an_admin_is_a_developer_too(developer_role: int) -> None:
+    assert is_kcpc_developer(make_member(manage_guild=True))
+    assert is_kcpc_developer(make_member(make_role(1, 'Admin')))
+
+
+def test_an_ordinary_member_is_not_a_developer(developer_role: int) -> None:
+    assert not is_kcpc_developer(make_member(make_role(1, 'Member')))
+    assert not is_kcpc_developer(make_member())
+
+
+def test_a_user_outside_a_server_is_not_a_developer(developer_role: int) -> None:
+    assert not is_kcpc_developer(MagicMock(spec=discord.User))
+
+
+def test_the_developer_role_matches_by_id_only(developer_role: int) -> None:
+    # A role named like the id is another role.
+    assert not is_kcpc_developer(make_member(make_role(5, str(DEVELOPER_ROLE_ID))))
+
+
+def test_without_a_developer_role_only_admins_are_developers(
+    monkeypatch: pytest.MonkeyPatch, admin_role_name: str
+) -> None:
+    # TLE_DEVELOPER unset, or not an id.
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', None)
+
+    assert not is_kcpc_developer(make_developer())
+    assert is_kcpc_developer(make_member(manage_guild=True))
+    assert is_kcpc_developer(make_member(make_role(1, 'Admin')))
+
+
+def test_the_developer_role_is_read_at_call_time(
+    monkeypatch: pytest.MonkeyPatch, admin_role_name: str
+) -> None:
+    developer = make_developer()
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', None)
+    assert not is_kcpc_developer(developer)
+
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', DEVELOPER_ROLE_ID)
+    assert is_kcpc_developer(developer)
+
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', ADMIN_ROLE_ID)
+    assert not is_kcpc_developer(developer)
+
+
+async def test_ensure_kcpc_developer_passes_admins_and_developers(
+    developer_role: int,
+) -> None:
+    for member in (
+        make_member(manage_guild=True),
+        make_member(make_role(1, 'Admin')),
+        make_developer(),
+    ):
+        assert await ensure_kcpc_developer(make_ctx(member))
+
+
+async def test_ensure_kcpc_developer_refuses_others_naming_no_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(constants, 'TLE_ADMIN', ADMIN_ROLE_ID)
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', DEVELOPER_ROLE_ID)
+
+    with pytest.raises(NotKcpcDeveloper) as caught:
+        await ensure_kcpc_developer(make_ctx(make_member(make_role(1, 'Member'))))
+
+    # In the words of NotKcpcAdmin's.
+    assert str(caught.value) == 'Only server admins and developers can do that.'
+    assert isinstance(caught.value, commands.CheckFailure)
+
+
+def test_kcpc_status_only_adds_the_developer_check() -> None:
+    @kcpc_status_only()
+    @commands.command()
+    async def status(ctx: commands.Context[Any]) -> None:
+        pass
+
+    assert status.checks == [ensure_kcpc_developer]
+
+
+@pytest.mark.parametrize('refusal', [NotKcpcAdmin, NotKcpcDeveloper])
+async def test_a_refused_member_gets_tles_general_refusal(
+    monkeypatch: pytest.MonkeyPatch, refusal: type[commands.CheckFailure]
+) -> None:
+    # discord.py calls the cog's handler first, then on_command_error; the
+    # reply is TLE's, which names no role.
+    monkeypatch.setattr(constants, 'TLE_ADMIN', ADMIN_ROLE_ID)
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', DEVELOPER_ROLE_ID)
+    ctx = make_ctx(make_member())
+    error = refusal()
+
+    await KcpcCog(MagicMock(spec=commands.Bot)).cog_command_error(ctx, error)
+    await discord_common.bot_error_handler(ctx, error)
+
+    ctx.send.assert_awaited_once()
+    assert ctx.send.await_args is not None
+    assert ctx.send.await_args.kwargs['ephemeral'] is True
+    embed = ctx.send.await_args.kwargs['embed']
+    assert embed.description == discord_common.NOT_ALLOWED_MESSAGE
 
 
 async def kcpc_command(interaction: discord.Interaction) -> None:
@@ -409,6 +564,7 @@ def test_unwrap_error_stops_after_five_wrappers() -> None:
         (KcpcDisabledError(), ErrorKind.USER),
         (commands.BadArgument('x'), ErrorKind.FRAMEWORK),
         (NotKcpcAdmin(), ErrorKind.FRAMEWORK),
+        (NotKcpcDeveloper(), ErrorKind.FRAMEWORK),
         (app_commands.CheckFailure(), ErrorKind.FRAMEWORK),
         (ConfigError('x'), ErrorKind.UNEXPECTED),
         (ValueError('x'), ErrorKind.UNEXPECTED),
@@ -455,6 +611,7 @@ async def test_a_user_error_is_shown_to_the_user(
     [
         commands.BadArgument('Channel "x" not found.'),
         NotKcpcAdmin(),
+        NotKcpcDeveloper(),
         commands.HybridCommandError(app_commands.CheckFailure('No.')),
     ],
 )

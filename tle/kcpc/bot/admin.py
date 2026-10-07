@@ -15,8 +15,9 @@ cog's commands that have no parent. An attached group has one, so it appears
 under /kcpc and nowhere else. A group that could not be attached is withheld,
 so that it doesn't become a top-level command shown to every member.
 
-The attached commands still belong to the feature's cog, so the admin cog's
-``cog_check`` doesn't run for them: each one needs ``kcpc_admin_only()``.
+Each attached command needs ``kcpc_admin_only()``, as the admin cog's own
+commands have it: discord.py never runs the checks of the groups a command is
+in, and the command belongs to the feature's cog, not the admin cog.
 
 A feature's posts mention the ping role an admin chose for it, and /notify
 lets every member give themselves that role or take it away.
@@ -35,6 +36,10 @@ from tle import constants
 logger = logging.getLogger(__name__)
 
 ADMIN_GROUP_NAME = 'kcpc'
+# Why a role that is one of TLE's isn't just for pings, in a reason members
+# see: it doesn't say which of TLE's roles it is, as TLE's own self-service
+# role commands don't.
+TLE_ROLE_FOR_MEMBERS = 'the bot uses it to decide what members may do'
 
 
 def attach_admin_group(
@@ -100,17 +105,21 @@ def withhold_admin_group(
     ]
 
 
-def ping_role_problem(role: discord.Role) -> str | None:
+def ping_role_problem(role: discord.Role, *, for_members: bool = False) -> str | None:
     """Why members must not give themselves ``role``, or None if it's just for pings.
 
     A role just for pings is none of TLE's roles (``tle.constants``, read at
     call time), grants no permission that @everyone lacks, and changes no
     permissions in any channel. Having any other role changes what a member
     can do, as a server's member or verified role does. The reason reads like
-    "it is TLE's admin role".
+    "it is TLE's admin role", for admins. With ``for_members``, for a reason
+    that members see, it doesn't say which of TLE's roles the role is
+    (``TLE_ROLE_FOR_MEMBERS``).
     """
     for purpose, configured in _tle_roles():
         if _is_role(role, configured):
+            if for_members:
+                return TLE_ROLE_FOR_MEMBERS
             return f"it is TLE's {purpose} role"
     everyone = role.guild.default_role.permissions
     extra = discord.Permissions(role.permissions.value & ~everyone.value)
@@ -129,13 +138,20 @@ def permission_names(names: Iterable[str]) -> str:
 
 
 def _tle_roles() -> tuple[tuple[str, str | int], ...]:
-    """What each of TLE's roles is for, and its name or id."""
-    return (
+    """What each of TLE's roles is for, and its name or id.
+
+    The developer role, an id, is there only when the bot has one.
+    """
+    roles: list[tuple[str, str | int]] = [
         ('admin', constants.TLE_ADMIN),
         ('moderator', constants.TLE_MODERATOR),
         ('trusted', constants.TLE_TRUSTED),
         ('purgatory', constants.TLE_PURGATORY),
-    )
+    ]
+    developer = constants.TLE_DEVELOPER
+    if developer is not None:
+        roles.append(('developer', developer))
+    return tuple(roles)
 
 
 def _is_role(role: discord.Role, configured: str | int) -> bool:
