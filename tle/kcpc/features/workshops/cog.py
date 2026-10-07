@@ -113,10 +113,18 @@ class KcpcWorkshops(KcpcCog):
 
     # mypy solves the types of discord.py's hybrid command decorators to Never,
     # so it rejects every callback; hence the type: ignores on them.
-    @commands.hybrid_group(fallback='next', brief='The next KCPC workshop')  # type: ignore[arg-type]
+    @commands.hybrid_group(fallback='next', brief='Show the next KCPC workshop')  # type: ignore[arg-type]
     @commands.guild_only()
     async def event(self, ctx: commands.Context[Any]) -> None:
-        """Show the next workshop of this server's Luma calendar."""
+        """Show the next KCPC workshop: when and where it is.
+
+        Workshops come from this server's Luma calendar, which the bot checks
+        every 10 minutes.
+
+        Examples:
+            /event next
+            ;event
+        """
         calendar_id = await self._calendar(_guild(ctx).id)
         last_synced = await self._last_synced(calendar_id)
         upcoming = await self._repo.next_from(calendar_id, self.services.clock.now())
@@ -136,11 +144,15 @@ class KcpcWorkshops(KcpcCog):
             )
         await ctx.send(embed=_synced_embed(message, last_synced))
 
-    @event.command(name='this-week', brief='KCPC workshops this week')  # type: ignore[arg-type]
+    @event.command(name='this-week', brief="Show this week's KCPC workshops")  # type: ignore[arg-type]
     async def this_week(self, ctx: commands.Context[Any]) -> None:
-        """Show this week's workshops, Monday to Sunday in the club's time zone.
+        """Show this week's KCPC workshops, Monday to Sunday in the club's time zone.
 
         Those that are over are marked as finished.
+
+        Examples:
+            /event this-week
+            ;event this-week
         """
         calendar_id = await self._calendar(_guild(ctx).id)
         last_synced = await self._last_synced(calendar_id)
@@ -157,10 +169,14 @@ class KcpcWorkshops(KcpcCog):
         )
         await ctx.send(embed=_synced_embed(message, last_synced))
 
-    @commands.hybrid_group(name='workshops', brief='Workshop calendar and syncing')  # type: ignore[arg-type]
+    @commands.hybrid_group(  # type: ignore[arg-type]
+        name='workshops', brief='Set or sync the Luma calendar that workshops come from'
+    )
     @kcpc_admin_only()
     async def workshops_admin(self, ctx: commands.Context[Any]) -> None:
-        """Set the Luma calendar this server follows, or sync it now."""
+        """Set the Luma calendar whose workshops this server follows, or sync it
+        now.
+        """
         # Only ;kcpc workshops gets here: Discord can't run a slash group.
         await ctx.send_help(ctx.command)
 
@@ -170,10 +186,15 @@ class KcpcWorkshops(KcpcCog):
     )
     @kcpc_admin_only()
     async def set_calendar(self, ctx: commands.Context[Any], calendar: str) -> None:
-        """Follow a Luma calendar: its workshops get the reminders from now on.
+        """Follow a Luma calendar: this server gets reminders of its workshops
+        from now on.
 
-        Luma is asked first whether the calendar exists. Then it is saved and
-        synced at once, and reminders that are due go out.
+        The bot first checks with Luma that the calendar exists, then saves it
+        and syncs it at once.
+
+        Examples:
+            /kcpc workshops calendar cal-ExampleClub001
+            ;kcpc workshops calendar https://api.lu.ma/ics/get?entity=calendar&id=cal-ExampleClub001
         """
         await ctx.defer(ephemeral=True)
         guild = _guild(ctx)
@@ -196,7 +217,13 @@ class KcpcWorkshops(KcpcCog):
     @workshops_admin.command(name='sync', brief="Sync this server's Luma calendar now")  # type: ignore[arg-type]
     @kcpc_admin_only()
     async def sync_now(self, ctx: commands.Context[Any]) -> None:
-        """Sync this server's Luma calendar now, rather than within 10 minutes."""
+        """Sync this server's Luma calendar now, rather than within 10 minutes,
+        and say what changed.
+
+        Examples:
+            /kcpc workshops sync
+            ;kcpc workshops sync
+        """
         await ctx.defer(ephemeral=True)
         calendar_id = await self._calendar(_guild(ctx).id)
         report = await self._sync_calendar(calendar_id)

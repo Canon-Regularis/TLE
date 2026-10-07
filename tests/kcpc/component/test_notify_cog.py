@@ -86,6 +86,9 @@ EVERYONE = discord.Permissions(
     view_channel=True, send_messages=True, read_message_history=True
 )
 IN_THE_CHANNEL = f'it changes what members can do in <#{CHANNEL_ID}>'
+# Why one of TLE's roles isn't just for pings, as members are told: not which
+# of them it is, as /kcpc role tells admins.
+TLE_ROLE = 'the bot uses it to decide what members may do'
 
 
 def not_just_for_pings(problem: str) -> str:
@@ -581,16 +584,10 @@ async def test_the_bot_must_be_able_to_manage_the_role(
             IN_THE_CHANNEL,
             id='allowed less in a channel',
         ),
-        pytest.param('Admin', EVERYONE, None, "it is TLE's admin role", id='admin'),
-        pytest.param(
-            'Moderator', EVERYONE, None, "it is TLE's moderator role", id='moderator'
-        ),
-        pytest.param(
-            'Trusted', EVERYONE, None, "it is TLE's trusted role", id='trusted'
-        ),
-        pytest.param(
-            'Purgatory', EVERYONE, None, "it is TLE's purgatory role", id='purgatory'
-        ),
+        pytest.param('Admin', EVERYONE, None, TLE_ROLE, id='admin'),
+        pytest.param('Moderator', EVERYONE, None, TLE_ROLE, id='moderator'),
+        pytest.param('Trusted', EVERYONE, None, TLE_ROLE, id='trusted'),
+        pytest.param('Purgatory', EVERYONE, None, TLE_ROLE, id='purgatory'),
     ],
 )
 async def test_a_role_that_is_not_just_for_pings_is_refused(
@@ -638,8 +635,56 @@ async def test_tles_roles_set_by_id_are_refused_too(
     with pytest.raises(KcpcUserError) as raised:
         await run(cog, ctx, 'workshops', state)
 
-    assert str(raised.value) == not_just_for_pings("it is TLE's moderator role")
+    assert str(raised.value) == not_just_for_pings(TLE_ROLE)
     assert_roles_unchanged(member)
+
+
+@pytest.mark.parametrize('state', ['on', 'off'])
+async def test_tles_developer_role_is_refused_too(
+    monkeypatch: pytest.MonkeyPatch,
+    cog: KcpcNotify,
+    ctx: MagicMock,
+    member: MagicMock,
+    ping_role: discord.Role,
+    state: str,
+) -> None:
+    # It is set by id alone. Members who gave it to themselves could use the
+    # developer commands.
+    monkeypatch.setattr(constants, 'TLE_DEVELOPER', ROLE_ID)
+    if state == 'off':
+        member.roles = [ping_role]
+
+    with pytest.raises(KcpcUserError) as raised:
+        await run(cog, ctx, 'workshops', state)
+
+    assert str(raised.value) == not_just_for_pings(TLE_ROLE)
+    assert_roles_unchanged(member)
+    ctx.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    'setting',
+    ['TLE_ADMIN', 'TLE_MODERATOR', 'TLE_TRUSTED', 'TLE_PURGATORY', 'TLE_DEVELOPER'],
+)
+async def test_a_refusal_never_says_which_of_tles_roles_the_role_is(
+    monkeypatch: pytest.MonkeyPatch,
+    cog: KcpcNotify,
+    ctx: MagicMock,
+    ping_role: discord.Role,
+    setting: str,
+) -> None:
+    # A ping role that an admin later made one of TLE's roles, say by setting
+    # TLE_DEVELOPER to its ID. Members see the refusal, on ;notify the whole
+    # channel, so it doesn't tell them which role it is: /kcpc role, which only
+    # admins see, does.
+    monkeypatch.setattr(constants, setting, ROLE_ID)
+
+    with pytest.raises(KcpcUserError) as raised:
+        await run(cog, ctx, 'workshops', 'on')
+
+    text = str(raised.value)
+    assert text == not_just_for_pings(TLE_ROLE)
+    assert f"TLE's {setting.removeprefix('TLE_').lower()} role" not in text
 
 
 async def test_a_role_as_discord_creates_it_is_just_for_pings(

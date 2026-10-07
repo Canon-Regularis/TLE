@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -57,8 +58,10 @@ from tle.kcpc.features.admin.cog import setup as add_admin_cog
 from tle.kcpc.features.problems import cog as problems_cog
 from tle.kcpc.features.problems.cog import REFRESH_JOB, KcpcProblems, setup
 from tle.kcpc.features.problems.repo import QueuedProblem, WeeklyProblem, WeeklyRepo
+from tle.kcpc.features.problems.rotation import parse_rotation
 from tle.kcpc.features.problems.settings import SPEC, WEEKLY, WeeklySettings
 from tle.kcpc.features.problems.solved import CODEFORCES_PAUSE
+from tle.kcpc.features.problems.topics import KNOWN_TAGS
 from tle.kcpc.features.problems.weekly import (
     PROBLEM,
     SUBJECT,
@@ -118,8 +121,9 @@ CONTEST_PAGE_NOTE = (
     '`/kcpc weekly solution` once it is posted.'
 )
 ROTATION_HINT = (
-    'Set it with `/kcpc weekly rotation cf easy, ac medium, cf medium graphs, ac '
-    'hard`, or go back to the default with `/kcpc weekly rotation default`.'
+    'Set it with `/kcpc weekly rotation entries:codeforces easy, atcoder medium, '
+    'codeforces medium graphs, atcoder hard`, or go back to the default with '
+    '`/kcpc weekly rotation entries:default`.'
 )
 UNREACHABLE = 'AtCoder is not responding right now. Please try again later.'
 # Real seconds a healthy teardown needs, many times over. One that hangs then
@@ -2679,8 +2683,8 @@ async def test_rotation_refuses_an_entry_it_cannot_read(
         await run(bot, 'kcpc weekly rotation', ctx, entries='cf easy, xx hard')
 
     assert str(raised.value) == (
-        "Entry 2 ('xx hard') has no platform I know: use cf (Codeforces) or ac "
-        '(AtCoder).'
+        "Entry 2 ('xx hard') has no platform I know: use codeforces or atcoder "
+        '(cf or ac for short).'
     )
     settings = await guild_settings.get_typed(GUILD, WEEKLY, WeeklySettings)
     assert settings.rotation == ('atcoder:hard:any',)
@@ -2701,6 +2705,35 @@ async def test_rotation_as_a_prefix_command_takes_the_rest_of_the_message(
     reply(ctx, ephemeral=True)
     settings = await guild_settings.get_typed(GUILD, WEEKLY, WeeklySettings)
     assert settings.rotation == ('codeforces:easy:dfs and similar', 'atcoder:hard:any')
+
+
+def test_the_rotations_that_its_help_and_hint_show_are_ones_it_takes() -> None:
+    # Spelt out, codeforces and atcoder, rather than cf and ac, which the
+    # rotation takes too. On slash they follow the option's name, since
+    # Discord takes an optional option's value only by name.
+    command = 'kcpc weekly rotation'
+    shown = re.findall(f'`/{command} entries:([^`]+)`', ROTATION_HINT)
+    assert len(shown) == 2
+    _, _, block = (KcpcProblems.set_rotation.help or '').partition('Examples:')
+    for line in block.splitlines():
+        example = line.strip()
+        if not example:
+            continue
+        kind, typed = example[0], example[1:]
+        assert typed.startswith(command), line
+        entries = typed[len(command) :].strip()
+        if kind == '/' and entries:
+            assert entries.startswith('entries:'), line
+            entries = entries[len('entries:') :]
+        if entries:
+            shown.append(entries)
+
+    assert 'default' in shown
+    rotations = [entries for entries in shown if entries != 'default']
+    assert len(rotations) == 2
+    for entries in rotations:
+        assert parse_rotation(entries, KNOWN_TAGS)
+        assert re.search(r'\b(cf|ac)\b', entries) is None, entries
 
 
 async def test_preview_shows_the_next_post_this_week_the_queue_and_the_rotation(

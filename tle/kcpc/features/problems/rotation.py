@@ -47,12 +47,15 @@ _ENTRY_SEPARATORS = re.compile(r'[,;]')
 # How much of a bad entry its error repeats.
 _SHOWN_LIMIT = 40
 _NO_ENTRIES = (
-    'Give at least one entry, such as: cf easy, ac medium, cf medium graphs, ac hard'
+    'Give at least one entry, such as: codeforces easy, atcoder medium, '
+    'codeforces medium graphs, atcoder hard'
 )
 _TOO_MANY = f'A rotation has at most {MAX_ROTATION} entries, one for each week.'
 _ENTRY = "Entry {number} ('{entry}')"
-_NEEDS_BAND = ' needs a platform and a band, such as cf medium graphs.'
-_UNKNOWN_PLATFORM = ' has no platform I know: use cf (Codeforces) or ac (AtCoder).'
+_NEEDS_BAND = ' needs a platform and a band, such as codeforces medium graphs.'
+_UNKNOWN_PLATFORM = (
+    ' has no platform I know: use codeforces or atcoder (cf or ac for short).'
+)
 _UNKNOWN_BAND = ' has no band I know: use easy, medium, hard or expert.'
 _ATCODER_TOPIC = ' is for AtCoder, whose problems have no topics: leave the topic out.'
 

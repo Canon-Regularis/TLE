@@ -59,7 +59,7 @@ class KcpcNotify(KcpcCog):
     @commands.hybrid_command(brief="Turn a feature's pings on or off for yourself")  # type: ignore[arg-type]
     @commands.guild_only()
     @app_commands.describe(
-        feature='The feature whose posts should ping you, e.g. workshops',
+        feature='The feature whose posts should ping you, such as workshops',
         state='on to get pinged, off to stop',
     )
     @app_commands.autocomplete(feature=feature_autocomplete)
@@ -71,10 +71,14 @@ class KcpcNotify(KcpcCog):
         feature: commands.Range[str, 1, _MAX_FEATURE_LENGTH],
         state: Literal['on', 'off'],
     ) -> None:
-        """Turn a feature's pings on or off for yourself, e.g. /notify workshops on.
+        """Turn a feature's pings on or off for yourself.
 
         A feature's posts ping the members who have its role, so this gives you
         the role or takes it away.
+
+        Examples:
+            /notify workshops on
+            ;notify contests off
         """
         # Changing a member's roles is a request to Discord, which can be rate
         # limited past the few seconds a slash command has to answer.
@@ -122,7 +126,8 @@ def _check_manageable(role: discord.Role, me: discord.Member) -> None:
     role (such as a bot's own, or the booster role) and one that isn't just
     for pings are reported first: only choosing another role fixes those.
     Admins may have chosen the role before it got permissions, so it is
-    checked on every change.
+    checked on every change. Members see the message, so it never says which
+    of TLE's roles the role is.
     """
     cannot = f"I can't change who has {role.mention}"
     if role.managed:
@@ -130,7 +135,7 @@ def _check_manageable(role: discord.Role, me: discord.Member) -> None:
             f'{cannot}: Discord or an integration manages it. Ask an admin to '
             'choose another ping role with /kcpc role.'
         )
-    problem = ping_role_problem(role)
+    problem = ping_role_problem(role, for_members=True)
     if problem is not None:
         raise KcpcUserError(
             f"{cannot}: it isn't just for pings ({problem}), and /notify would "
