@@ -1,3 +1,14 @@
+"""Linking a Codeforces account by signing in to Codeforces (OpenID Connect).
+
+``;handle identify`` and ``/handle identify`` give a member a sign-in link,
+whose ``state`` the ``OAuthStateStore`` keeps for 5 minutes. Codeforces sends
+the member back to the ``OAuthServer``'s callback, which links the account
+through ``tle.util.handle_linking`` and tells the member how it went: through
+the slash command's interaction, privately, or else by direct message. It
+never posts in a channel.
+"""
+
+import html
 import logging
 import secrets
 import time
@@ -6,6 +17,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import aiohttp
+import discord
 import jwt
 from aiohttp import web
 
@@ -19,12 +31,31 @@ _CF_ISSUER = 'https://codeforces.com'
 
 _STATE_TTL = 5 * 60  # 5 minutes
 
+# What the member is told, privately, when their account couldn't be linked.
+LINK_FAILED_TEXT = (
+    "I couldn't link your Codeforces account. Try `/handle identify` again, or "
+    'ask a moderator if it keeps failing.'
+)
+# ... and when it can't be linked for a reason that trying again won't change,
+# such as another member having linked the handle; ``reason`` is that of the
+# ``handle_linking.HandleLinkError``.
+LINK_REFUSED_TEXT = (
+    "I couldn't link your Codeforces account: {reason} Ask a moderator to sort it out."
+)
+
 
 @dataclass
 class OAuthPending:
+    """A sign-in that a member started, until Codeforces sends them back.
+
+    ``interaction`` is that of the slash command that started it, through
+    which the member hears how it went; None for the prefix command, whose
+    member hears by direct message.
+    """
+
     user_id: int
     guild_id: int
-    channel_id: int
+    interaction: discord.Interaction | None
     created_at: float
 
 
@@ -34,13 +65,22 @@ class OAuthStateStore:
     def __init__(self) -> None:
         self._pending: dict[str, OAuthPending] = {}
 
-    def create(self, user_id: int, guild_id: int, channel_id: int) -> str:
+    def create(
+        self,
+        user_id: int,
+        guild_id: int,
+        *,
+        interaction: discord.Interaction | None = None,
+    ) -> str:
+        """A new state for a sign-in by ``user_id`` in ``guild_id``, started
+        by the slash command of ``interaction``, or by the prefix command.
+        """
         self._prune()
         state = secrets.token_urlsafe(32)
         self._pending[state] = OAuthPending(
             user_id=user_id,
             guild_id=guild_id,
-            channel_id=channel_id,
+            interaction=interaction,
             created_at=time.monotonic(),
         )
         return state
@@ -163,8 +203,11 @@ class OAuthServer:
         error = request.query.get('error')
 
         if error:
+            # Anyone can open the callback with any error, so it is escaped.
             return web.Response(
-                text=_ERROR_HTML.format(message=f'Authorization denied: {error}'),
+                text=_ERROR_HTML.format(
+                    message=f'Authorization denied: {html.escape(error)}'
+                ),
                 content_type='text/html',
             )
 
@@ -183,8 +226,6 @@ class OAuthServer:
                 ),
                 content_type='text/html',
             )
-
-        channel = self.bot.get_channel(pending.channel_id)
 
         try:
             assert constants.OAUTH_CLIENT_ID is not None
@@ -226,32 +267,76 @@ class OAuthServer:
                 raise ValueError('Member not found in guild')
 
             await handle_linking.link_handle(self.bot.user_db, guild, member, user)
-
-            if channel:
-                from tle.cogs.handles import _make_profile_embed
-
-                embed = _make_profile_embed(member, user, mode='set')
-                await channel.send(embed=embed)
-
-            return web.Response(text=_SUCCESS_HTML, content_type='text/html')
-
+        except handle_linking.HandleLinkError as error:
+            # Not the bot's fault, and the same however often it is tried, so
+            # the member hears why rather than to try again.
+            logger.info(
+                'Could not link the Codeforces account of user %d: %s',
+                pending.user_id,
+                error,
+            )
+            refused = LINK_REFUSED_TEXT.format(reason=error)
+            await self._tell(
+                pending, discord.Embed(description=refused, color=discord.Color.red())
+            )
+            # The page says it too, in case the message can't reach them; it
+            # shows no Markdown, so without the code spans' backticks.
+            page = html.escape(refused.replace('`', ''))
+            return web.Response(
+                text=_ERROR_HTML.format(message=page), content_type='text/html'
+            )
         except Exception:
             logger.exception('OAuth callback error')
-            if channel:
-                import discord
-
-                embed = discord.Embed(
-                    description=(
-                        'Something went wrong during Codeforces'
-                        ' account linking. Please try again.'
-                    ),
-                    color=discord.Color.red(),
-                )
-                await channel.send(f'<@{pending.user_id}>', embed=embed)
+            failed = discord.Embed(
+                description=LINK_FAILED_TEXT, color=discord.Color.red()
+            )
+            await self._tell(pending, failed)
             return web.Response(
                 text=_ERROR_HTML.format(
                     message='An error occurred.'
                     ' Please try the command again in Discord.'
                 ),
                 content_type='text/html',
+            )
+
+        # Outside the try above: the account is linked, whatever happens to
+        # the message that says so.
+        from tle.cogs.handles import _make_profile_embed
+
+        await self._tell(pending, _make_profile_embed(member, user, mode='set'))
+        return web.Response(text=_SUCCESS_HTML, content_type='text/html')
+
+    async def _tell(self, pending: OAuthPending, embed: discord.Embed) -> None:
+        """Tell the member who signed in how it went, in ``embed``.
+
+        The slash command's interaction answers them privately; without one,
+        they get a direct message. Nothing is ever posted in a channel, so if
+        neither works, it is only logged.
+        """
+        interaction = pending.interaction
+        try:
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            user = self.bot.get_user(pending.user_id)
+            if user is None:
+                logger.info(
+                    'Could not tell user %d how linking their Codeforces account '
+                    'went: they are not in any server of the bot',
+                    pending.user_id,
+                )
+                return
+            await user.send(embed=embed)
+        except discord.HTTPException as exc:
+            # Direct messages closed, or the interaction expired.
+            logger.info(
+                'Could not tell user %d how linking their Codeforces account went: %s',
+                pending.user_id,
+                exc,
+            )
+        except Exception:
+            # Whatever went wrong, the page the member sees says how it went.
+            logger.exception(
+                'Could not tell user %d how linking their Codeforces account went',
+                pending.user_id,
             )
