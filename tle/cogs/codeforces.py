@@ -4,9 +4,9 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
-from tle import constants
 from tle.util import (
     codeforces_api as cf,
     codeforces_common as cf_common,
@@ -25,6 +25,20 @@ class CodeforcesCogError(commands.CommandError):
     pass
 
 
+# The gitgud commands and gimme run one at a time for each member (see
+# cf_common.user_guard); one used while another is running gets this reply.
+GITGUD_RUNNING_MESSAGE = (
+    'You already have a gitgud command running. Try again when it finishes.'
+)
+
+
+def _gitgud_running() -> CodeforcesCogError:
+    """The error for a gitgud command used while another one of the member's
+    is still running.
+    """
+    return CodeforcesCogError(GITGUD_RUNNING_MESSAGE)
+
+
 class Codeforces(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -33,10 +47,14 @@ class Codeforces(commands.Cog):
     async def _validate_gitgud_status(
         self, ctx: commands.Context, delta: int | None
     ) -> None:
+        # Codeforces hasn't been asked anything yet, so a refusal here gives
+        # back the use that the command's cooldown counted.
         if delta is not None and delta % 100 != 0:
+            discord_common.undo_cooldown(ctx)
             raise CodeforcesCogError('Delta must be a multiple of 100.')
 
         if delta is not None and abs(delta) > _GITGUD_MAX_ABS_DELTA_VALUE:
+            discord_common.undo_cooldown(ctx)
             raise CodeforcesCogError(
                 f'Delta must range from -{_GITGUD_MAX_ABS_DELTA_VALUE}'
                 f' to {_GITGUD_MAX_ABS_DELTA_VALUE}.'
@@ -47,6 +65,7 @@ class Codeforces(commands.Cog):
         if active is not None:
             _, _, name, contest_id, index, _ = active
             url = f'{cf.CONTEST_BASE_URL}{contest_id}/problem/{index}'
+            discord_common.undo_cooldown(ctx)
             raise CodeforcesCogError(f'You have an active challenge {name} at {url}')
 
     async def _gitgud(
@@ -69,12 +88,33 @@ class Codeforces(commands.Cog):
         embed.add_field(name='Rating', value=problem.rating)
         await ctx.send(f'Challenge problem for `{handle}`', embed=embed)
 
-    @commands.hybrid_command(brief='Upsolve a problem')
-    @cf_common.user_guard(group='gitgud')
-    async def upsolve(self, ctx: commands.Context, choice: int = -1) -> None:
-        """Request an unsolved problem from a contest you participated in
+    # The cooldowns of the commands below count a use only once the command's
+    # arguments are parsed, so that a mistyped command costs no wait.
+    @commands.hybrid_command(
+        brief='Upsolve a problem from a contest you took part in, for gitgud points',
+        cooldown_after_parsing=True,
+    )
+    @app_commands.describe(
+        choice="A problem's number in the list, to take it as your gitgud challenge; "
+        'shows the list if left out'
+    )
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
+    async def upsolve(self, ctx: commands.Context, choice: int | None = None) -> None:
+        """Upsolve a problem from a rated contest you took part in, for gitgud points.
+
+        Without a number, it lists the newest problems you haven't solved from
+        those contests, rated within 300 of your rating. With a problem's number,
+        that problem becomes your gitgud challenge, and its points depend on its
+        rating minus yours:
+
         delta  | -300 | -200 | -100 |  0  | +100 | +200 | +300
         points |   2  |   3  |   5  |  8  |  12  |  17  |  23
+
+        Examples:
+            /upsolve
+            /upsolve choice:2
+            ;upsolve 2
         """
         await self._validate_gitgud_status(ctx, delta=None)
         (handle,) = await cf_common.resolve_handles(
@@ -82,9 +122,12 @@ class Codeforces(commands.Cog):
         )
         user = await self.bot.user_db.fetch_cf_user(handle)
         rating = round(user.effective_rating, -2)
-        resp = await cf.user.rating(handle=handle)
+        # Codeforces may take longer than the 3 seconds a slash command has to
+        # answer, so typing defers the answer first.
+        async with ctx.typing():
+            resp = await cf.user.rating(handle=handle)
+            submissions = await cf.user.status(handle=handle)
         contests = {change.contestId for change in resp}
-        submissions = await cf.user.status(handle=handle)
         solved = {sub.problem.name for sub in submissions if sub.verdict == 'OK'}
         problems = [
             prob
@@ -106,7 +149,7 @@ class Codeforces(commands.Cog):
             reverse=True,
         )
 
-        if choice > 0 and choice <= len(problems):
+        if choice is not None and 0 < choice <= len(problems):
             problem = problems[choice - 1]
             await self._gitgud(ctx, handle, problem, problem.rating - rating)
         else:
@@ -118,9 +161,25 @@ class Codeforces(commands.Cog):
             embed = discord_common.cf_color_embed(title=title, description=msg)
             await ctx.send(embed=embed)
 
-    @commands.command(brief='Recommend a problem', usage='[+tag..] [~tag..] [rating]')
-    @cf_common.user_guard(group='gitgud')
+    @commands.command(
+        brief="Get a random Codeforces problem you haven't solved, by rating and tags",
+        usage='[rating] [+tag...] [~tag...]',
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
     async def gimme(self, ctx: commands.Context, *args: str) -> None:
+        """Get a random Codeforces problem you haven't solved, at your rating.
+
+        Add a rating, such as 1800, for a problem of that rating instead. Add
+        tags with `+` to ask for them, or with `~` to rule them out: part of a
+        tag's name is enough, such as `+binary` for binary search.
+
+        Examples:
+            ;gimme
+            ;gimme 1800
+            ;gimme +dp ~math 1600
+        """
         (handle,) = await cf_common.resolve_handles(
             ctx, self.converter, ('!' + str(ctx.author),)
         )
@@ -167,12 +226,32 @@ class Codeforces(commands.Cog):
         await ctx.send(f'Recommended problem for `{handle}`', embed=embed)
 
     @commands.command(
-        brief='List solved problems',
-        usage='[handles] [+hardest] [+practice] [+contest] [+virtual] [+outof] [+team] [+tag..] [~tag..] [r>=rating] [r<=rating] [d>=[[dd]mm]yyyy] [d<[[dd]mm]yyyy] [c+marker..] [i+index..]',  # noqa: E501
+        brief='List the problems you or other Codeforces users solved, newest first',
+        usage='[handles...] [+hardest] [filters...]',
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def stalk(self, ctx: commands.Context, *args: str) -> None:
-        """Print problems solved by user sorted by time (default) or rating.
-        All submission types are included by default (practice, contest, etc.)
+        """List the problems you or other Codeforces users solved, newest first.
+
+        Give up to 5 Codeforces handles, or members' names after `!`; without
+        any, it lists yours. Add `+hardest` to list the highest-rated first, and
+        any of these filters:
+        - `+contest`, `+virtual`, `+practice`: solved that way only
+        - `+outof`: solved out of competition only
+        - `+team`: count team solutions too
+        - `+dp`, `~math`: with that tag, or without it
+        - `r>=1500`, `r<=2000`: rated at least, or at most, that
+        - `d>=2024`, `d<01062025`: solved from, or before, that date
+        - `c+edu`: from contests whose names contain that text
+        - `i+A`: with that problem index
+
+        Dates are yyyy, mmyyyy or ddmmyyyy.
+
+        Examples:
+            ;stalk
+            ;stalk tourist +hardest
+            ;stalk +dp r>=1800 d>=2024
         """
         (hardest,), remaining = cf_common.filter_flags(args, ['+hardest'])
         filt = cf_common.SubFilter(False)
@@ -223,13 +302,22 @@ class Codeforces(commands.Cog):
             ctx=ctx,
         )
 
-    @commands.command(brief='Create a mashup', usage='[handles] [+tag..] [~tag..]')
+    @commands.command(
+        brief='Pick four problems that none of you has tried, for a mashup contest',
+        usage='[handles...] [+tag...] [~tag...]',
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def mashup(self, ctx: commands.Context, *args: str) -> None:
-        """Create a mashup contest.
+        """Pick four problems that none of you has tried, for a mashup contest.
 
-        The contest uses problems within +-100 of average rating of handles provided.
-        Add tags with "+" before them.
-        Ban tags with "~" before them.
+        Give up to 5 Codeforces handles, or members' names after `!`; without
+        any, it picks for you. The problems are rated within 100 of your average
+        rating. Add tags with `+` to ask for them, or with `~` to rule them out.
+
+        Examples:
+            ;mashup
+            ;mashup tourist !alice +greedy ~math
         """
         handles: list[str] = [arg for arg in args if arg[0] not in '+~']
         tags = cf_common.parse_tags(args, prefix='+')
@@ -287,12 +375,29 @@ class Codeforces(commands.Cog):
         embed = discord_common.cf_color_embed(description=msg)
         await ctx.send(f'Mashup contest for `{str_handles}`', embed=embed)
 
-    @commands.hybrid_command(brief='Challenge')
-    @cf_common.user_guard(group='gitgud')
+    @commands.hybrid_command(
+        brief='Get a problem to solve for gitgud points', cooldown_after_parsing=True
+    )
+    @app_commands.describe(
+        delta="The problem's rating minus yours, from -300 to 300 in steps of 100; "
+        '0 if left out'
+    )
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
     async def gitgud(self, ctx: commands.Context, delta: int = 0) -> None:
-        """Request a problem for gitgud points.
+        """Get a problem to solve for gitgud points.
+
+        It is one you haven't tried, rated your rating plus delta, and is worth
+        the points below. Claim them with gotgud once you have solved it, or skip
+        it with nogud. You can have one challenge at a time.
+
         delta  | -300 | -200 | -100 |  0  | +100 | +200 | +300
         points |   2  |   3  |   5  |  8  |  12  |  17  |  23
+
+        Examples:
+            /gitgud
+            /gitgud delta:200
+            ;gitgud -100
         """
         await self._validate_gitgud_status(ctx, delta)
         (handle,) = await cf_common.resolve_handles(
@@ -300,7 +405,10 @@ class Codeforces(commands.Cog):
         )
         user = await self.bot.user_db.fetch_cf_user(handle)
         rating = round(user.effective_rating, -2)
-        submissions = await cf.user.status(handle=handle)
+        # Codeforces may take longer than the 3 seconds a slash command has to
+        # answer, so typing defers the answer first.
+        async with ctx.typing():
+            submissions = await cf.user.status(handle=handle)
         solved = {sub.problem.name for sub in submissions}
         noguds = await self.bot.user_db.get_noguds(ctx.message.author.id)
 
@@ -335,13 +443,22 @@ class Codeforces(commands.Cog):
         choice = max(random.randrange(len(problems)) for _ in range(2))
         await self._gitgud(ctx, handle, problems[choice], delta)
 
-    @commands.hybrid_command(brief='Print user gitgud history')
+    @commands.hybrid_command(brief="Show your gitgud history, or another member's")
+    @app_commands.describe(
+        member='The member whose gitgud history to show; you if left out'
+    )
     async def gitlog(
         self, ctx: commands.Context, member: discord.Member | None = None
     ) -> None:
-        """Displays the list of gitgud problems issued to the specified member,
-        excluding those noguded by admins. If the challenge was completed, time
-        of completion and amount of points gained will also be displayed.
+        """Show your gitgud history, or another member's, newest first.
+
+        Each problem shows its rating and, once solved, when and for how many
+        points. Challenges that staff skipped are left out.
+
+        Examples:
+            /gitlog
+            /gitlog member:@alice
+            ;gitlog @alice
         """
 
         def make_line(entry: tuple) -> str:
@@ -377,9 +494,19 @@ class Codeforces(commands.Cog):
             ctx=ctx,
         )
 
-    @commands.hybrid_command(brief='Report challenge completion')
-    @cf_common.user_guard(group='gitgud')
+    @commands.hybrid_command(
+        brief='Claim the points for your gitgud challenge once you have solved it'
+    )
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
     async def gotgud(self, ctx: commands.Context) -> None:
+        """Claim the points for your gitgud challenge once you have solved it.
+
+        It counts as solved once Codeforces has accepted a solution of yours.
+
+        Examples:
+            /gotgud
+            ;gotgud
+        """
         (handle,) = await cf_common.resolve_handles(
             ctx, self.converter, ('!' + str(ctx.author),)
         )
@@ -388,7 +515,10 @@ class Codeforces(commands.Cog):
         if not active:
             raise CodeforcesCogError('You do not have an active challenge')
 
-        submissions = await cf.user.status(handle=handle)
+        # Codeforces may take longer than the 3 seconds a slash command has to
+        # answer, so typing defers the answer first.
+        async with ctx.typing():
+            submissions = await cf.user.status(handle=handle)
         solved = {sub.problem.name for sub in submissions if sub.verdict == 'OK'}
 
         challenge_id, issue_time, name, contestId, index, delta = active
@@ -408,9 +538,18 @@ class Codeforces(commands.Cog):
         else:
             await ctx.send('You have already claimed your points')
 
-    @commands.hybrid_command(brief='Skip challenge')
-    @cf_common.user_guard(group='gitgud')
+    @commands.hybrid_command(brief='Skip your gitgud challenge, without points')
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
     async def nogud(self, ctx: commands.Context) -> None:
+        """Skip your gitgud challenge, without points.
+
+        You can skip it once 3 hours have passed since you got it, and gitgud
+        won't give you that problem again.
+
+        Examples:
+            /nogud
+            ;nogud
+        """
         await cf_common.resolve_handles(ctx, self.converter, ('!' + str(ctx.author),))
         user_id = ctx.message.author.id
         active = await self.bot.user_db.check_challenge(user_id)
@@ -428,11 +567,24 @@ class Codeforces(commands.Cog):
         await self.bot.user_db.skip_challenge(user_id, challenge_id, Gitgud.NOGUD)
         await ctx.send('Challenge skipped.')
 
-    @commands.hybrid_command(brief='Force skip a challenge')
-    @cf_common.user_guard(group='gitgud')
-    @commands.has_any_role(constants.TLE_ADMIN, constants.TLE_MODERATOR)
+    @commands.hybrid_command(brief="Skip a member's gitgud challenge for them")
+    @app_commands.describe(member='The member whose gitgud challenge to skip')
+    @cf_common.user_guard(group='gitgud', get_exception=_gitgud_running)
     async def _nogud(self, ctx: commands.Context, member: discord.Member) -> None:
+        """Skip a member's gitgud challenge for them, at once and without points.
+
+        The challenge leaves their gitgud history, and gitgud may give them the
+        problem again.
+
+        Examples:
+            /_nogud member:@alice
+            ;_nogud @alice
+        """
         active = await self.bot.user_db.check_challenge(member.id)
+        if active is None:
+            raise CodeforcesCogError(
+                f'{member.mention} has no gitgud challenge to skip.'
+            )
         rc = await self.bot.user_db.skip_challenge(
             member.id, active[0], Gitgud.FORCED_NOGUD
         )
@@ -441,10 +593,25 @@ class Codeforces(commands.Cog):
         else:
             await ctx.send('Failed to force challenge skip.')
 
-    @commands.command(brief='Recommend a contest', usage='[handles...] [+pattern...]')
+    @commands.command(
+        brief='Suggest past contests that none of you has tried, for a virtual contest',
+        usage='[handles...] [+text...]',
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def vc(self, ctx: commands.Context, *args: str) -> None:
-        """Recommends a contest based on Codeforces rating of the handle provided.
-        e.g ;vc mblazev c1729 +global +hello +goodbye +avito"""
+        """Suggest past contests that none of you has tried, for a virtual contest.
+
+        Give up to 25 Codeforces handles, or members' names after `!`; without
+        any, it suggests contests for you. They suit your average rating: Div. 3
+        below 1600, Div. 2 below 2100, and Div. 1, Global and similar rounds from
+        2100. Add `+text` for contests whose names contain that text instead, such
+        as `+edu`.
+
+        Examples:
+            ;vc
+            ;vc tourist !alice +global
+        """
         markers = [x for x in args if x[0] == '+']
         handles = [x for x in args if x[0] != '+'] or ['!' + str(ctx.author)]
         handles = await cf_common.resolve_handles(
@@ -509,12 +676,21 @@ class Codeforces(commands.Cog):
         )
 
     @commands.command(
-        brief='Display unsolved rounds closest to completion', usage='[keywords]'
+        brief='List the contests you have partly solved, fewest problems left first',
+        usage='[+text...]',
+        cooldown_after_parsing=True,
     )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def fullsolve(self, ctx: commands.Context, *args: str) -> None:
-        """Displays a list of contests, sorted by number of unsolved problems.
-        Contest names matching any of the provided tags will be considered. e.g
-        ;fullsolve +edu"""
+        """List the contests you have partly solved, fewest problems left first.
+
+        Add `+text` to list only the contests whose names contain that text, such
+        as `+edu`.
+
+        Examples:
+            ;fullsolve
+            ;fullsolve +edu
+        """
         (handle,) = await cf_common.resolve_handles(
             ctx, self.converter, ('!' + str(ctx.author),)
         )
@@ -613,11 +789,25 @@ class Codeforces(commands.Cog):
                 right = r
         return round((left + right) / 2)
 
-    @commands.command(brief='Calculate team rating', usage='[handles] [+peak]')
+    @commands.command(
+        brief="Work out a team's rating from its members' ratings",
+        usage='[handles...] [+peak] [+server]',
+        cooldown_after_parsing=True,
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
     async def teamrate(self, ctx: commands.Context, *args: str) -> None:
-        """Provides the combined rating of the entire team. If +server is
-        provided as the only handle, will display the rating of the entire
-        server. Supports multipliers. e.g: ;teamrate gamegame*1000"""
+        """Work out a team's rating from its members' ratings.
+
+        Give their Codeforces handles, or members' names after `!`; without any,
+        it rates you alone. Add `*2` after a handle to count it twice, `+peak` to
+        use everyone's highest rating, or `+server` to rate everyone in this
+        server who has linked a handle. Unrated players don't count.
+
+        Examples:
+            ;teamrate tourist Petr
+            ;teamrate tourist*2 !alice +peak
+            ;teamrate +server
+        """
 
         (is_entire_server, peak), handles = cf_common.filter_flags(
             args, ['+server', '+peak']
@@ -681,7 +871,7 @@ class Codeforces(commands.Cog):
             ]
 
         if len(ratings) == 0:
-            raise CodeforcesCogError('No CF usernames with ratings passed in.')
+            raise CodeforcesCogError('None of these Codeforces handles has a rating.')
 
         left = -100.0
         right = 10000.0
