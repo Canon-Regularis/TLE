@@ -23,8 +23,12 @@ logger = logging.getLogger(__name__)
 
 # The most Codeforces handles that one user.info request asks about.
 CODEFORCES_BATCH = 300
-# A refresh of every account that couldn't fetch some logs at WARNING at most
-# this often, and at INFO in between: a site that is down fails every refresh.
+# A refresh of every account that couldn't fetch some on a site other than
+# Codeforces logs at WARNING at most this often, and at INFO in between: a site
+# that is down fails every refresh. Failures on Codeforces alone are logged at
+# INFO, because they all come from TLE's client, which reports them itself: an
+# outage once it has lasted 15 minutes, a refusal it doesn't expect, and the
+# call limit hit 3 times in a row.
 _FAILURE_WARNING_INTERVAL = timedelta(days=1)
 
 # An account: (platform, handle).
@@ -135,7 +139,8 @@ class RatingRefresher:
 
     def _log_refresh(self, report: RefreshReport) -> None:
         level = logging.INFO
-        if report.failed:
+        # TLE's client reports Codeforces' failures itself.
+        if any(platform != CODEFORCES for platform, _ in report.failed):
             now = self._clock.now()
             last = self._last_warning
             if last is None or now - last >= _FAILURE_WARNING_INTERVAL:
