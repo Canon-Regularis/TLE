@@ -57,15 +57,25 @@ async def initialize(bot: Any, nodb: bool) -> None:
     bot.cf_cache = cf_cache
     bot.event_sys = event_sys
 
+    _contest_id_to_writers_map = _load_contest_writers()
+
+
+def _load_contest_writers() -> dict[int, list[str]] | None:
+    """The writers of each contest, by contest id, from the contest writers
+    file; None without the file.
+    """
     try:
         with open(constants.CONTEST_WRITERS_JSON_FILE_PATH) as f:
             data = json.load(f)
-        _contest_id_to_writers_map = {
-            contest['id']: [s.lower() for s in contest['writers']] for contest in data
-        }
-        logger.info('Contest writers loaded from JSON file')
     except FileNotFoundError:
-        logger.warning('JSON file containing contest writers not found')
+        # The file is optional, so its absence is no news for the log channel.
+        logger.info('JSON file containing contest writers not found')
+        return None
+    writers = {
+        contest['id']: [s.lower() for s in contest['writers']] for contest in data
+    }
+    logger.info('Contest writers loaded from JSON file')
+    return writers
 
 
 # algmyr's guard idea:

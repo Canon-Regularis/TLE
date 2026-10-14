@@ -319,9 +319,11 @@ class FakeCodeforces:
         self.listed = list(LISTED)
         self.standings = {key: list(value) for key, value in STANDINGS.items()}
         self.list_fails = False
-        # The contests whose standings Codeforces fails to give, and those
-        # whose standings break with an error that isn't Codeforces'.
+        # The contests whose standings Codeforces fails to give, those whose
+        # standings it keeps private, as for some of its practice rounds, and
+        # those whose standings break with an error that isn't Codeforces'.
         self.failing: set[int] = set()
+        self.private: set[int] = set()
         self.broken: dict[int, Exception] = {}
         # The contests whose standings never come, and what is set once they
         # are asked for.
@@ -357,6 +359,11 @@ class FakeCodeforces:
         self.requests.append(f'contest.standings {contest_id}')
         if contest_id in self.failing:
             raise cf.TrueApiError('HTTP Error 503, Service Unavailable')
+        if contest_id in self.private:
+            # What the client raises for Codeforces' answer to them.
+            raise cf.ContestNotFoundError(
+                f'contestId: Contest with id {contest_id} not found', contest_id
+            )
         if contest_id in self.broken:
             raise self.broken[contest_id]
         if contest_id in self.hanging:
@@ -651,6 +658,33 @@ async def test_standings_without_problems_wait_24_hours_too(
         cache, codeforces, clock, UNLISTED, failed_at
     )
     assert (await stored(cache_db))[UNLISTED] == EXPECTED[UNLISTED]
+
+
+async def test_private_standings_are_no_failure_and_wait_24_hours_too(
+    cache: ProblemsetCache,
+    cache_db: CacheDbConn,
+    codeforces: FakeCodeforces,
+    clock: Clock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Codeforces lists the contest, but says it has no such contest when asked
+    # for its standings, as for some of its practice rounds.
+    codeforces.private = {UNLISTED}
+    failed_at = clock.now = NOW + 10
+
+    with caplog.at_level(logging.INFO):
+        await hourly(cache)
+
+    assert await stored(cache_db) == expected(OLD_SOLO, SOLO, DIV1, DIV2)
+    assert 'Standings of contest 2104 are not public.' in caplog.messages
+    # Nothing is missing that Codeforces would give, so there is no summary.
+    assert not [message for message in caplog.messages if 'still missing' in message]
+    assert warnings_and_errors(caplog) == []
+
+    # Not asked for again every hour.
+    await assert_asked_again_after_24_hours(
+        cache, codeforces, clock, UNLISTED, failed_at
+    )
 
 
 async def test_each_contest_waits_24_hours_from_its_own_failure(
@@ -1353,6 +1387,31 @@ async def test_updating_every_contest_goes_on_past_any_failure_of_a_contest(
     assert [record.getMessage() for record in warnings_and_errors(caplog)] == [
         'Problems of contest 2102 not saved.'
     ]
+
+
+async def test_updating_every_contest_leaves_private_standings_out_of_failures(
+    cache: ProblemsetCache,
+    cache_db: CacheDbConn,
+    codeforces: FakeCodeforces,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A practice round whose standings Codeforces keeps private, and a real
+    # failure.
+    codeforces.private = {OLD_UNLISTED}
+    codeforces.failing = {DIV2}
+
+    with caplog.at_level(logging.INFO):
+        update = await cache.update_for_all()
+
+    # Only the real failure is reported; the practice round was asked about
+    # once, and has nothing stored.
+    assert update.failed == [DIV2]
+    assert codeforces.standings_requests().count(OLD_UNLISTED) == 1
+    found = await stored(cache_db)
+    assert OLD_UNLISTED not in found and DIV2 not in found
+    assert update.problems == sum(len(rows) for rows in found.values())
+    assert 'Standings of contest 2004 are not public.' in caplog.messages
+    assert warnings_and_errors(caplog) == []
 
 
 async def test_updating_every_contest_ignores_the_hourly_backoff(

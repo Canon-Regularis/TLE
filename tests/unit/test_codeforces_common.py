@@ -3,14 +3,18 @@
 We skip anything that depends on discord globals, bot state, or discord.ext.commands.
 """
 
+import json
+import logging
 import time
 
 import pytest
 
+from tle import constants
 from tle.util import codeforces_api as cf
 from tle.util.codeforces_common import (
     ParamParseError,
     SubFilter,
+    _load_contest_writers,
     days_ago,
     filter_flags,
     fix_urls,
@@ -346,3 +350,41 @@ class TestSubFilterRatingChanges:
         ]
         filtered = sf.filter_rating_changes(changes)
         assert len(filtered) == 0
+
+
+class TestLoadContestWriters:
+    def test_a_missing_file_is_only_information(self, tmp_path, monkeypatch, caplog):
+        # The file is optional: its absence never reaches the log channel.
+        missing = tmp_path / 'contest_writers.json'
+        monkeypatch.setattr(constants, 'CONTEST_WRITERS_JSON_FILE_PATH', str(missing))
+
+        with caplog.at_level(logging.INFO):
+            assert _load_contest_writers() is None
+
+        assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+            (logging.INFO, 'JSON file containing contest writers not found')
+        ]
+
+    def test_the_file_gives_each_contest_s_writers(self, tmp_path, monkeypatch, caplog):
+        path = tmp_path / 'contest_writers.json'
+        path.write_text(
+            json.dumps([{'id': 2273, 'writers': ['Alice', 'bob']}]), encoding='utf-8'
+        )
+        monkeypatch.setattr(constants, 'CONTEST_WRITERS_JSON_FILE_PATH', str(path))
+
+        with caplog.at_level(logging.INFO):
+            assert _load_contest_writers() == {2273: ['alice', 'bob']}
+
+        assert caplog.messages == ['Contest writers loaded from JSON file']
+
+    def test_a_broken_file_raises_without_saying_it_loaded(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        path = tmp_path / 'contest_writers.json'
+        path.write_text(json.dumps([{'id': 2273}]), encoding='utf-8')
+        monkeypatch.setattr(constants, 'CONTEST_WRITERS_JSON_FILE_PATH', str(path))
+
+        with caplog.at_level(logging.INFO), pytest.raises(KeyError):
+            _load_contest_writers()
+
+        assert caplog.messages == []
