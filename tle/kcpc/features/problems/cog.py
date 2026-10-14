@@ -10,7 +10,9 @@
   attached under /kcpc (see ``tle.kcpc.bot.admin``).
 - The job problems.refresh keeps both platforms' problem lists in memory
   (see ``catalog``): it runs as the bot starts and then every 30 minutes,
-  fetching a list again once it is older than its max age. The job
+  fetching a list again once it is older than its max age. While a site is
+  down, its list stays as it was: each failed fetch is logged at INFO, and
+  the third in a row at WARNING, but only a bug fails the job. The job
   weekly.post runs each Friday at noon, club time, posting last week's
   solution, then the new problem, in every server with the weekly problem on
   that the bot is in (see ``weekly``). A fresh install posts from the next
@@ -59,6 +61,7 @@ from tle.kcpc.features.problems import markdown
 from tle.kcpc.features.problems.catalog import (
     ATCODER,
     CODEFORCES,
+    PLATFORMS,
     Problem,
     ProblemCatalog,
     ProblemRef,
@@ -118,6 +121,9 @@ REFRESH_JOB = 'problems.refresh'
 # How often the problem lists are checked: each is fetched again only once it
 # is older than its max age (see ProblemCatalog).
 _REFRESH_INTERVAL = timedelta(minutes=30)
+# A platform's failures are logged at INFO, except the one that makes this many
+# in a row, at WARNING (which reaches the Discord log channel): once a streak.
+_FAILURES_TO_WARN = 3
 # How late the weekly job may still post a Friday it missed, while the bot was
 # down, say: the same afternoon is worth it, the next day not.
 _CATCH_UP_GRACE = timedelta(hours=6)
@@ -312,6 +318,9 @@ class KcpcProblems(KcpcCog):
     # Each server's queue, which unqueue suggests from; read again after every
     # change, the weekly job's picks among them.
     _queues: dict[int, tuple[QueuedProblem, ...]]
+    # How many refreshes of each platform's list have failed in a row, its site
+    # being down; kept in memory, as the lists are.
+    _refresh_failures: dict[str, int]
 
     async def cog_load(self) -> None:
         """Make the services, add the admin commands, then the jobs.
@@ -344,6 +353,7 @@ class KcpcProblems(KcpcCog):
             in_guild=self._in_guild,
         )
         self._queues = {}
+        self._refresh_failures = {}
         await self._refresh_queues()
         self._nest_subcommands()
         added: list[str] = []
@@ -821,21 +831,46 @@ class KcpcProblems(KcpcCog):
     async def _refresh_problems(self, slot: datetime) -> None:
         """Refresh each platform's problem list that is due (see the catalog).
 
-        A platform that fails keeps the list it had. Each failure is logged,
-        then the job fails, so that the scheduler reports it.
+        A platform that fails keeps the list it had. A site that is down
+        (``ExternalServiceError``) doesn't fail the job. Each of its failures
+        is logged at INFO, except the one that makes ``_FAILURES_TO_WARN`` in
+        a row, which is logged at WARNING. The first refresh that works again
+        ends the streak and is logged at INFO. Anything else is a bug: logged
+        here with its traceback, it fails the job, whose error names only the
+        platforms with bugs, so that the scheduler reports it.
         """
         # Each run refreshes the lists as they are now, whichever slot it is for.
         failures = await self._catalog.refresh()
-        for platform, error in failures.items():
+        bugs: dict[str, Exception] = {}
+        for platform in PLATFORMS:
             owner = platform_possessive(platform)
-            if isinstance(error, ExternalServiceError):
-                logger.info('Could not refresh %s problem list: %s', owner, error)
+            error = failures.get(platform)
+            if error is None:  # the list was fetched, or is fresh
+                streak = self._refresh_failures.pop(platform, 0)
+                if streak:
+                    logger.info(
+                        'Refreshed %s problem list again after %d failed %s',
+                        owner,
+                        streak,
+                        'attempt' if streak == 1 else 'attempts',
+                    )
+            elif isinstance(error, ExternalServiceError):
+                streak = self._refresh_failures.get(platform, 0) + 1
+                self._refresh_failures[platform] = streak
+                logger.log(
+                    logging.WARNING if streak == _FAILURES_TO_WARN else logging.INFO,
+                    'Could not refresh %s problem list (consecutive failures: %d): %s',
+                    owner,
+                    streak,
+                    error,
+                )
             else:
                 logger.info('Could not refresh %s problem list', owner, exc_info=error)
-        if failures:
-            failed = ', '.join(platform_name(platform) for platform in failures)
+                bugs[platform] = error
+        if bugs:
+            failed = ', '.join(platform_name(platform) for platform in bugs)
             message = f'Could not refresh the problem lists of: {failed}'
-            raise RuntimeError(message) from next(iter(failures.values()))
+            raise RuntimeError(message) from next(iter(bugs.values()))
 
     async def _post_weekly(self, slot: datetime) -> None:
         """Post every server's weekly problem for ``slot``; see ``WeeklyService``.

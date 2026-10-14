@@ -28,6 +28,7 @@ from tle.util import (
     discord_common,
     graph_common as gc,
 )
+from tle.util.cache import ContestNotFound, ProblemsetNotCached
 
 pd.plotting.register_matplotlib_converters()
 
@@ -47,6 +48,23 @@ NO_RATED_MEMBERS_MESSAGE = (
 )
 NO_COUNTRIES_MESSAGE = (
     'No member of this server has linked a Codeforces handle with a country yet.'
+)
+# ;plot extreme's replies when the bot has the problems of none of the
+# handle's rated contests, or only problems that Codeforces hasn't rated yet,
+# and its note on a plot that leaves some of the contests out.
+NO_EXTREMES_MESSAGE = (
+    "The bot doesn't have the problems of `{handle}`'s contests yet, so there "
+    'is nothing to plot.'
+)
+NO_RATED_EXTREMES_MESSAGE = (
+    "Codeforces hasn't rated the problems of `{handle}`'s contests yet, so "
+    'there is nothing to plot.'
+)
+EXTREMES_LEFT_OUT_NOTE = (
+    "Leaves out {count} contests whose problems the bot doesn't have yet."
+)
+EXTREMES_LEFT_OUT_ONE_NOTE = (
+    "Leaves out 1 contest whose problems the bot doesn't have yet."
 )
 
 
@@ -233,27 +251,29 @@ def _plot_extreme(
         plt.scatter(*args, **kwargs)
 
     plt.clf()
-    time_scatter, plot_min, plot_max = zip(*regular, strict=False)
-    if unsolved:
-        scatter_outline(
-            time_scatter,
-            plot_min,
-            zorder=10,
-            s=14,
-            marker='o',
-            color=unsolvedcolor,
-            label='Easiest unsolved',
-        )
-    if solved:
-        scatter_outline(
-            time_scatter,
-            plot_max,
-            zorder=10,
-            s=14,
-            marker='o',
-            color=solvedcolor,
-            label='Hardest solved',
-        )
+    # Every contest may be fully solved, or not solved at all.
+    if regular:
+        time_scatter, plot_min, plot_max = zip(*regular, strict=False)
+        if unsolved:
+            scatter_outline(
+                time_scatter,
+                plot_min,
+                zorder=10,
+                s=14,
+                marker='o',
+                color=unsolvedcolor,
+                label='Easiest unsolved',
+            )
+        if solved:
+            scatter_outline(
+                time_scatter,
+                plot_max,
+                zorder=10,
+                s=14,
+                marker='o',
+                color=solvedcolor,
+                label='Hardest solved',
+            )
 
     ax = plt.gca()
     if solved and unsolved:
@@ -278,7 +298,11 @@ def _plot_extreme(
         )
 
     if legend:
+        # The labelled points, given explicitly: there may be none, and then
+        # matplotlib would warn about a legend that has only its title.
+        handles, _ = ax.get_legend_handles_labels()
         plt.legend(
+            handles=handles,
             title=f'{handle}: {rating}',
             title_fontsize=plt.rcParams['legend.fontsize'],
             loc='upper left',
@@ -466,21 +490,39 @@ class Graphs(commands.Cog):
         if not ratingchanges:
             raise GraphCogError(f'User {handle} is not rated')
 
-        contest_ids = [change.contestId for change in ratingchanges]
+        # The contests whose problems the bot has; the others are left out.
+        contests: list[tuple[cf.Contest, list[cf.Problem]]] = []
+        for change in ratingchanges:
+            try:
+                contest = self.bot.cf_cache.contest_cache.get_contest(change.contestId)
+                problemset = await self.bot.cf_cache.problemset_cache.get_problemset(
+                    change.contestId
+                )
+            except (ContestNotFound, ProblemsetNotCached):
+                continue
+            contests.append((contest, problemset))
+        if not contests:
+            raise GraphCogError(NO_EXTREMES_MESSAGE.format(handle=handle))
+        # Only a contest with a rated problem gives a point, and Codeforces
+        # rates a contest's problems days after it ends.
+        if not any(
+            problem.rating is not None
+            for _, problemset in contests
+            for problem in problemset
+        ):
+            raise GraphCogError(NO_RATED_EXTREMES_MESSAGE.format(handle=handle))
+        left_out = len(ratingchanges) - len(contests)
+
         subs_by_contest_id: dict[int, list[cf.Submission]] = {
-            contest_id: [] for contest_id in contest_ids
+            contest.id: [] for contest, _ in contests
         }
         for sub in await cf.user.status(handle=handle):
             if sub.contestId in subs_by_contest_id:
                 subs_by_contest_id[sub.contestId].append(sub)
 
         packed_contest_subs_problemset = [
-            (
-                self.bot.cf_cache.contest_cache.get_contest(contest_id),
-                await self.bot.cf_cache.problemset_cache.get_problemset(contest_id),
-                subs_by_contest_id[contest_id],
-            )
-            for contest_id in contest_ids
+            (contest, problemset, subs_by_contest_id[contest.id])
+            for contest, problemset in contests
         ]
 
         rating = max(
@@ -492,6 +534,10 @@ class Graphs(commands.Cog):
 
         discord_file = gc.get_current_figure_as_file()
         embed = discord_common.cf_color_embed(title='Codeforces extremes graph')
+        if left_out == 1:
+            embed.description = EXTREMES_LEFT_OUT_ONE_NOTE
+        elif left_out:
+            embed.description = EXTREMES_LEFT_OUT_NOTE.format(count=left_out)
         discord_common.attach_image(embed, discord_file)
         discord_common.set_author_footer(embed, ctx.author)
         await ctx.send(embed=embed, file=discord_file)

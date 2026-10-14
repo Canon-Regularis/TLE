@@ -36,27 +36,32 @@ class RatingChangesCache:
         self._update_task.start()
 
     async def fetch_contest(self, contest_id: int) -> int:
-        """Fetch rating changes for a specific contest.
+        """Fetch rating changes for a specific contest; the number fetched.
 
-        Intended for manual trigger.
+        Intended for manual trigger. A Codeforces error is raised, so that the
+        command says what went wrong. The stored changes are replaced only
+        when new ones arrive.
         """
         contest = self.cache_master.contest_cache.contest_by_id[contest_id]
-        changes = await self._fetch([contest])
-        await self.cache_master.conn.clear_rating_changes(contest_id=contest_id)
-        await self._save_changes(changes)
+        changes = await cf.contest.ratingChanges(contest_id=contest.id)
+        if changes:
+            await self._replace_changes([(contest, changes)])
         await self._refresh_handle_cache()
         return len(changes)
 
     async def fetch_all_contests(self) -> int:
-        """Fetch rating changes for all contests.
+        """Fetch rating changes for all contests; the number fetched.
 
-        Intended for manual trigger.
+        Intended for manual trigger. A contest that Codeforces fails for keeps
+        the changes it had, as the stored changes of each contest are replaced
+        only when its new ones arrive.
         """
-        await self.cache_master.conn.clear_rating_changes()
-        return await self.fetch_missing_contests()
+        contests = self.cache_master.contest_cache.contests_by_phase['FINISHED']
+        return await self._fetch_and_replace(contests)
 
     async def fetch_missing_contests(self) -> int:
-        """Fetch rating changes for contests which are not saved in database.
+        """Fetch rating changes for contests which are not saved in database;
+        the number fetched.
 
         Intended for manual trigger.
         """
@@ -66,13 +71,20 @@ class RatingChangesCache:
             for contest in contests
             if not await self.has_rating_changes_saved(contest.id)
         ]
+        return await self._fetch_and_replace(contests)
+
+    async def _fetch_and_replace(self, contests: list[cf.Contest]) -> int:
+        """Fetch the rating changes of ``contests``, a batch at a time, and
+        replace the stored changes of each contest whose new ones arrive; the
+        number of changes fetched.
+        """
         total_changes = 0
         for contests_chunk in paginator.chunkify(
             contests, _CONTESTS_PER_BATCH_IN_CACHE_UPDATES
         ):
-            contests_chunk = await self._fetch(list(contests_chunk))
-            await self._save_changes(contests_chunk)
-            total_changes += len(contests_chunk)
+            contest_changes_pairs = await self._fetch(list(contests_chunk))
+            await self._replace_changes(contest_changes_pairs)
+            total_changes += sum(len(changes) for _, changes in contest_changes_pairs)
         await self._refresh_handle_cache()
         return total_changes
 
@@ -152,11 +164,12 @@ class RatingChangesCache:
                 if changes:
                     all_changes.append((contest, changes))
             except cf.CodeforcesApiError as er:
-                self.logger.warning(
+                # The other contests go on. The client warns about what
+                # matters: an outage that lasts, or a refusal it doesn't expect.
+                self.logger.info(
                     f'Fetch rating changes failed for contest {contest.id},'
                     f' ignoring. {er!r}'
                 )
-                pass
         return all_changes
 
     async def _save_changes(
@@ -169,6 +182,18 @@ class RatingChangesCache:
             return
         rc = await self.cache_master.conn.save_rating_changes(flattened)
         self.logger.info(f'Saved {rc} changes to database.')
+
+    async def _replace_changes(
+        self, contest_changes_pairs: list[tuple[cf.Contest, list[cf.RatingChange]]]
+    ) -> None:
+        """Replace the stored rating changes of each contest in
+        ``contest_changes_pairs`` with its new ones, which have arrived.
+        """
+        # Changes that Codeforces no longer gives, such as those of a handle
+        # it removed from the contest, go too.
+        for contest, _ in contest_changes_pairs:
+            await self.cache_master.conn.clear_rating_changes(contest_id=contest.id)
+        await self._save_changes(contest_changes_pairs)
 
     async def _refresh_handle_cache(self) -> None:
         self.handle_rating_cache = (

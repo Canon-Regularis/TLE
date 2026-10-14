@@ -17,12 +17,22 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands.view import StringView
 
+from tle.access.help import split_help
 from tle.cogs.cache_control import (
     NOT_A_PROBLEMSETS_MODE,
     NOT_A_RATING_CHANGES_MODE,
+    PROBLEMSETS_FAILED_ONE_TEXT,
+    PROBLEMSETS_FAILED_TEXT,
+    PROBLEMSETS_SAVED_ONE_TEXT,
+    PROBLEMSETS_SAVED_TEXT,
     UNKNOWN_CONTEST_TEXT,
     CacheControl,
 )
+
+# codeforces_common is imported before tle.util.cache: it is the module that
+# brings the cache in, and importing the cache first runs into their cycle.
+from tle.util import codeforces_api as cf, codeforces_common  # noqa: F401
+from tle.util.cache.problemset import ProblemsetUpdate
 
 # A contest in the bot's Codeforces contest list.
 CONTEST_ID = 1950
@@ -47,7 +57,9 @@ def bot() -> MagicMock:
     changes.fetch_missing_contests = AsyncMock(return_value=17)
     problemsets = bot.cf_cache.problemset_cache
     problemsets.update_for_contest = AsyncMock(return_value=6)
-    problemsets.update_for_all = AsyncMock(return_value=60)
+    problemsets.update_for_all = AsyncMock(
+        return_value=ProblemsetUpdate(problems=60, failed=[])
+    )
     return bot
 
 
@@ -144,8 +156,145 @@ async def test_problemsets_fetches_one_contest_or_all(
 
     problemsets.update_for_contest.assert_awaited_once_with(CONTEST_ID)
     problemsets.update_for_all.assert_awaited_once_with()
-    assert 'Done, fetched 6 problems' in replies(ctx)
-    assert 'Done, fetched 60 problems' in replies(ctx)
+    assert replies(ctx)[:2] == ['Running...', 'Done, fetched 6 problems']
+    assert replies(ctx)[3:6] == [
+        'Running...',
+        'This will take a while',
+        'Done, saved 60 new or changed problems',
+    ]
+    # Nothing failed, so nothing more is said.
+    assert len(replies(ctx)) == 7
+    assert replies(ctx)[6].startswith('Completed in ')
+
+
+@pytest.mark.parametrize(
+    ('problems', 'reply'),
+    [
+        (0, 'Done, saved 0 new or changed problems'),
+        (1, 'Done, saved 1 new or changed problem'),
+        (2, 'Done, saved 2 new or changed problems'),
+    ],
+    ids=['none', 'one', 'two'],
+)
+async def test_problemsets_all_says_how_many_problems_it_saved(
+    cog: CacheControl,
+    bot: MagicMock,
+    ctx: commands.Context[Any],
+    problems: int,
+    reply: str,
+) -> None:
+    # After the hourly update, a run usually saves none, and one rating that
+    # changed since saves one.
+    bot.cf_cache.problemset_cache.update_for_all.return_value = ProblemsetUpdate(
+        problems=problems, failed=[]
+    )
+
+    await callback('problemsets')(cog, ctx, 'all')
+
+    assert replies(ctx)[:3] == ['Running...', 'This will take a while', reply]
+    assert replies(ctx)[3].startswith('Completed in ')
+    assert len(replies(ctx)) == 4
+
+
+def test_the_answers_about_saved_problems_count_them() -> None:
+    assert PROBLEMSETS_SAVED_TEXT.format(count=3) == (
+        'Done, saved 3 new or changed problems'
+    )
+    assert PROBLEMSETS_SAVED_ONE_TEXT == 'Done, saved 1 new or changed problem'
+
+
+@pytest.mark.parametrize(
+    ('failed', 'reply'),
+    [
+        (
+            [2004],
+            "Codeforces didn't give the problems of contest 2004, so the bot "
+            'still lacks them.',
+        ),
+        (
+            [2004, 2102],
+            "Codeforces didn't give the problems of 2 contests, so the bot still "
+            'lacks them: 2004, 2102.',
+        ),
+        (
+            list(range(1001, 1021)),
+            "Codeforces didn't give the problems of 20 contests, so the bot still "
+            'lacks them: ' + ', '.join(map(str, range(1001, 1021))) + '.',
+        ),
+        (
+            list(range(1001, 1026)),
+            "Codeforces didn't give the problems of 25 contests, so the bot still "
+            'lacks them: ' + ', '.join(map(str, range(1001, 1021))) + ' and 5 more.',
+        ),
+    ],
+    ids=['one contest', 'two contests', '20 contests', 'more than 20 contests'],
+)
+async def test_problemsets_all_names_the_contests_codeforces_failed_for(
+    cog: CacheControl,
+    bot: MagicMock,
+    ctx: commands.Context[Any],
+    failed: list[int],
+    reply: str,
+) -> None:
+    bot.cf_cache.problemset_cache.update_for_all.return_value = ProblemsetUpdate(
+        problems=3, failed=failed
+    )
+
+    await callback('problemsets')(cog, ctx, 'all')
+
+    assert replies(ctx)[2:4] == ['Done, saved 3 new or changed problems', reply]
+    assert replies(ctx)[4].startswith('Completed in ')
+    assert len(replies(ctx)) == 5
+
+
+@pytest.mark.parametrize('argument', [str(CONTEST_ID), 'all'])
+async def test_problemsets_passes_codeforces_errors_on(
+    cog: CacheControl, bot: MagicMock, ctx: commands.Context[Any], argument: str
+) -> None:
+    # The error handler answers with Codeforces' error, such as the problem
+    # list's; the cache kept the problems it had, so the command says nothing
+    # was done.
+    failure = cf.TrueApiError('HTTP Error 503, Service Unavailable')
+    problemsets = bot.cf_cache.problemset_cache
+    problemsets.update_for_contest.side_effect = failure
+    problemsets.update_for_all.side_effect = failure
+
+    with pytest.raises(cf.TrueApiError) as raised:
+        await callback('problemsets')(cog, ctx, argument)
+
+    assert raised.value is failure
+    if argument == 'all':
+        assert replies(ctx) == ['Running...', 'This will take a while']
+    else:
+        assert replies(ctx) == ['Running...']
+
+
+def test_the_answers_about_failed_contests_say_what_the_bot_lacks() -> None:
+    assert PROBLEMSETS_FAILED_TEXT == (
+        "Codeforces didn't give the problems of {count} contests, so the bot still "
+        'lacks them: {ids}.'
+    )
+    assert PROBLEMSETS_FAILED_ONE_TEXT == (
+        "Codeforces didn't give the problems of contest {id}, so the bot still "
+        'lacks them.'
+    )
+
+
+def test_problemsets_says_how_the_bot_fills_the_problems_in(cog: CacheControl) -> None:
+    (command,) = [
+        command
+        for command in cog.walk_commands()
+        if command.qualified_name == 'cache problemsets'
+    ]
+    description, examples = split_help(command.help)
+
+    assert ' '.join(description.split()) == (
+        'Fetch the problems of one Codeforces contest again, or with `all` those '
+        'of every finished contest that the bot lacks. Every hour the bot updates '
+        "them from Codeforces' problem list itself, and fetches the standings of "
+        'new contests that the list leaves incomplete.'
+    )
+    assert examples == (';cache problemsets 1950', ';cache problemsets all')
 
 
 @pytest.mark.parametrize(

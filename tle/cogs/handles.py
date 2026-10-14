@@ -344,7 +344,18 @@ class Handles(commands.Cog):
         rc = await self.bot.user_db.update_status(member.guild.id, [member.id])
         if rc == 1:
             handle = await self.bot.user_db.get_handle(member.id, member.guild.id)
-            await self._update_ranks(member.guild, [(int(member.id), handle)])
+            try:
+                await self._update_ranks(member.guild, [(int(member.id), handle)])
+            except cf.CodeforcesApiError as e:
+                # Such as Codeforces being down, or the account renamed or
+                # deleted: no bug, so not left to discord.py's handler, which
+                # would log it as an error with its traceback. The client
+                # warns about what matters: an outage that lasts, or a refusal
+                # it doesn't expect.
+                self.logger.info(
+                    f'Rank role of member {member.id}, who joined server'
+                    f' {member.guild.id}, not updated: {e!r}'
+                )
 
     @tasks.task_spec(
         name='SetExUsersInactive',

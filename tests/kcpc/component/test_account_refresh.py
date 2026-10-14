@@ -36,6 +36,8 @@ LOGGER = 'tle.kcpc.features.accounts.refresh'
 DOWN = ExternalServiceError(
     'AtCoder', 'AtCoder is not responding right now. Please try again later.'
 )
+# The message of the error KCPC raises when TLE's ``cf.user.info`` fails.
+CODEFORCES_DOWN = 'Codeforces is not responding right now. Please try again later.'
 
 
 class FakeAtCoder:
@@ -316,6 +318,61 @@ async def test_refreshing_everything_warns_of_failures_at_most_once_a_day(
         (logging.INFO, summary(0, 0, 1)),
         (logging.INFO, could_not),
         (logging.WARNING, summary(0, 0, 1)),
+    ]
+
+
+async def test_failures_on_codeforces_alone_are_logged_at_info(
+    refresher: RatingRefresher,
+    codeforces: FakeCodeforces,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    codeforces.add('FakeCoder')
+    caplog.set_level(logging.INFO)
+
+    # Codeforces is down for both refreshes, a day apart.
+    for _ in range(2):
+        codeforces.errors.append(cf.ClientError())
+        await refresher.refresh_all(['FakeCoder'], [])
+        await clock.advance(timedelta(days=1))
+
+    could_not = f'Could not refresh 1 Codeforces users: {CODEFORCES_DOWN}'
+    assert logged(caplog) == [
+        (logging.INFO, could_not),
+        (logging.INFO, summary(0, 0, 1)),
+        (logging.INFO, could_not),
+        (logging.INFO, summary(0, 0, 1)),
+    ]
+    # Nothing at WARNING from any logger. TLE's client is faked here; it
+    # reports Codeforces' failures itself (see test_codeforces_api_http.py).
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_failures_on_codeforces_dont_hold_back_a_warning_for_atcoder(
+    refresher: RatingRefresher,
+    atcoder: FakeAtCoder,
+    codeforces: FakeCodeforces,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    codeforces.add('FakeCoder')
+    atcoder.errors['Down'] = DOWN
+    caplog.set_level(logging.INFO, logger=LOGGER)
+
+    codeforces.errors.append(cf.ClientError())
+    await refresher.refresh_all(['FakeCoder'], [])
+    # The next refresh, 6 hours later: AtCoder fails too.
+    await clock.advance(timedelta(hours=6))
+    codeforces.errors.append(cf.ClientError())
+    await refresher.refresh_all(['FakeCoder'], ['Down'])
+
+    codeforces_failed = f'Could not refresh 1 Codeforces users: {CODEFORCES_DOWN}'
+    assert logged(caplog) == [
+        (logging.INFO, codeforces_failed),
+        (logging.INFO, summary(0, 0, 1)),
+        (logging.INFO, codeforces_failed),
+        (logging.INFO, f'Could not refresh AtCoder user Down: {DOWN}'),
+        (logging.WARNING, summary(0, 0, 2)),
     ]
 
 

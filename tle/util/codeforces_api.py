@@ -5,7 +5,9 @@ import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, NamedTuple
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, NamedTuple, NoReturn
 
 import aiohttp
 from discord.ext import commands
@@ -267,6 +269,8 @@ class Submission(NamedTuple):
     verdict: str | None
     creationTimeSeconds: int
     relativeTimeSeconds: int
+    # How many tests it passed: a failure on test 1 costs no penalty.
+    passedTestCount: int | None = None
 
 
 class RanklistRow(NamedTuple):
@@ -295,6 +299,40 @@ def make_from_dict(namedtuple_cls: Any, dict_: dict[str, Any]) -> Any:
     return namedtuple_cls._make(field_vals)
 
 
+def _parse_party(party_dict: dict[str, Any]) -> Party:
+    party_dict['members'] = [
+        make_from_dict(Member, member) for member in party_dict['members']
+    ]
+    party: Party = make_from_dict(Party, party_dict)
+    return party
+
+
+def _parse_standings(
+    resp: dict[str, Any],
+) -> tuple[Contest, list[Problem], list[RanklistRow]]:
+    """The contest, problems and rows of a contest.standings result."""
+    contest_ = make_from_dict(Contest, resp['contest'])
+    problems = [
+        make_from_dict(Problem, problem_dict) for problem_dict in resp['problems']
+    ]
+    for row in resp['rows']:
+        row['party'] = _parse_party(row['party'])
+        row['problemResults'] = [
+            make_from_dict(ProblemResult, problem_result)
+            for problem_result in row['problemResults']
+        ]
+    ranklist = [make_from_dict(RanklistRow, row_dict) for row_dict in resp['rows']]
+    return contest_, problems, ranklist
+
+
+def _parse_submissions(resp: list[dict[str, Any]]) -> list[Submission]:
+    """The submissions of a user.status or contest.status result."""
+    for submission in resp:
+        submission['problem'] = make_from_dict(Problem, submission['problem'])
+        submission['author'] = _parse_party(submission['author'])
+    return [make_from_dict(Submission, submission_dict) for submission_dict in resp]
+
+
 # Error classes
 
 
@@ -318,6 +356,13 @@ class ClientError(CodeforcesApiError):
 
     def __init__(self) -> None:
         super().__init__('Error connecting to Codeforces API')
+
+
+class BadAnswer(Exception):
+    """An answer that is retried, as the cause of a ``ClientError``: one that
+    isn't a JSON object, a 200 without a result, or a server error. Its
+    message names the HTTP status, as in 'HTTP 502 without JSON'.
+    """
 
 
 class HandleNotFoundError(TrueApiError):
@@ -364,6 +409,15 @@ class RatingChangesUnavailableError(TrueApiError):
 # Codeforces API query methods
 
 _session: aiohttp.ClientSession | None = None
+_CALL_SPACING_SECONDS = 1  # read on each call by cf_ratelimit; tests set it to 0
+# Standings and user.ratedList are megabytes: a whole request may take five
+# minutes, but half a minute without a connection, or a minute without a byte,
+# means Codeforces stopped answering.
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=5 * 60, sock_connect=30, sock_read=60)
+# Refusals that callers turn into errors of their own, such as an unknown handle
+# or contest, or rating changes not out yet, are logged at INFO. Any other is a
+# WARNING, because it can mean that Codeforces changed its rules.
+_EXPECTED_REFUSALS = ('not found', 'should contain', 'Rating changes are unavailable')
 
 
 async def initialize() -> None:
@@ -378,18 +432,177 @@ def _bool_to_str(value: bool) -> str:
     raise TypeError(f'Expected bool, got {value} of type {type(value)}')
 
 
+# How long every call must have failed, or every call of one method while other
+# calls are answered, before one WARNING reaches the log channel. A shorter
+# outage leaves only INFO lines.
+OUTAGE_WARNING_AFTER = 15 * 60
+# A streak of failures whose latest failure is this old is over: the next
+# failure starts a new one, and an answer logs no end for it. Some methods are
+# called days apart, only around contests or by commands. It is longer than the
+# hourly problem-list run, so a method down alone and called that often is
+# still reported.
+_STREAK_GAP = 3 * 60 * 60
+
+
+def _plural(count: int, noun: str) -> str:
+    """'1 call' or '2 calls'."""
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
+
+
+def _duration(seconds: float) -> str:
+    """Reads like '2 hours 5 minutes', in whole minutes."""
+    hours, minutes = divmod(int(max(seconds, 0) // 60), 60)
+    parts = [_plural(hours, 'hour')] if hours else []
+    if minutes or not hours:
+        parts.append(_plural(minutes, 'minute'))
+    return ' '.join(parts)
+
+
+def _utc_time(epoch: float) -> str:
+    """The time of day of ``epoch`` in UTC, as '23:00'."""
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime('%H:%M')
+
+
+@dataclass
+class _Streak:
+    """Calls that failed in a row: when the first and the latest failed, how
+    many, and whether a WARNING said so.
+    """
+
+    since: float
+    last: float
+    calls: int = 0
+    warned: bool = False
+    # For one method's calls: when another call was first answered meanwhile
+    others_answered: float | None = None
+    # For every call: the methods that failed
+    paths: set[str] = field(default_factory=set)
+
+
+def _count_failure(streak: _Streak | None, now: float) -> _Streak:
+    """``streak`` with a failure at ``now`` counted, or a new streak in its
+    place when there is none or its latest failure is ``_STREAK_GAP`` old.
+    """
+    if streak is None or now - streak.last >= _STREAK_GAP:
+        streak = _Streak(since=now, last=now)
+    streak.calls += 1
+    streak.last = now
+    return streak
+
+
+class _Outage:
+    """Warns once about a long Codeforces outage, and logs its end.
+
+    A call fails when ``cf_ratelimit`` gives up on it, and is answered when
+    Codeforces sends JSON: a result or a refusal. One WARNING says so once
+    every call has failed for ``OUTAGE_WARNING_AFTER`` seconds, or once every
+    call of one method has failed for as long since other calls were answered
+    again. The next answer is logged at INFO. ``clock`` gives epoch seconds.
+
+    A method's failures count from the other calls' answer, not from its own
+    first failure: otherwise the first failure after an outage of every call,
+    while Codeforces recovers, would read as that method alone being down.
+
+    A method is said to fail while other calls work only if no other call
+    has failed since the last answer: otherwise every call may be failing.
+
+    Failures far apart are no outage. A streak, of every call or of one
+    method, is over once its latest failure is ``_STREAK_GAP`` old: the next
+    failure starts a new one, so that two short failures days apart don't
+    read as one long outage, and an answer logs no end for it.
+
+    It never raises, so that it can't fail the call it is told about: a fault
+    of its own is logged instead.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._all: _Streak | None = None  # every call, since the last answer
+        self._by_method: dict[str, _Streak] = {}  # each method's own calls
+
+    def failed(self, path: str, error: BaseException) -> None:
+        """Counts a call of ``path`` that was given up on ``error``."""
+        try:
+            now = self._clock()
+            every = self._all = _count_failure(self._all, now)
+            every.paths.add(path)
+            mine = self._by_method[path] = _count_failure(
+                self._by_method.get(path), now
+            )
+            # Only this method failed since the last answer.
+            alone = every.paths == {path}
+            # Other calls were answered since this method began to fail, and
+            # none failed since: the truer warning, so it is the one given.
+            if (
+                alone
+                and mine.others_answered is not None
+                and not every.warned
+                and not mine.warned
+                and now - mine.others_answered >= OUTAGE_WARNING_AFTER
+            ):
+                logger.warning(
+                    f'Codeforces has failed every {path} call since '
+                    f'{_utc_time(mine.since)} UTC ({_plural(mine.calls, "call")}),'
+                    f' while other calls work; the last: {error!r}'
+                )
+                mine.warned = True
+            elif (
+                not every.warned
+                and now - every.since >= OUTAGE_WARNING_AFTER
+                # A method already reported alone is no news either.
+                and not (alone and mine.warned)
+            ):
+                logger.warning(
+                    'Codeforces has failed every call since '
+                    f'{_utc_time(every.since)} UTC ({_plural(every.calls, "call")});'
+                    f' the last: {path}: {error!r}'
+                )
+                every.warned = True
+        except Exception:
+            logger.warning(
+                f'Outage tracker failed on CF API {path}, ignoring.', exc_info=True
+            )
+
+    def answered(self, path: str) -> None:
+        """Ends the outage, and the failures of ``path``. Methods that still
+        fail now fail while other calls work.
+        """
+        try:
+            now = self._clock()
+            every, self._all = self._all, None
+            mine = self._by_method.pop(path, None)
+            if every is not None and every.warned and now - every.last < _STREAK_GAP:
+                failing = _duration(now - every.since)
+                logger.info(f'Codeforces answers again after {failing} of failures')
+            if mine is not None and mine.warned and now - mine.last < _STREAK_GAP:
+                failing = _duration(now - mine.since)
+                logger.info(f'Codeforces answers {path} again after {failing}')
+            for streak in self._by_method.values():
+                if streak.others_answered is None:
+                    streak.others_answered = now
+        except Exception:
+            logger.warning(
+                f'Outage tracker failed on CF API {path}, ignoring.', exc_info=True
+            )
+
+
+_outage = _Outage()  # tests replace it, with a clock of their own
+
+
 def cf_ratelimit(f: Callable[..., Any]) -> Callable[..., Any]:
     tries = 3
     per_second = 1
     last = deque([0.0] * per_second)
 
     @functools.wraps(f)
-    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+    async def wrapped(path: str, *args: Any, **kwargs: Any) -> Any:
+        limited = 0  # tries that hit the call limit
         for i in itertools.count():
             now = time.time()
 
-            # Next valid slot is 1s after the `per_second`th last request
-            next_valid = max(now, 1 + last[0])
+            # Next valid slot is _CALL_SPACING_SECONDS after the
+            # `per_second`th last request
+            next_valid = max(now, _CALL_SPACING_SECONDS + last[0])
             last.append(next_valid)
             last.popleft()
 
@@ -399,45 +612,103 @@ def cf_ratelimit(f: Callable[..., Any]) -> Callable[..., Any]:
                 await asyncio.sleep(delay)
 
             try:
-                return await f(*args, **kwargs)
-            except (ClientError, CallLimitExceededError) as e:
-                logger.info(f'Try {i + 1}/{tries} at query failed.')
-                logger.info(repr(e))
-                if i < tries - 1:
-                    logger.info('Retrying...')
-                else:
-                    logger.info('Aborting.')
-                    raise e
+                return await f(path, *args, **kwargs)
+            except ClientError as e:
+                # Each failure was logged as it came. Giving up is no news
+                # either: the outage tracker warns once an outage lasts.
+                if i == tries - 1:
+                    error = e.__cause__ or e
+                    logger.info(
+                        f'CF API {path} failed {tries} times, giving up: {error!r}'
+                    )
+                    _outage.failed(path, error)
+                    raise
+            except CallLimitExceededError as e:
+                limited += 1
+                if i == tries - 1:
+                    if limited == tries:
+                        # Then the spacing between calls is too short.
+                        logger.warning(
+                            f'CF API {path} hit the call limit {tries} times in a row'
+                        )
+                    else:
+                        logger.info(
+                            f'CF API {path} failed {tries} times, giving up: {e!r}'
+                        )
+                    raise
         raise AssertionError('Unreachable')
 
     return wrapped
 
 
+def _transient(path: str, detail: str) -> NoReturn:
+    """Logs an answer to retry, and raises it as a ``ClientError``."""
+    logger.info(f'Request to CF API {path} failed: {detail}')
+    raise ClientError from BadAnswer(detail)
+
+
 @cf_ratelimit
-async def _query_api(path: str, data: Any = None) -> Any:
+async def _query_api(
+    path: str, data: dict[str, Any] | None = None, *, get: bool = False
+) -> Any:
+    """The result of the API method ``path``, called with ``data``.
+
+    A POST request, whose size limits ``user_info_chunkify`` counts on, or with
+    ``get``, a GET request with ``data`` as its query string.
+
+    A failed request, an answer that isn't a JSON object, a 200 without a
+    result and a server error raise ``ClientError``, which ``cf_ratelimit``
+    retries. Any other JSON answer is a refusal, raised as ``TrueApiError``.
+    """
     url = API_BASE_URL + path
     try:
         logger.info(f'Querying CF API at {url} with {data}')
         # Explicitly state encoding (though aiohttp accepts gzip by default)
         headers = {'Accept-Encoding': 'gzip'}
         assert _session is not None, 'Session not initialized. Call initialize() first.'
-        async with _session.post(url, data=data, headers=headers) as resp:
+        if get:
+            request = _session.get(
+                url, params=data, headers=headers, timeout=_REQUEST_TIMEOUT
+            )
+        else:
+            request = _session.post(
+                url, data=data, headers=headers, timeout=_REQUEST_TIMEOUT
+            )
+        async with request as resp:
+            status = resp.status
             try:
-                respjson = await resp.json()
-            except aiohttp.ContentTypeError:
-                logger.warning(
-                    f'CF API did not respond with JSON, status {resp.status}.'
-                )
-                raise CodeforcesApiError
-            if resp.status == 200:
-                return respjson['result']
-            comment = f'HTTP Error {resp.status}, {respjson.get("comment")}'
-    except aiohttp.ClientError as e:
-        logger.error(f'Request to CF API encountered error: {e!r}')
+                answer = await resp.json()
+            # An error page, such as a 502's, or a broken body
+            except (aiohttp.ContentTypeError, ValueError):
+                answer = None
+    # A timeout is an asyncio.TimeoutError, which on 3.10 is no builtin
+    # TimeoutError and no aiohttp.ClientError. Either is retried.
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.info(f'Request to CF API {path} failed: {e!r}')
         raise ClientError from e
-    logger.warning(f'Query to CF API failed: {comment}')
+    if answer is None:  # also an empty body
+        _transient(path, f'HTTP {status} without JSON')
+    if not isinstance(answer, dict):
+        _transient(path, f'HTTP {status} without a JSON object')
+    if status == 200:
+        if 'result' not in answer:
+            _transient(path, 'HTTP 200 without a result')
+        _outage.answered(path)
+        return answer['result']
+    comment = f'HTTP Error {status}, {answer.get("comment")}'
+    # Codeforces may give the call limit a 5xx status.
     if 'limit exceeded' in comment:
+        # Retried, so not worth a warning yet.
+        _outage.answered(path)
+        logger.info(f'Query to CF API {path} failed: {comment}')
         raise CallLimitExceededError(comment)
+    if status >= 500:
+        _transient(path, f'HTTP {status}: {answer.get("comment")}')
+    _outage.answered(path)
+    if any(refusal in comment for refusal in _EXPECTED_REFUSALS):
+        logger.info(f'Query to CF API {path} failed: {comment}')
+    else:
+        logger.warning(f'Query to CF API {path} failed: {comment}')
     raise TrueApiError(comment)
 
 
@@ -467,46 +738,58 @@ class contest:
 
     @staticmethod
     async def standings(
-        *,
-        contest_id: Any,
-        from_: int | None = None,
-        count: int | None = None,
-        handles: list[str] | None = None,
-        room: Any | None = None,
-        show_unofficial: bool | None = None,
+        *, contest_id: int
     ) -> tuple[Contest, list[Problem], list[RanklistRow]]:
-        params = {'contestId': contest_id}
-        if from_ is not None:
-            params['from'] = from_
-        if count is not None:
-            params['count'] = count
-        if handles is not None:
-            params['handles'] = ';'.join(handles)
-        if room is not None:
-            params['room'] = room
-        if show_unofficial is not None:
-            params['showUnofficial'] = _bool_to_str(show_unofficial)
+        """Returns a contest, its problems and its standings.
+
+        Codeforces answers only an anonymous GET request whose one parameter is
+        contestId: a POST, or any other parameter, is refused. The rows are
+        official contestants' alone, without virtual, out-of-competition or
+        practice ones. In some rounds, such as Div. 2, Div. 3 and Educational
+        rounds, they are only the contestants that Codeforces trusts, ranked
+        among themselves, so a rank can be better than the official one.
+        """
+        params = {'contestId': str(contest_id)}
         try:
-            resp = await _query_api('contest.standings', params)
+            resp = await _query_api('contest.standings', params, get=True)
         except TrueApiError as e:
             if 'not found' in e.comment:
                 raise ContestNotFoundError(e.comment, contest_id)
             raise
-        contest_ = make_from_dict(Contest, resp['contest'])
-        problems = [
-            make_from_dict(Problem, problem_dict) for problem_dict in resp['problems']
-        ]
-        for row in resp['rows']:
-            row['party']['members'] = [
-                make_from_dict(Member, member) for member in row['party']['members']
-            ]
-            row['party'] = make_from_dict(Party, row['party'])
-            row['problemResults'] = [
-                make_from_dict(ProblemResult, problem_result)
-                for problem_result in row['problemResults']
-            ]
-        ranklist = [make_from_dict(RanklistRow, row_dict) for row_dict in resp['rows']]
-        return contest_, problems, ranklist
+        return _parse_standings(resp)
+
+    @staticmethod
+    async def status(
+        *,
+        contest_id: int,
+        handle: str | None = None,
+        from_: int | None = None,
+        count: int | None = None,
+    ) -> list[Submission]:
+        """Returns the submissions to a contest, newest first: everyone's, or
+        those of ``handle`` alone.
+        """
+        params: dict[str, Any] = {'contestId': contest_id}
+        if handle is not None:
+            params['handle'] = handle
+        if from_ is not None:
+            params['from'] = from_
+        if count is not None:
+            params['count'] = count
+        try:
+            resp = await _query_api('contest.status', params)
+        except TrueApiError as e:
+            # The comment names the parameter at fault, as in "handle: User
+            # with handle X not found" or "contestId: Contest with id N not
+            # found".
+            if handle is not None and 'handle:' in e.comment:
+                if 'not found' in e.comment:
+                    raise HandleNotFoundError(e.comment, handle)
+                raise HandleInvalidError(e.comment, handle)
+            if 'not found' in e.comment:
+                raise ContestNotFoundError(e.comment, contest_id)
+            raise
+        return _parse_submissions(resp)
 
 
 class problemset:
@@ -619,14 +902,7 @@ class user:
             if 'should contain' in e.comment:
                 raise HandleInvalidError(e.comment, handle)
             raise
-        for submission in resp:
-            submission['problem'] = make_from_dict(Problem, submission['problem'])
-            submission['author']['members'] = [
-                make_from_dict(Member, member)
-                for member in submission['author']['members']
-            ]
-            submission['author'] = make_from_dict(Party, submission['author'])
-        return [make_from_dict(Submission, submission_dict) for submission_dict in resp]
+        return _parse_submissions(resp)
 
 
 async def _resolve_redirect(handle: str) -> str | None:
@@ -668,8 +944,9 @@ async def _resolve_handles(handles: Iterable[str]) -> dict[str, User]:
                         resolved_handles[handle] = cf_user
                 break
             except HandleNotFoundError as e:
-                # Handle not found, drop it.
-                logger.warning(f'Handle {e.handle} not found, dropping it.')
+                # Handle not found, drop it. A typo or a deleted account is no
+                # failure, and the client has logged the refusal at INFO too.
+                logger.info(f'Handle {e.handle} not found, dropping it.')
                 handle_chunk.remove(e.handle)
     return resolved_handles
 

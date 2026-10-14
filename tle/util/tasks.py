@@ -6,6 +6,7 @@ from typing import Any
 from discord.ext import commands
 
 import tle.util.codeforces_common as cf_common
+from tle.util import codeforces_api as cf
 from tle.util.events import Event
 
 
@@ -105,7 +106,9 @@ class Task:
     periodically and another coroutine function `waiter` to wait on between
     calls to `func`. The return value of `waiter` is passed to `func` in the
     next call. An optional coroutine function `exception_handler` may be
-    provided to which exceptions will be reported.
+    provided to which exceptions will be reported. An exception is logged
+    first: a Codeforces error as information, anything else as a warning with
+    its traceback.
     """
 
     def __init__(
@@ -192,9 +195,17 @@ class Task:
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            self.logger.warning(
-                f'Exception in task `{self.name}`, ignoring.', exc_info=True
-            )
+            if isinstance(ex, cf.CodeforcesApiError):
+                # The task runs again, and the client warns about what matters:
+                # an outage that lasts, or a refusal it doesn't expect.
+                self.logger.info(
+                    f'Task `{self.name}` stopped on a Codeforces error,'
+                    f' ignoring: {ex!r}'
+                )
+            else:
+                self.logger.warning(
+                    f'Exception in task `{self.name}`, ignoring.', exc_info=True
+                )
             if self._exception_handler is not None:
                 await self._exception_handler.handle(ex, self.instance)
 

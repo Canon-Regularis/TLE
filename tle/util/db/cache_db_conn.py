@@ -300,6 +300,35 @@ class CacheDbConn:
         await self.conn.commit()
         return rc
 
+    async def replace_problemset(
+        self, contest_id: int, problemset: list[cf.Problem]
+    ) -> int:
+        """Replace the stored problems of contest ``contest_id`` with
+        ``problemset``, the contest's problems, in one commit.
+
+        The new problems are written before the old ones are deleted, so every
+        step leaves the table fit to commit, as another writer's commit on the
+        shared connection would: an error never loses a problem.
+        """
+        query = """
+            INSERT OR REPLACE INTO problem2 (
+                contest_id, problemset_name, [index], name, type, points, rating, tags
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        cursor = await self.conn.executemany(
+            query, list(map(self._squish_tags, problemset))
+        )
+        rc = cursor.rowcount
+        indices = [problem.index for problem in problemset]
+        await self.conn.execute(
+            'DELETE FROM problem2 WHERE contest_id = ? AND [index] NOT IN'
+            f' ({", ".join("?" * len(indices))})',
+            (contest_id, *indices),
+        )
+        await self.conn.commit()
+        return rc
+
     async def fetch_problems2(self) -> list[cf.Problem]:
         query = """
             SELECT
@@ -317,6 +346,7 @@ class CacheDbConn:
         else:
             query = 'DELETE FROM problem2 WHERE contest_id = ?'
             await self.conn.execute(query, (contest_id,))
+        await self.conn.commit()
 
     async def fetch_problemset(self, contest_id: int) -> list[cf.Problem]:
         query = """

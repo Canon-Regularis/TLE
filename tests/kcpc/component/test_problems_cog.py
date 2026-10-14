@@ -56,6 +56,7 @@ from tle.kcpc.core.settings import FeatureRegistry, GuildSettingsRepo, default_r
 from tle.kcpc.core.timeutil import to_epoch, zone
 from tle.kcpc.features.admin.cog import setup as add_admin_cog
 from tle.kcpc.features.problems import cog as problems_cog
+from tle.kcpc.features.problems.catalog import CODEFORCES_MAX_AGE
 from tle.kcpc.features.problems.cog import REFRESH_JOB, KcpcProblems, setup
 from tle.kcpc.features.problems.repo import QueuedProblem, WeeklyProblem, WeeklyRepo
 from tle.kcpc.features.problems.rotation import parse_rotation
@@ -95,6 +96,8 @@ NOW = CLOCK_START  # Thursday 2026-10-01, 13:00 in London
 CLUB = zone('Europe/London')
 COG_LOGGER = 'tle.kcpc.features.problems.cog'
 ADMIN_LOGGER = 'tle.kcpc.bot.admin'
+SCHEDULER_LOGGER = 'tle.kcpc.core.scheduler'
+KCPC_LOGGER = 'tle.kcpc'  # the parent of every KCPC module's logger
 ADMIN_COMMANDS = ['post-now', 'preview', 'queue', 'rotation', 'solution', 'unqueue']
 BLOG = 'https://codeforces.com/blog/entry/90342'
 BAD_LINK = 'The link must be a web address starting with https:// or http://.'
@@ -126,6 +129,10 @@ ROTATION_HINT = (
     '`/kcpc weekly rotation entries:default`.'
 )
 UNREACHABLE = 'AtCoder is not responding right now. Please try again later.'
+# Why a problem list can't be refreshed while its site is down: the messages of
+# the errors that KCPC's clients raise.
+CODEFORCES_DOWN = 'Codeforces is not responding right now. Please try again later.'
+ATCODER_DOWN = 'AtCoder Problems is not responding right now.'
 # Real seconds a healthy teardown needs, many times over. One that hangs then
 # fails its test instead of stalling the whole run.
 TEARDOWN_TIMEOUT = 10
@@ -682,6 +689,38 @@ def fields(embed: discord.Embed) -> list[tuple[str | None, str | None]]:
 
 def cog_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == COG_LOGGER]
+
+
+def cog_records(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str, bool]]:
+    """The cog's records: each one's level, its message and whether it has a
+    traceback.
+    """
+    return [
+        (r.levelno, r.getMessage(), r.exc_info is not None)
+        for r in caplog.records
+        if r.name == COG_LOGGER
+    ]
+
+
+def loud(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
+    """Records at WARNING and above, from any logger, which would reach the
+    Discord log channel: each one's logger and message. The sites' clients are
+    fakes here, so the lines that the real ones log themselves are never among
+    them: KCPC's HTTP client's, or TLE's Codeforces client's.
+    """
+    return [
+        (r.name, r.getMessage()) for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+
+
+def refresh_failed(owner: str, count: int, detail: str) -> str:
+    """What the refresh job logs as a site that is down fails ``count`` times in
+    a row; ``owner`` names the platform, as in "Codeforces'".
+    """
+    return (
+        f'Could not refresh {owner} problem list (consecutive failures: {count}): '
+        f'{detail}'
+    )
 
 
 def titles(publisher: FakePublisher) -> list[str | None]:
@@ -2916,30 +2955,71 @@ async def test_preview_says_where_this_weeks_solution_link_comes_from(
     assert this_week.splitlines()[1] == f'**Solution:** {status}'
 
 
-async def test_the_refresh_job_keeps_a_list_it_cannot_fetch_and_fails(
+@pytest.mark.parametrize(
+    ('failure', 'platform', 'logged'),
+    [
+        ('atcoder down', 'atcoder', refresh_failed("AtCoder's", 1, ATCODER_DOWN)),
+        (
+            'codeforces down',
+            'codeforces',
+            refresh_failed("Codeforces'", 1, CODEFORCES_DOWN),
+        ),
+        (
+            'codeforces empty',
+            'codeforces',
+            refresh_failed(
+                "Codeforces'", 1, "Codeforces' problem list came back empty."
+            ),
+        ),
+    ],
+    ids=['atcoder down', 'codeforces down', 'codeforces empty'],
+)
+async def test_the_refresh_job_keeps_a_list_it_cannot_fetch_without_failing(
     bot: KcpcBot,
     member_ctx: MagicMock,
     services: KcpcServices,
+    clock: FakeClock,
     sites: FakeSites,
+    codeforces: FakeCodeforces,
     caplog: pytest.LogCaptureFixture,
+    failure: str,
+    platform: str,
+    logged: str,
 ) -> None:
-    sites.errors['problems'] = ExternalServiceError(
-        'AtCoder Problems', 'AtCoder Problems is not responding right now.'
-    )
+    await load_lists(services)
+    await clock.advance(24 * HOUR)  # both lists are due again
+    if failure == 'atcoder down':
+        sites.errors['problems'] = ExternalServiceError(
+            'AtCoder Problems', ATCODER_DOWN
+        )
+    elif failure == 'codeforces down':
+        # TLE's client fails, as on a 502 page, after its retries.
+        codeforces.errors['problemset'] = cf.CodeforcesApiError()
+    else:  # an empty list counts as an outage too
+        codeforces.problems = []
 
-    with caplog.at_level(logging.INFO, logger=COG_LOGGER):
-        with pytest.raises(RuntimeError) as raised:
-            await load_lists(services)
+    with caplog.at_level(logging.INFO, logger=KCPC_LOGGER):
+        await load_lists(services)  # which doesn't raise
 
-    assert str(raised.value) == 'Could not refresh the problem lists of: AtCoder'
-    assert raised.value.__cause__ is sites.errors['problems']
-    assert cog_messages(caplog) == [
-        "Could not refresh AtCoder's problem list: AtCoder Problems is not "
-        'responding right now.'
-    ]
-    # Codeforces' list loaded all the same.
-    await run(bot, 'randproblem', member_ctx, 'graphs', 'expert')
-    assert reply(member_ctx).title == '1520G - To Go Or Not To Go?'
+    # At INFO, without a traceback: neither the cog nor the scheduler warns,
+    # and /kcpc status doesn't count it as a failure of the job. (The sites'
+    # clients are fakes here. While AtCoder Problems is down, KCPC's real HTTP
+    # client warns on its own, at the first failure and then at most once an
+    # hour; see test_http.py.)
+    assert cog_records(caplog) == [(logging.INFO, logged, False)]
+    assert loud(caplog) == []
+    [job] = [job for job in services.scheduler.status() if job.name == REFRESH_JOB]
+    assert (job.failures, job.last_error) == (0, None)
+    # Both sites were asked again, and the list that couldn't be fetched is
+    # still the one there was.
+    assert codeforces.asked.count('problemset') == 2
+    assert sites.fetched.count('problems') == 2
+    await run(bot, 'randproblem', member_ctx, 'any', 'expert', platform)
+    expected = {
+        'codeforces': '1520G - To Go Or Not To Go?',
+        'atcoder': 'AGC060 A - No Majority',
+    }
+    assert reply(member_ctx).title == expected[platform]
 
 
 async def test_the_refresh_job_logs_a_bug_with_its_traceback(
@@ -2957,6 +3037,201 @@ async def test_the_refresh_job_logs_a_bug_with_its_traceback(
     (record,) = [r for r in caplog.records if r.name == COG_LOGGER]
     assert record.getMessage() == "Could not refresh Codeforces' problem list"
     assert record.exc_info is not None and str(record.exc_info[1]) == 'boom'
+
+
+async def test_the_refresh_job_warns_once_a_streak_at_the_third_failure_in_a_row(
+    bot: KcpcBot,
+    services: KcpcServices,
+    clock: FakeClock,
+    codeforces: FakeCodeforces,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=KCPC_LOGGER)
+    codeforces.errors['problemset'] = cf.CodeforcesApiError()
+
+    # A run every 30 minutes: the third failure comes an hour into the outage.
+    for _ in range(4):
+        await load_lists(services)
+        await clock.advance(30 * MINUTE)
+    del codeforces.errors['problemset']
+    await load_lists(services)
+    # Another outage, once the list is due again.
+    await clock.advance(CODEFORCES_MAX_AGE)
+    codeforces.errors['problemset'] = cf.CodeforcesApiError()
+    for _ in range(3):
+        await load_lists(services)
+        await clock.advance(30 * MINUTE)
+
+    def failed(count: int) -> str:
+        return refresh_failed("Codeforces'", count, CODEFORCES_DOWN)
+
+    recovered = "Refreshed Codeforces' problem list again after 4 failed attempts"
+    assert cog_records(caplog) == [
+        (logging.INFO, failed(1), False),
+        (logging.INFO, failed(2), False),
+        (logging.WARNING, failed(3), False),
+        (logging.INFO, failed(4), False),
+        (logging.INFO, recovered, False),
+        (logging.INFO, failed(1), False),
+        (logging.INFO, failed(2), False),
+        (logging.WARNING, failed(3), False),
+    ]
+    # Nothing else here logs at WARNING: the job never failed, so the scheduler
+    # had nothing to report. (TLE's client is faked. The real one's outage
+    # tracker warns too, once an outage has lasted 15 minutes.)
+    assert loud(caplog) == [(COG_LOGGER, failed(3)), (COG_LOGGER, failed(3))]
+
+
+async def test_the_refresh_job_counts_each_sites_failures_apart(
+    bot: KcpcBot,
+    services: KcpcServices,
+    sites: FakeSites,
+    codeforces: FakeCodeforces,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Both sites are down, as when the bot's own network is: the job warns once
+    # for each.
+    codeforces.errors['problemset'] = cf.CodeforcesApiError()
+    sites.errors['problems'] = ExternalServiceError('AtCoder Problems', ATCODER_DOWN)
+    caplog.set_level(logging.INFO, logger=KCPC_LOGGER)
+    for _ in range(3):
+        await load_lists(services)
+    # AtCoder Problems answers again, but Codeforces still doesn't.
+    del sites.errors['problems']
+
+    await load_lists(services)
+
+    def codeforces_failed(count: int) -> str:
+        return refresh_failed("Codeforces'", count, CODEFORCES_DOWN)
+
+    def atcoder_failed(count: int) -> str:
+        return refresh_failed("AtCoder's", count, ATCODER_DOWN)
+
+    assert cog_records(caplog) == [
+        (logging.INFO, codeforces_failed(1), False),
+        (logging.INFO, atcoder_failed(1), False),
+        (logging.INFO, codeforces_failed(2), False),
+        (logging.INFO, atcoder_failed(2), False),
+        (logging.WARNING, codeforces_failed(3), False),
+        (logging.WARNING, atcoder_failed(3), False),
+        (logging.INFO, codeforces_failed(4), False),
+        (
+            logging.INFO,
+            "Refreshed AtCoder's problem list again after 3 failed attempts",
+            False,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ('broken', 'failed', 'records', 'recovered'),
+    [
+        (
+            'codeforces',
+            'Codeforces',
+            [
+                (logging.INFO, "Could not refresh Codeforces' problem list", True),
+                (logging.INFO, refresh_failed("AtCoder's", 1, ATCODER_DOWN), False),
+            ],
+            "Refreshed AtCoder's problem list again after 1 failed attempt",
+        ),
+        (
+            'atcoder',
+            'AtCoder',
+            [
+                (
+                    logging.INFO,
+                    refresh_failed("Codeforces'", 1, CODEFORCES_DOWN),
+                    False,
+                ),
+                (logging.INFO, "Could not refresh AtCoder's problem list", True),
+            ],
+            "Refreshed Codeforces' problem list again after 1 failed attempt",
+        ),
+    ],
+    ids=['codeforces bug', 'atcoder bug'],
+)
+async def test_the_refresh_job_fails_only_for_a_bug_and_names_only_its_platform(
+    bot: KcpcBot,
+    services: KcpcServices,
+    sites: FakeSites,
+    codeforces: FakeCodeforces,
+    caplog: pytest.LogCaptureFixture,
+    broken: str,
+    failed: str,
+    records: list[tuple[int, str, bool]],
+    recovered: str,
+) -> None:
+    # One site's answer hits a bug, while the other site is down.
+    bug = RuntimeError('boom')
+    if broken == 'codeforces':
+        codeforces.errors['problemset'] = bug
+        sites.errors['problems'] = ExternalServiceError(
+            'AtCoder Problems', ATCODER_DOWN
+        )
+    else:
+        codeforces.errors['problemset'] = cf.CodeforcesApiError()
+        sites.errors['problems'] = bug
+    caplog.set_level(logging.INFO, logger=KCPC_LOGGER)
+
+    with pytest.raises(RuntimeError, match=f'problem lists of: {failed}$') as raised:
+        await load_lists(services)
+
+    assert raised.value.__cause__ is bug
+    assert cog_records(caplog) == records
+    # The scheduler reports the bug, with its traceback, as the job starts
+    # failing. Nothing else here logs at WARNING: the site that is down has
+    # failed only once (and the sites' clients are fakes; see loud).
+    [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning.name == SCHEDULER_LOGGER
+    assert warning.exc_info is not None and warning.exc_info[1] is raised.value
+    caplog.clear()
+
+    # Both answer again. A bug is no failure of the site, so only the site that
+    # was down ends a streak.
+    del codeforces.errors['problemset'], sites.errors['problems']
+    await load_lists(services)
+
+    assert cog_records(caplog) == [(logging.INFO, recovered, False)]
+    assert loud(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ('error', 'shown'),
+    [
+        (cf.CodeforcesApiError, ['Failures: 0']),
+        (
+            RuntimeError,
+            [
+                'Failures: 3',
+                'Last error: `RuntimeError: Could not refresh the problem lists of: '
+                'Codeforces`',
+            ],
+        ),
+    ],
+    ids=['site down', 'bug'],
+)
+async def test_kcpc_status_counts_only_bugs_as_failures_of_the_refresh_job(
+    bot: KcpcBot,
+    guild: MagicMock,
+    services: KcpcServices,
+    codeforces: FakeCodeforces,
+    error: type[Exception],
+    shown: list[str],
+) -> None:
+    codeforces.errors['problemset'] = error()
+    for _ in range(3):
+        with contextlib.suppress(RuntimeError):  # how a bug fails the job
+            await load_lists(services)
+    bot.owner_id = ADMIN  # only the bot owner sees the jobs
+    ctx = make_context(bot, guild, make_member(manage_guild=True), slash=True)
+
+    await run(bot, 'kcpc status', ctx)
+
+    job = dict(fields(reply(ctx, ephemeral=True)))['Job `problems.refresh`']
+    assert job is not None
+    counted = ('Failures', 'Last error')
+    assert [line for line in job.splitlines() if line.startswith(counted)] == shown
 
 
 async def test_the_weekly_job_retries_a_post_it_couldnt_deliver_with_the_same_problem(

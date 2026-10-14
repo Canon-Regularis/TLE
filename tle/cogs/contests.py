@@ -28,6 +28,7 @@ from tle.util import (
     tasks,
 )
 from tle.util.cache import CacheError, ContestNotFound, RanklistNotMonitored
+from tle.util.ranklist import virtual
 
 _CONTESTS_PER_PAGE = 5
 _CONTEST_PAGINATE_WAIT_TIME = 5 * 60
@@ -36,6 +37,9 @@ _STANDINGS_PAGINATE_WAIT_TIME = 2 * 60
 _FINISHED_CONTESTS_LIMIT = 5
 _WATCHING_RATED_VC_WAIT_TIME = 5 * 60  # seconds
 _RATED_VC_EXTRA_TIME = 10 * 60  # seconds
+# How long after its end a rated virtual contest waits for its channel, if the
+# channel is gone, and after which one still unfinished is warned of.
+_RATED_VC_GRACE_TIME = 60 * 60  # seconds
 _MIN_RATED_CONTESTANTS_FOR_RATED_VC = 50
 
 NO_REMINDERS_TEXT = "Contest reminders aren't set up in this server."
@@ -60,6 +64,39 @@ UNASSIGNABLE_REMINDER_ROLE_TEXT = (
     'choose a role just for pings.'
 )
 RATED_VC_CHANNEL_SET_TEXT = 'This is now the rated virtual contest channel.'
+# What a ranklist's ranks count. Codeforces' public standings can leave
+# contestants out, and rank those listed among themselves, until the rating
+# changes give everyone's official rank.
+RANKLIST_LISTED_NOTE = (
+    "Codeforces' public standings can leave contestants out: ranks count only "
+    "those listed, and members left out aren't shown."
+)
+RANKLIST_PREDICTED_NOTE = (
+    "Codeforces' public standings can leave contestants out until the rating "
+    'changes are out: ranks and predicted changes count only those listed, and '
+    "members left out aren't shown yet."
+)
+RANKLIST_OFFICIAL_NOTE = "Ranks and rating changes are Codeforces' official ones."
+# Under a page of standings that shows a member whom the public standings
+# leave out, as a comment in the page's yaml.
+UNLISTED_NOTE = (
+    "# * Not in Codeforces' public standings: official rank and rating change only"
+)
+VC_RANKLIST_NOTE = (
+    "Scored from members' virtual submissions, and ranked among the contestants "
+    'Codeforces lists publicly.'
+)
+RATED_VC_START_TEXT = (
+    'Start it on Codeforces as a virtual contest, on your own, within {minutes} '
+    'minutes.'
+)
+UNSCORABLE_RATED_VC_TEXT = (
+    "`{name}` can't be a rated virtual contest: the bot scores only contests in "
+    'Codeforces or ICPC format.'
+)
+# The marks after a handle in standings: a virtual contestant, and a member
+# whom the public standings leave out.
+_PARTY_MARKS = {'VIRTUAL': '#', rl.UNLISTED: '*'}
 
 
 class ContestCogError(commands.CommandError):
@@ -160,6 +197,10 @@ class Contests(commands.Cog):
         self.role_converter: commands.RoleConverter = commands.RoleConverter()
 
         self.logger: logging.Logger = logging.getLogger(self.__class__.__name__)
+        # The last error that kept each rated virtual contest from being
+        # updated, as its repr, and those warned of for not finishing in time.
+        self._rated_vc_errors: dict[int, str] = {}
+        self._overdue_rated_vcs: set[int] = set()
 
     async def _get_ongoing_vc_participants(self) -> set[str]:
         """Returns `member_id` of users who are registered in an ongoing vc."""
@@ -526,13 +567,17 @@ class Contests(commands.Cog):
 
         body = []
         for handle, standing in handle_standings:
-            virtual = '#' if standing.party.participantType == 'VIRTUAL' else ''
-            tokens = [standing.rank, handle + ':' + virtual, maybe_int(standing.points)]
-            for problem_result in standing.problemResults:
-                score = ''
-                if problem_result.points:
-                    score = str(maybe_int(problem_result.points))
-                tokens.append(score)
+            mark = _PARTY_MARKS.get(standing.party.participantType, '')
+            tokens = [standing.rank, handle + ':' + mark]
+            if standing.party.participantType != rl.UNLISTED:
+                tokens.append(maybe_int(standing.points))
+                for problem_result in standing.problemResults:
+                    score = ''
+                    if problem_result.points:
+                        score = str(maybe_int(problem_result.points))
+                    tokens.append(score)
+            # An unlisted row has no results, and table.Table needs every cell.
+            tokens += [''] * (3 + len(problem_indices) - len(tokens))
             body.append(tokens)
 
         if deltas:
@@ -560,22 +605,21 @@ class Contests(commands.Cog):
 
         body = []
         for handle, standing in handle_standings:
-            virtual = '#' if standing.party.participantType == 'VIRTUAL' else ''
-            tokens = [
-                standing.rank,
-                handle + ':' + virtual,
-                int(standing.points),
-                int(standing.penalty),
-            ]
-            for problem_result in standing.problemResults:
-                score = '+' if problem_result.points else ''
-                if problem_result.rejectedAttemptCount:
-                    penalty = str(problem_result.rejectedAttemptCount)
-                    if problem_result.points:
-                        score += penalty
-                    else:
-                        score = '-' + penalty
-                tokens.append(score)
+            mark = _PARTY_MARKS.get(standing.party.participantType, '')
+            tokens = [standing.rank, handle + ':' + mark]
+            if standing.party.participantType != rl.UNLISTED:
+                tokens += [int(standing.points), int(standing.penalty)]
+                for problem_result in standing.problemResults:
+                    score = '+' if problem_result.points else ''
+                    if problem_result.rejectedAttemptCount:
+                        penalty = str(problem_result.rejectedAttemptCount)
+                        if problem_result.points:
+                            score += penalty
+                        else:
+                            score = '-' + penalty
+                    tokens.append(score)
+            # An unlisted row has no results, and table.Table needs every cell.
+            tokens += [''] * (4 + len(problem_indices) - len(tokens))
             body.append(tokens)
 
         if deltas:
@@ -631,9 +675,14 @@ class Contests(commands.Cog):
             page_num_footer = (
                 f' # Page: {num_pages} / {num_chunks}' if num_chunks > 1 else ''
             )
+            unlisted = any(
+                standing.party.participantType == rl.UNLISTED
+                for _, standing in handle_standings_chunk
+            )
+            note = f'{UNLISTED_NOTE}\n' if unlisted else ''
 
             # We use yaml to get nice colors in the ranklist.
-            content = f'```yaml\n{t}\n{page_num_footer}```'
+            content = f'```yaml\n{t}\n{note}{page_num_footer}```'
             pages.append((content, None))
             num_pages += 1
 
@@ -667,6 +716,14 @@ class Contests(commands.Cog):
             )
             msg = f'{start}{en}|{en}{duration}{en}|{en}Ended {since} ago'
             embed.add_field(name='When', value=msg, inline=False)
+        if ranklist.official:
+            embed.set_footer(text=RANKLIST_OFFICIAL_NOTE)
+        elif ranklist.is_rated and ranklist.deltas_status != 'Final':
+            embed.set_footer(text=RANKLIST_PREDICTED_NOTE)
+        else:
+            # Unrated, or with final rating changes but the listed ranks, as
+            # in a team contest.
+            embed.set_footer(text=RANKLIST_LISTED_NOTE)
         return embed
 
     @staticmethod
@@ -687,6 +744,7 @@ class Contests(commands.Cog):
             )
             msg = f'{elapsed} elapsed{en}|{en}{remaining} remaining'
             embed.add_field(name='Tick tock', value=msg, inline=False)
+        embed.set_footer(text=VC_RANKLIST_NOTE)
         return embed
 
     # The cooldowns of ranklist, ratedvc and vcrating count a use only once the
@@ -705,8 +763,8 @@ class Contests(commands.Cog):
     ) -> None:
         """Show the standings of a Codeforces contest for this server's members,
         or for the handles you give. Name a member as !name, and add +server to
-        include this server's members too. Add +official to show only official
-        contestants, leaving out virtual and unofficial ones.
+        include this server's members too. Add +official to leave out the
+        contestants that an Educational round doesn't rate.
 
         Examples:
             ;ranklist 1950
@@ -760,7 +818,7 @@ class Contests(commands.Cog):
                 discord_common.undo_cooldown(ctx)
                 raise ContestCogError(f"`{contest.name}` hasn't started yet.")
             return await self.bot.cf_cache.ranklist_cache.generate_ranklist(
-                contest.id, fetch_changes=True, show_unofficial=not show_official
+                contest.id, fetch_changes=True, rated_only=show_official
             )
 
     async def _show_ranklist(
@@ -799,7 +857,11 @@ class Contests(commands.Cog):
                 return
             raise ContestCogError(error)
 
-        handle_standings.sort(key=lambda data: data[1].rank)
+        # By rank, and a better score first among equal ranks, such as an
+        # unrated row's and the rated row below it in an Educational round.
+        handle_standings.sort(
+            key=lambda data: (data[1].rank, -data[1].points, data[1].penalty)
+        )
         deltas = None
         if ranklist.is_rated:
             deltas = [
@@ -829,8 +891,9 @@ class Contests(commands.Cog):
     ) -> None:
         """Replay a past Codeforces contest as a rated virtual contest for the
         members you name, yourself included if you take part. It must be a
-        rated contest that none of you has submitted to. Use it in the rated
-        virtual contest channel, where the standings follow every 5 minutes.
+        rated contest in Codeforces or ICPC format that none of you has
+        submitted to. Use it in the rated virtual contest channel, where the
+        standings follow every 5 minutes.
 
         Examples:
             ;ratedvc 1950 @alice @bob
@@ -854,6 +917,10 @@ class Contests(commands.Cog):
                 'Name the members who take part, yourself included if you do.'
             )
         contest = self._get_contest(ctx, contest_id)
+        if contest.type not in virtual.SCORABLE_TYPES:
+            # The bot couldn't score it. Codeforces wasn't asked anything.
+            discord_common.undo_cooldown(ctx)
+            raise ContestCogError(UNSCORABLE_RATED_VC_TEXT.format(name=contest.name))
         try:
             (await cf.contest.ratingChanges(contest_id=contest_id))[
                 _MIN_RATED_CONTESTANTS_FOR_RATED_VC - 1
@@ -904,9 +971,10 @@ class Contests(commands.Cog):
             title=title, description=msg, url=contest.url
         )
         await ctx.send(embed=embed)
+        start_text = RATED_VC_START_TEXT.format(minutes=_RATED_VC_EXTRA_TIME // 60)
         embed = discord_common.embed_alert(
             f'You have {int(finish_time - start_time) // 60}'
-            ' minutes to finish the contest!'
+            f' minutes to finish the contest!\n{start_text}'
         )
         embed.set_footer(text='Good luck, and have fun!')
         await ctx.send(embed=embed)
@@ -968,36 +1036,106 @@ class Contests(commands.Cog):
         )
         return embed
 
+    async def _find_vc_participations(
+        self, vc: Any, handles: Sequence[str | None]
+    ) -> dict[str, virtual.VirtualParticipation]:
+        """The participations in the rated virtual contest ``vc`` of the
+        members with ``handles``, by handle.
+
+        A member's participation is their virtual one, on their own, that
+        started from _RATED_VC_EXTRA_TIME before the rated virtual contest
+        until it finished, with the submissions made by then: a member who
+        started late has a shorter contest. A member without a handle, or
+        whose handle Codeforces doesn't know, took no part.
+        """
+        participations = {}
+        for handle in handles:
+            if handle is None:
+                continue
+            try:
+                submissions = await cf.contest.status(
+                    contest_id=vc.contest_id, handle=handle
+                )
+            except (cf.HandleNotFoundError, cf.HandleInvalidError) as error:
+                self.logger.info(
+                    f'Rated virtual contest {vc.id}: {handle} took no part. {error!r}'
+                )
+                continue
+            in_time = [
+                submission
+                for submission in submissions
+                if submission.creationTimeSeconds <= vc.finish_time
+            ]
+            participation = virtual.find_participation(
+                in_time,
+                handle,
+                earliest=vc.start_time - _RATED_VC_EXTRA_TIME,
+                latest=vc.finish_time,
+            )
+            if participation is not None:
+                participations[handle] = participation
+        return participations
+
+    @staticmethod
+    def _get_vc_delta(ranklist: rl.Ranklist, handle: str | None) -> int | None:
+        """The rating change of ``handle`` in a rated virtual contest's
+        ranklist, or None if they took no part.
+        """
+        if handle is None:
+            return None
+        try:
+            return ranklist.get_delta(handle)
+        except rl.HandleNotPresentError:
+            return None
+
     async def _watch_rated_vc(self, vc_id: int) -> None:
+        """Post the standings of the rated virtual contest ``vc_id``, or once it
+        has ended and its submissions are judged, finish it: save its members'
+        new ratings, then post them.
+
+        If its channel is gone, it waits for it until _RATED_VC_GRACE_TIME after
+        the end, then finishes without a post.
+        """
         vc = await self.bot.user_db.get_rated_vc(vc_id)
+        # Read before the submissions are fetched, so that it never finishes on
+        # submissions fetched before its end.
+        now = time.time()
         channel_id = await self.bot.user_db.get_rated_vc_channel(vc.guild_id)
-        if channel_id is None:
-            raise ContestCogError('No Rated VC channel')
-        channel = self.bot.get_channel(int(channel_id))
+        channel = None if channel_id is None else self.bot.get_channel(int(channel_id))
+        if channel is None and now < vc.finish_time + _RATED_VC_GRACE_TIME:
+            # Not in discord.py's cache yet, or gone: the next tick tries again.
+            self.logger.info(f'Rated virtual contest {vc_id} has no channel yet.')
+            return
         member_ids = await self.bot.user_db.get_rated_vc_user_ids(vc_id)
         handles = [
-            await self.bot.user_db.get_handle(member_id, channel.guild.id)
+            await self.bot.user_db.get_handle(member_id, int(vc.guild_id))
             for member_id in member_ids
         ]
+        participations = await self._find_vc_participations(vc, handles)
         handle_to_member_id = {
             handle: member_id
-            for handle, member_id in zip(handles, member_ids, strict=False)
+            for handle, member_id in zip(handles, member_ids, strict=True)
+            if handle is not None
         }
-        now = time.time()
         ranklist = await self.bot.cf_cache.ranklist_cache.generate_vc_ranklist(
-            vc.contest_id, handle_to_member_id
+            vc.contest_id, handle_to_member_id, participations
         )
+        handles_shown = list(handle_to_member_id)
 
-        async def has_running_subs(handle: str) -> list[Any]:
-            return [
-                sub
-                for sub in await cf.user.status(handle=handle)
-                if sub.verdict == 'TESTING'
-                and sub.problem.contestId == vc.contest_id
-                and sub.relativeTimeSeconds <= vc.finish_time - vc.start_time
-            ]
-
-        running_subs_flag = any([await has_running_subs(handle) for handle in handles])
+        running_subs_flag = any(
+            participation.pending for participation in participations.values()
+        )
+        if channel is None:
+            # Gone for good: it finishes all the same once every submission
+            # is judged, as its members can't start another meanwhile.
+            if not running_subs_flag:
+                await self._save_vc_ratings(vc_id, ranklist, handles, member_ids)
+                await self.bot.user_db.finish_rated_vc(vc_id)
+                self.logger.warning(
+                    f'Rated virtual contest {vc_id} finished without a post: its '
+                    'channel is gone.'
+                )
+            return
         if running_subs_flag:
             msg = 'Some submissions are still being judged'
             await channel.send(
@@ -1015,16 +1153,47 @@ class Contests(commands.Cog):
             await self._show_ranklist(
                 channel,
                 vc.contest_id,
-                handles,
+                handles_shown,
                 ranklist=ranklist,
                 vc=True,
                 delete_after=_WATCHING_RATED_VC_WAIT_TIME,
             )
             return
+        rating_change_by_handle = await self._save_vc_ratings(
+            vc_id, ranklist, handles, member_ids
+        )
+        await self.bot.user_db.finish_rated_vc(vc_id)
+        await channel.send(
+            embed=await self._make_vc_rating_changes_embed(
+                channel.guild, vc.contest_id, rating_change_by_handle
+            )
+        )
+        await self._show_ranklist(
+            channel, vc.contest_id, handles_shown, ranklist=ranklist, vc=True
+        )
+
+    async def _save_vc_ratings(
+        self,
+        vc_id: int,
+        ranklist: rl.Ranklist,
+        handles: Sequence[str | None],
+        member_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Save the new ratings that the members of the rated virtual contest
+        ``vc_id``, with ``handles``, earned in ``ranklist``, and take out those
+        who took no part. Returns the rating changes saved, by handle.
+
+        If an earlier try at finishing saved some members' ratings before it
+        failed, those members keep them, as a change counts once, and are left
+        out of what it returns.
+        """
         rating_change_by_handle = {}
         RatingChange = namedtuple('RatingChange', 'handle oldRating newRating')
-        for handle, member_id in zip(handles, member_ids, strict=False):
-            delta = ranklist.delta_by_handle.get(handle)
+        for handle, member_id in zip(handles, member_ids, strict=True):
+            history = await self.bot.user_db.get_vc_rating_history(member_id)
+            if any(row.vc_id == vc_id for row in history):
+                continue
+            delta = self._get_vc_delta(ranklist, handle)
             if delta is None:  # The user did not participate.
                 await self.bot.user_db.remove_last_ratedvc_participation(member_id)
                 continue
@@ -1034,15 +1203,7 @@ class Contests(commands.Cog):
                 handle=handle, oldRating=old_rating, newRating=new_rating
             )
             await self.bot.user_db.update_vc_rating(vc_id, member_id, new_rating)
-        await self.bot.user_db.finish_rated_vc(vc_id)
-        await channel.send(
-            embed=await self._make_vc_rating_changes_embed(
-                channel.guild, vc.contest_id, rating_change_by_handle
-            )
-        )
-        await self._show_ranklist(
-            channel, vc.contest_id, handles, ranklist=ranklist, vc=True
-        )
+        return rating_change_by_handle
 
     @tasks.task_spec(
         name='WatchRatedVCs',
@@ -1052,8 +1213,54 @@ class Contests(commands.Cog):
         ongoing_rated_vcs = await self.bot.user_db.get_ongoing_rated_vc_ids()
         if ongoing_rated_vcs is None:
             return
+        # Forget the contests that have finished.
+        ongoing = set(ongoing_rated_vcs)
+        self._rated_vc_errors = {
+            vc_id: error
+            for vc_id, error in self._rated_vc_errors.items()
+            if vc_id in ongoing
+        }
+        self._overdue_rated_vcs &= ongoing
         for rated_vc_id in ongoing_rated_vcs:
-            await self._watch_rated_vc(rated_vc_id)
+            # One contest's failure mustn't hold the others back. Codeforces
+            # fails now and then, and the next tick tries again.
+            try:
+                await self._watch_rated_vc(rated_vc_id)
+            except cf.CodeforcesApiError as error:
+                self._rated_vc_errors[rated_vc_id] = repr(error)
+                self.logger.info(
+                    f'Rated virtual contest {rated_vc_id} not updated. {error!r}'
+                )
+            except Exception as error:
+                self._rated_vc_errors[rated_vc_id] = repr(error)
+                self.logger.warning(
+                    f'Rated virtual contest {rated_vc_id} not updated. {error!r}',
+                    exc_info=True,
+                )
+            else:
+                self._rated_vc_errors.pop(rated_vc_id, None)
+            await self._warn_if_overdue(rated_vc_id)
+
+    async def _warn_if_overdue(self, vc_id: int) -> None:
+        """Warn, once, if the rated virtual contest ``vc_id`` hasn't finished
+        _RATED_VC_GRACE_TIME after its end, naming the error that last stopped
+        it, if one did.
+        """
+        if vc_id in self._overdue_rated_vcs:
+            return
+        vc = await self.bot.user_db.get_rated_vc(vc_id)
+        if (
+            vc.status != db.RatedVC.ONGOING
+            or time.time() < vc.finish_time + _RATED_VC_GRACE_TIME
+        ):
+            return
+        self._overdue_rated_vcs.add(vc_id)
+        error = self._rated_vc_errors.get(vc_id)
+        last = '' if error is None else f'; the last error: {error}'
+        self.logger.warning(
+            f'Rated virtual contest {vc_id} has not finished an hour after its '
+            f'end{last}'
+        )
 
     @commands.hybrid_command(brief='Take a member out of their rated virtual contest')
     @app_commands.describe(

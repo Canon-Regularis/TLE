@@ -1,5 +1,9 @@
 """Component tests for tle.util.db.cache_db_conn — async in-memory aiosqlite."""
 
+import sqlite3
+
+import pytest
+
 from tle.util.codeforces_api import Problem, RatingChange
 
 
@@ -195,6 +199,75 @@ class TestProblemset:
         fetched = await cache_db.fetch_problems2()
         assert len(fetched) == 1
         assert fetched[0].contestId == 2
+
+    @pytest.mark.parametrize('contest_id', [1, None], ids=['one contest', 'all'])
+    async def test_clear_is_committed(self, cache_db, contest_id):
+        # Left uncommitted, any later commit on the shared connection would
+        # commit it, or a rollback undo it.
+        await cache_db.cache_problemset([self._make_problem()])
+        await cache_db.clear_problemset(contest_id=contest_id)
+        await cache_db.conn.rollback()
+        assert await cache_db.fetch_problems2() == []
+
+    async def test_replace(self, cache_db):
+        await cache_db.cache_problemset(
+            [
+                self._make_problem(contestId=1, index='A', name='P1'),
+                self._make_problem(contestId=1, index='B', name='P2'),
+                self._make_problem(contestId=2, index='A', name='Other'),
+            ]
+        )
+        rc = await cache_db.replace_problemset(
+            1,
+            [
+                self._make_problem(contestId=1, index='A', name='P1', rating=1600),
+                self._make_problem(contestId=1, index='C', name='P3'),
+            ],
+        )
+        # Committed: a rollback changes nothing.
+        await cache_db.conn.rollback()
+        assert rc == 2
+        fetched = sorted(await cache_db.fetch_problemset(1), key=lambda p: p.index)
+        assert [(p.index, p.name, p.rating) for p in fetched] == [
+            ('A', 'P1', 1600),
+            ('C', 'P3', 1500),
+        ]
+        assert [p.name for p in await cache_db.fetch_problemset(2)] == ['Other']
+
+    async def test_replace_with_nothing_clears_the_contest(self, cache_db):
+        await cache_db.cache_problemset(
+            [
+                self._make_problem(contestId=1, index='A', name='P1'),
+                self._make_problem(contestId=2, index='A', name='Other'),
+            ]
+        )
+        assert await cache_db.replace_problemset(1, []) == 0
+        assert await cache_db.fetch_problemset(1) == []
+        assert len(await cache_db.fetch_problemset(2)) == 1
+
+    async def test_replace_never_loses_problems_on_an_error(self, cache_db):
+        # A problem without a name breaks the replacement halfway; then
+        # another writer's commit on the shared connection commits whatever
+        # the replacement had done.
+        await cache_db.cache_problemset(
+            [
+                self._make_problem(contestId=1, index='A', name='P1'),
+                self._make_problem(contestId=1, index='B', name='P2'),
+            ]
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await cache_db.replace_problemset(
+                1,
+                [
+                    self._make_problem(contestId=1, index='C', name='P3'),
+                    self._make_problem(contestId=1, index='D', name=None),
+                ],
+            )
+        await cache_db.cache_contests(
+            [(1, 'Round #1', 1000, 7200, 'CF', 'FINISHED', None)]
+        )
+        names = {p.name for p in await cache_db.fetch_problemset(1)}
+        assert {'P1', 'P2'} <= names
 
     async def test_empty_check(self, cache_db):
         assert await cache_db.problemset_empty() is True

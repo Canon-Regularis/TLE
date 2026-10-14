@@ -2,19 +2,31 @@
 RatingChangesCache, ProblemsetCache.
 
 Tests data management methods directly, NOT the periodic task infrastructure.
+The timed tasks' bodies run once at a time, to show what they log when
+Codeforces fails.
 
 NOTE: The cache modules have a circular import chain
 (tle.util.cache.__init__ <-> tle.util.codeforces_common). To avoid triggering
-this at test collection time we import cache classes lazily inside fixtures.
+this at test collection time we import cache classes lazily inside fixtures,
+and codeforces_common first, so that the file also runs on its own.
 """
 
 import asyncio
-from unittest.mock import patch
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
+import tle.util.codeforces_common  # noqa: F401
+from tle.util import codeforces_api as cf
 from tle.util.codeforces_api import Contest, Problem, RatingChange
-from tle.util.events import ContestListRefresh, EventSystem, Listener
+from tle.util.events import (
+    ContestListRefresh,
+    EventSystem,
+    Listener,
+    RatingChangesUpdate,
+)
 
 
 def _make_contest(id=1, name='Round #1', start=1_000_000, dur=7200, phase='FINISHED'):
@@ -60,6 +72,22 @@ def cache_system(cache_db):
     from tle.util.cache.cache_system import CacheSystem
 
     return CacheSystem(cache_db)
+
+
+def logged(caplog, name=None):
+    """The level and message of each captured record, or of those of the
+    logger `name`.
+    """
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if name is None or record.name == name
+    ]
+
+
+def warned(caplog):
+    """The captured records at WARNING or above."""
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
 # --- CacheSystem init ---
@@ -175,6 +203,48 @@ class TestContestCache:
             await cache_system.contest_cache._try_disk()
         assert 10 in cache_system.contest_cache.contest_by_id
 
+    async def test_codeforces_failing_is_information_and_retried_in_5_minutes(
+        self, cache_system, caplog
+    ):
+        contest_cache = cache_system.contest_cache
+        error = cf.ClientError()
+
+        with patch.object(cf.contest, 'to_list', AsyncMock(side_effect=error)):
+            with caplog.at_level(logging.INFO), pytest.raises(cf.ClientError):
+                # As ;cache contests does: the task runs once, and its error
+                # is raised to the command.
+                await contest_cache.reload_now()
+
+        assert logged(caplog, 'Task') == [
+            (logging.INFO, 'Manually triggering task `ContestCacheUpdate`.'),
+            (
+                logging.INFO,
+                'Task `ContestCacheUpdate` stopped on a Codeforces error,'
+                f' ignoring: {error!r}',
+            ),
+        ]
+        assert warned(caplog) == []
+        assert all(record.exc_info is None for record in caplog.records)
+        # The task's exception handler still had it, so the next try is sooner.
+        assert contest_cache.reload_exception is error
+        assert contest_cache.next_delay == contest_cache._EXCEPTION_CONTEST_RELOAD_DELAY
+
+    async def test_a_bug_is_still_a_warning_with_its_traceback(
+        self, cache_system, caplog
+    ):
+        contest_cache = cache_system.contest_cache
+        error = KeyError('phase')
+
+        with patch.object(cf.contest, 'to_list', AsyncMock(side_effect=error)):
+            with caplog.at_level(logging.INFO), pytest.raises(KeyError):
+                await contest_cache.reload_now()
+
+        assert [(record.name, record.getMessage()) for record in warned(caplog)] == [
+            ('Task', 'Exception in task `ContestCacheUpdate`, ignoring.')
+        ]
+        assert warned(caplog)[0].exc_info[1] is error
+        assert contest_cache.next_delay == contest_cache._EXCEPTION_CONTEST_RELOAD_DELAY
+
 
 # --- ProblemCache ---
 
@@ -206,6 +276,31 @@ class TestProblemCache:
         assert len(cache_with_contests.problem_cache.problems) == 1
         prob = cache_with_contests.problem_cache.problem_by_name['DiskProblem']
         assert prob.rating == 1500
+
+    async def test_codeforces_failing_is_information_and_keeps_the_problems(
+        self, cache_with_contests, caplog
+    ):
+        problem_cache = cache_with_contests.problem_cache
+        await problem_cache._update([_make_problem(contestId=1, name='Kept')])
+        # Such as the error page Codeforces answered once instead of the list.
+        error = cf.ClientError()
+
+        with patch.object(cf.problemset, 'problems', AsyncMock(side_effect=error)):
+            with caplog.at_level(logging.INFO), pytest.raises(cf.ClientError):
+                # As ;cache problems does.
+                await problem_cache.reload_now()
+
+        assert logged(caplog, 'Task') == [
+            (logging.INFO, 'Manually triggering task `ProblemCacheUpdate`.'),
+            (
+                logging.INFO,
+                'Task `ProblemCacheUpdate` stopped on a Codeforces error,'
+                f' ignoring: {error!r}',
+            ),
+        ]
+        assert warned(caplog) == []
+        assert all(record.exc_info is None for record in caplog.records)
+        assert [problem.name for problem in problem_cache.problems] == ['Kept']
 
 
 # --- RatingChangesCache ---
@@ -249,6 +344,299 @@ class TestRatingChangesCache:
         await cache_system.rating_changes_cache._save_changes([(contest, [change])])
         await cache_system.rating_changes_cache._refresh_handle_cache()
         assert cache_system.rating_changes_cache.get_current_rating('dave') == 1900
+
+
+# --- RatingChangesCache, when Codeforces fails ---
+
+# Codeforces Round 1127, whose Div. 1 and Div. 2 ran in parallel. The cache's
+# clock is an hour after its end, while it waits for the rating changes.
+ROUND_START = 1_791_743_700
+ROUND_LENGTH = 2 * 60 * 60
+NOW = ROUND_START + ROUND_LENGTH + 60 * 60
+DIV1 = _make_contest(
+    id=2273, name='Codeforces Round 1127 (Div. 1)', start=ROUND_START, dur=ROUND_LENGTH
+)
+DIV2 = _make_contest(
+    id=2274, name='Codeforces Round 1127 (Div. 2)', start=ROUND_START, dur=ROUND_LENGTH
+)
+
+
+class FakeRatingChanges:
+    """Codeforces' contest.ratingChanges for Round 1127, recording each request.
+    A contest in `failing` gets a new error from its factory instead.
+    """
+
+    def __init__(self):
+        self.changes = {
+            DIV1.id: [_make_rating_change(DIV1.id, 'potato167', 2981, 3127)],
+            DIV2.id: [
+                _make_rating_change(DIV2.id, 'alice', 1500, 1650),
+                _make_rating_change(DIV2.id, 'bob', 1400, 1380),
+            ],
+        }
+        self.failing = {}
+        self.requests = []
+
+    async def __call__(self, *, contest_id):
+        self.requests.append(contest_id)
+        if contest_id in self.failing:
+            raise self.failing[contest_id]()
+        return self.changes[contest_id]
+
+
+class TestRatingChangesCacheErrors:
+    @pytest.fixture(autouse=True)
+    def clock(self, monkeypatch):
+        from tle.util.cache import rating_changes
+
+        monkeypatch.setattr(rating_changes, 'time', SimpleNamespace(time=lambda: NOW))
+
+    @pytest.fixture
+    def codeforces(self, monkeypatch):
+        fake = FakeRatingChanges()
+        monkeypatch.setattr(cf.contest, 'ratingChanges', fake)
+        return fake
+
+    @pytest.fixture
+    def dispatched(self):
+        """The cache's dispatch of events, a mock."""
+        with patch('tle.util.cache.rating_changes.cf_common') as common:
+            yield common.event_sys.dispatch
+
+    @pytest.mark.parametrize(
+        'make_error',
+        [
+            # Codeforces down, after the client's tries.
+            pytest.param(cf.ClientError, id='no-answer'),
+            # A finished contest that isn't rated.
+            pytest.param(
+                lambda: cf.RatingChangesUnavailableError(
+                    'contestId: Rating changes are unavailable for this contest',
+                    DIV1.id,
+                ),
+                id='unrated',
+            ),
+            # A refusal the client doesn't expect, such as a new rule; the
+            # client warns about it itself.
+            pytest.param(
+                lambda: cf.TrueApiError(
+                    'contestId: Rating changes for non-admin users are available'
+                    ' only via anonymous GET requests'
+                ),
+                id='refused',
+            ),
+        ],
+    )
+    async def test_fetch_logs_a_codeforces_error_as_information_and_goes_on(
+        self, cache_system, codeforces, make_error, caplog
+    ):
+        cache = cache_system.rating_changes_cache
+        codeforces.failing[DIV1.id] = make_error
+
+        with caplog.at_level(logging.INFO, logger='RatingChangesCache'):
+            fetched = await cache._fetch([DIV1, DIV2])
+
+        assert codeforces.requests == [DIV1.id, DIV2.id]
+        assert fetched == [(DIV2, codeforces.changes[DIV2.id])]
+        assert logged(caplog) == [
+            (
+                logging.INFO,
+                'Fetch rating changes failed for contest 2273, ignoring.'
+                f' {make_error()!r}',
+            ),
+            (logging.INFO, '2 rating changes fetched for contest 2274'),
+        ]
+        assert all(record.exc_info is None for record in caplog.records)
+
+    async def test_the_monitor_saves_the_others_and_retries_the_failed_one(
+        self, cache_system, codeforces, dispatched, caplog
+    ):
+        cache = cache_system.rating_changes_cache
+        monitor = cache._monitor_task
+        cache.monitored_contests = [DIV1, DIV2]
+        codeforces.failing[DIV1.id] = cf.ClientError
+
+        with caplog.at_level(logging.INFO):
+            await monitor.manual_trigger()
+
+        # The Div. 2's changes are saved and announced, and its members'
+        # ratings cached; Codeforces failing for the Div. 1 is information.
+        assert codeforces.requests == [DIV1.id, DIV2.id]
+        assert not await cache.has_rating_changes_saved(DIV1.id)
+        assert cache.get_current_rating('alice') == 1650
+        assert dispatched.call_args_list == [
+            call(
+                RatingChangesUpdate,
+                contest=DIV2,
+                rating_changes=codeforces.changes[DIV2.id],
+            )
+        ]
+        assert (
+            logging.INFO,
+            'Fetch rating changes failed for contest 2273, ignoring.'
+            f' {cf.ClientError()!r}',
+        ) in logged(caplog)
+        assert warned(caplog) == []
+
+        # At the next tick Codeforces answers; only the Div. 1 is asked for.
+        del codeforces.failing[DIV1.id]
+        codeforces.requests.clear()
+        dispatched.reset_mock()
+        with caplog.at_level(logging.INFO):
+            await monitor.manual_trigger()
+
+        assert codeforces.requests == [DIV1.id]
+        assert cache.get_current_rating('potato167') == 3127
+        assert dispatched.call_args_list == [
+            call(
+                RatingChangesUpdate,
+                contest=DIV1,
+                rating_changes=codeforces.changes[DIV1.id],
+            )
+        ]
+
+        # Then nothing is left to monitor.
+        codeforces.requests.clear()
+        with caplog.at_level(logging.INFO):
+            await monitor.manual_trigger()
+
+        assert codeforces.requests == []
+        assert cache.monitored_contests == []
+        assert warned(caplog) == []
+
+    async def test_a_bug_is_still_a_warning_with_its_traceback(
+        self, cache_system, codeforces, dispatched, caplog
+    ):
+        cache = cache_system.rating_changes_cache
+        cache.monitored_contests = [DIV1, DIV2]
+        error = KeyError('oldRating')
+        codeforces.failing[DIV1.id] = lambda: error
+
+        with caplog.at_level(logging.INFO):
+            await cache._monitor_task.manual_trigger()
+
+        assert len(warned(caplog)) == 1
+        assert warned(caplog)[0].exc_info[1] is error
+
+
+# --- RatingChangesCache, fetched again by ;cache ratingchanges ---
+
+
+async def stored(cache_system, contest):
+    """The handle and new rating of each stored rating change of `contest`."""
+    changes = await cache_system.conn.get_rating_changes_for_contest(contest.id)
+    return sorted((change.handle, change.newRating) for change in changes)
+
+
+class TestRatingChangesCacheFetchedAgain:
+    @pytest.fixture
+    def codeforces(self, monkeypatch):
+        fake = FakeRatingChanges()
+        monkeypatch.setattr(cf.contest, 'ratingChanges', fake)
+        return fake
+
+    @pytest.fixture
+    async def cache(self, cache_system):
+        """The cache, with Round 1127 in the contest list and its rating
+        changes as they were first stored: since then, Codeforces changed the
+        Div. 2's and removed carol from it.
+        """
+        contest_cache = cache_system.contest_cache
+        contest_cache.contest_by_id = {DIV1.id: DIV1, DIV2.id: DIV2}
+        contest_cache.contests_by_phase['FINISHED'] = [DIV1, DIV2]
+        await cache_system.conn.save_rating_changes(
+            [
+                _make_rating_change(DIV1.id, 'potato167', 2981, 3127),
+                _make_rating_change(DIV2.id, 'alice', 1500, 1600),
+                _make_rating_change(DIV2.id, 'carol', 1500, 1450),
+            ]
+        )
+        return cache_system.rating_changes_cache
+
+    @pytest.mark.parametrize(
+        'make_error',
+        [
+            # Codeforces down, after the client's tries.
+            pytest.param(cf.ClientError, id='no-answer'),
+            # A refusal the client doesn't expect; the client warns about it.
+            pytest.param(
+                lambda: cf.TrueApiError(
+                    'contestId: Rating changes for non-admin users are available'
+                    ' only via anonymous GET requests'
+                ),
+                id='refused',
+            ),
+        ],
+    )
+    async def test_a_contest_that_codeforces_fails_for_keeps_its_changes(
+        self, cache_system, cache, codeforces, make_error, caplog
+    ):
+        codeforces.failing[DIV2.id] = make_error
+
+        with caplog.at_level(logging.INFO), pytest.raises(type(make_error())):
+            # Raised to ;cache ratingchanges 2274, which replies with it. It
+            # used to delete the changes, and reply that it fetched none.
+            await cache.fetch_contest(DIV2.id)
+
+        assert await stored(cache_system, DIV2) == [('alice', 1600), ('carol', 1450)]
+        assert warned(caplog) == []
+
+    async def test_a_contest_fetched_again_has_its_changes_replaced(
+        self, cache_system, cache, codeforces
+    ):
+        fetched = await cache.fetch_contest(DIV2.id)
+
+        # The reply counts changes, not contests.
+        assert fetched == 2
+        assert codeforces.requests == [DIV2.id]
+        assert await stored(cache_system, DIV2) == [('alice', 1650), ('bob', 1380)]
+        assert await stored(cache_system, DIV1) == [('potato167', 3127)]
+        assert cache.get_current_rating('alice') == 1650
+
+    async def test_a_contest_without_changes_yet_keeps_those_stored(
+        self, cache_system, cache, codeforces
+    ):
+        # An answer without changes brings none to store in their place.
+        codeforces.changes[DIV2.id] = []
+
+        assert await cache.fetch_contest(DIV2.id) == 0
+
+        assert await stored(cache_system, DIV2) == [('alice', 1600), ('carol', 1450)]
+
+    async def test_all_contests_fetched_again_keep_the_changes_of_those_that_fail(
+        self, cache_system, cache, codeforces, caplog
+    ):
+        # Each contest's changes used to be deleted before any was fetched,
+        # so those that Codeforces failed for were left without any.
+        codeforces.failing[DIV1.id] = cf.ClientError
+        codeforces.changes[DIV2.id] = [
+            _make_rating_change(DIV2.id, 'alice', 1500, 1650),
+            _make_rating_change(DIV2.id, 'dave', 1200, 1350),
+        ]
+
+        with caplog.at_level(logging.INFO):
+            fetched = await cache.fetch_all_contests()
+
+        assert fetched == 2
+        assert codeforces.requests == [DIV1.id, DIV2.id]
+        assert await stored(cache_system, DIV1) == [('potato167', 3127)]
+        assert await stored(cache_system, DIV2) == [('alice', 1650), ('dave', 1350)]
+        assert cache.get_current_rating('dave') == 1350
+        assert warned(caplog) == []
+
+    async def test_missing_contests_are_fetched_and_counted_by_their_changes(
+        self, cache_system, codeforces
+    ):
+        cache = cache_system.rating_changes_cache
+        cache_system.contest_cache.contests_by_phase['FINISHED'] = [DIV1, DIV2]
+        await cache_system.conn.save_rating_changes(codeforces.changes[DIV1.id])
+
+        fetched = await cache.fetch_missing_contests()
+
+        # The Div. 2's 2 changes; the Div. 1's were stored already.
+        assert fetched == 2
+        assert codeforces.requests == [DIV2.id]
+        assert await stored(cache_system, DIV2) == [('alice', 1650), ('bob', 1380)]
 
 
 # --- ProblemsetCache ---
