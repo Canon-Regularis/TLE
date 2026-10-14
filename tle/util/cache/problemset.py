@@ -28,7 +28,8 @@ class ProblemsetUpdate(NamedTuple):
     # How many problems it saved, new or changed.
     problems: int
     # The contests whose problems Codeforces didn't give, so the bot still
-    # lacks them.
+    # lacks them. Contests whose standings Codeforces keeps private, as for
+    # some of its practice rounds, aren't among them: there is nothing to get.
     failed: list[int]
 
 
@@ -124,7 +125,8 @@ class ProblemsetCache:
         self.logger = logging.getLogger(self.__class__.__name__)
         self._clock = clock
         # When an update of every finished contest last failed to get each
-        # contest's problems from its standings, by contest id.
+        # contest's problems from its standings, or found them private, by
+        # contest id.
         self._failed_fetches: dict[int, float] = {}
 
     async def run(self) -> None:
@@ -168,7 +170,8 @@ class ProblemsetCache:
         old it is, and without the backoff. Intended for manual trigger.
 
         Stored problems are never deleted, and a contest whose problems it
-        fails to get is reported, not raised.
+        fails to get is reported, not raised. A contest whose standings
+        Codeforces keeps private isn't reported.
         """
         async with self.update_lock:
             return await self._update_finished(every_age=True)
@@ -210,8 +213,9 @@ class ProblemsetCache:
         to get in the last 24 hours. Only new or changed problems are saved.
 
         A contest whose problems it fails to get, for any reason, goes in
-        ``failed``, and the update goes on. Raises ``CodeforcesApiError`` if
-        the problem list fails, before anything changes.
+        ``failed``, and the update goes on; one whose standings Codeforces
+        keeps private doesn't. Raises ``CodeforcesApiError`` if the problem
+        list fails, before anything changes.
         """
         contests = self.cache_master.contest_cache.contests_by_phase['FINISHED']
         if not contests:
@@ -252,7 +256,7 @@ class ProblemsetCache:
     def _due(self, contest: cf.Contest, now: float) -> bool:
         """Whether the hourly update fetches the standings of ``contest``: it
         ended in the last 14 days, and getting its problems from them last
-        failed more than 24 hours ago, if ever.
+        failed, or found them private, more than 24 hours ago, if ever.
         """
         end = contest.end_time
         if end is None or now - end > self._MONITOR_PERIOD_SINCE_CONTEST_END:
@@ -283,6 +287,10 @@ class ProblemsetCache:
         alone for 24 hours. A Codeforces error is logged as information, and
         anything else as a warning with its traceback. Cancelling still stops
         it.
+
+        Standings that Codeforces keeps private are no failure: it logs that at
+        INFO and returns 0, and the hourly update leaves the contest alone for
+        24 hours too.
         """
         try:
             found = await self._fetch_standings(contest_id)
@@ -293,6 +301,13 @@ class ProblemsetCache:
                 self._failed_fetches.pop(contest_id, None)
                 return count
             self.logger.info(f'Standings of contest {contest_id} have no problems.')
+        except cf.ContestNotFoundError:
+            # Codeforces lists the contest, as it is in the bot's contest list,
+            # but keeps its standings to itself, as for some of its practice
+            # rounds.
+            self.logger.info(f'Standings of contest {contest_id} are not public.')
+            self._failed_fetches[contest_id] = self._clock()
+            return 0
         except cf.CodeforcesApiError as error:
             # Codeforces failed, which the API client has logged.
             self.logger.info(
