@@ -4,16 +4,18 @@ The access rules alone decide who may use each command, so the cog has no
 checks of its own. Slow commands answer within Discord's 3 seconds by typing
 first. Mistyped choices get the choices, the self-service ping roles are
 checked before they are handed out, and replies never name a role or an id.
+A member who joins while Codeforces fails is only logged.
 
 The cog reads and writes a real in-memory user database (the ``user_db``
 fixture). Discord is mocked, and Codeforces is patched, so no test reaches
 either. Commands run as their callbacks, as in the other cog tests, or through
-a real bot where discord.py's own argument parsing matters.
+a real bot where discord.py's own argument parsing or error handling matters.
 """
 
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from collections.abc import AsyncIterator, Callable
 from types import ModuleType
 from typing import Any
@@ -38,6 +40,7 @@ CHANNEL_ID = 1_300_000_000_000_000_001
 PING_ROLE_ID = 1_400_000_000_000_000_001
 TRUSTED_ROLE_ID = 1_400_000_000_000_000_002
 PURGATORY_ROLE_ID = 1_400_000_000_000_000_003
+EXPERT_ROLE_ID = 1_400_000_000_000_000_004
 BOT_ROLE_ID = 1_400_000_000_000_000_009
 HANDLE = 'Fake_Coder'  # a made-up account
 CONTEST_ID = 1950
@@ -450,6 +453,125 @@ async def test_updatestatus_says_how_many_members_it_marked(
     await type(cog)._updatestatus.callback(cog, ctx)
 
     assert replies(ctx) == ['Marked 1 member with a linked handle as active.']
+
+
+# Members who join
+
+
+def warned(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The captured records at WARNING or above, which reach the log channel."""
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+async def test_a_linked_member_who_joins_gets_their_rank_role(
+    cog: Any,
+    guild: MagicMock,
+    member: MagicMock,
+    user_db: UserDbConn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expert = make_role(guild, EXPERT_ROLE_ID, 'Expert', position=2)
+    guild.roles = [*guild.roles, expert]
+    await link(user_db)
+    info = AsyncMock(return_value=[codeforces_user(rating=1700)])
+    monkeypatch.setattr(cf.user, 'info', info)
+
+    await cog.on_member_join(member)
+
+    info.assert_awaited_once_with(handles=(HANDLE,))
+    assert member.roles == [expert]
+
+
+@pytest.mark.parametrize(
+    'error',
+    [
+        # Codeforces down, after the client's tries.
+        cf.ClientError(),
+        # The account renamed or deleted since it was linked.
+        cf.HandleNotFoundError(f'handles: User with handle {HANDLE} not found', HANDLE),
+    ],
+    ids=['codeforces-down', 'account-gone'],
+)
+async def test_a_member_who_joins_while_codeforces_fails_is_only_logged(
+    cog: Any,
+    member: MagicMock,
+    user_db: UserDbConn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: cf.CodeforcesApiError,
+) -> None:
+    await link(user_db)
+    monkeypatch.setattr(cf.user, 'info', AsyncMock(side_effect=error))
+
+    with caplog.at_level(logging.INFO):
+        await cog.on_member_join(member)
+
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == cog.logger.name
+    ] == [
+        (
+            logging.INFO,
+            f'Rank role of member {MEMBER_ID}, who joined server {GUILD_ID}, not'
+            f' updated: {error!r}',
+        )
+    ]
+    assert warned(caplog) == []
+    assert all(record.exc_info is None for record in caplog.records)
+    assert member.roles == []
+
+
+async def test_a_bug_when_a_member_joins_is_still_raised(
+    cog: Any, member: MagicMock, user_db: UserDbConn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await link(user_db)
+    monkeypatch.setattr(cf.user, 'info', AsyncMock(side_effect=KeyError('rating')))
+
+    with pytest.raises(KeyError):
+        await cog.on_member_join(member)
+
+
+@pytest.mark.parametrize(
+    ('error', 'reported'),
+    [(cf.ClientError(), False), (KeyError('rating'), True)],
+    ids=['codeforces-down', 'bug'],
+)
+async def test_only_a_bug_when_a_member_joins_reaches_discords_handler(
+    live_bot: commands.Bot,
+    member: MagicMock,
+    user_db: UserDbConn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    reported: bool,
+) -> None:
+    # discord.py logs an event's exception as an error, with its traceback,
+    # which the log channel posts.
+    await link(user_db)
+    monkeypatch.setattr(cf.user, 'info', AsyncMock(side_effect=error))
+
+    with caplog.at_level(logging.INFO):
+        live_bot.dispatch('member_join', member)
+        # Wait for the listener, which discord.py runs as a task.
+        await asyncio.gather(
+            *(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name().startswith('discord.py:')
+            )
+        )
+
+    posted = [
+        (record.name, record.levelno, record.getMessage()) for record in warned(caplog)
+    ]
+    if reported:
+        assert posted == [
+            ('discord.client', logging.ERROR, 'Ignoring exception in on_member_join')
+        ]
+        assert warned(caplog)[0].exc_info[1] is error
+    else:
+        assert posted == []
 
 
 @pytest.mark.parametrize(

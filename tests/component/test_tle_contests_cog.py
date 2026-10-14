@@ -6,11 +6,16 @@ the arguments, with a real in-memory user database (the ``user_db`` fixture)
 and, where channels matter, a real access service. Discord itself (contexts,
 the server, its channels and members) is mocked, but roles are real
 ``discord.Role`` objects, so that the checks of which roles members may give
-themselves run as they do in a server.
+themselves run as they do in a server. The rated virtual contest watcher runs
+one tick at a time, on the test's clock, with Codeforces' submissions and the
+ranklist cache's standings faked.
 """
 
+import itertools
 import json
-from collections.abc import Callable
+import logging
+import sqlite3
+from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
@@ -27,14 +32,21 @@ from tle.access.service import AccessService
 from tle.access.settings import GuildAccess
 from tle.cogs import contests
 from tle.cogs.contests import (
+    RANKLIST_LISTED_NOTE,
+    RANKLIST_OFFICIAL_NOTE,
+    RANKLIST_PREDICTED_NOTE,
     RATED_VC_CHANNEL_SET_TEXT,
+    RATED_VC_START_TEXT,
     UNASSIGNABLE_REMINDER_ROLE_TEXT,
+    UNLISTED_NOTE,
+    UNSCORABLE_RATED_VC_TEXT,
     UNSUITABLE_REMINDER_ROLE_TEXT,
+    VC_RANKLIST_NOTE,
     ContestCogError,
     Contests,
 )
 from tle.config import Settings
-from tle.util import codeforces_api as cf
+from tle.util import codeforces_api as cf, codeforces_common as cf_common, tasks
 from tle.util.cache import ContestNotFound, RanklistNotMonitored
 from tle.util.codeforces_api import (
     Contest,
@@ -43,10 +55,12 @@ from tle.util.codeforces_api import (
     Problem,
     ProblemResult,
     RanklistRow,
+    RatingChange,
+    Submission,
 )
 from tle.util.db.user_db_conn import UserDbConn
 from tle.util.discord_common import NOT_IN_A_THREAD_MESSAGE
-from tle.util.ranklist import Ranklist
+from tle.util.ranklist import Ranklist, virtual
 
 # Real snowflakes are 64-bit, so use big ones.
 GUILD_ID = 1_100_000_000_000_000_001
@@ -223,9 +237,9 @@ def make_contest(phase: str) -> Contest:
     )
 
 
-def make_ranklist(contest: Contest, handle: str) -> Ranklist:
-    """The standings of ``contest``, which ``handle`` won with problem A."""
-    problem = Problem(
+def watermelon(contest: Contest) -> Problem:
+    """The problem A of ``contest``."""
+    return Problem(
         contestId=contest.id,
         problemsetName=None,
         index='A',
@@ -235,6 +249,11 @@ def make_ranklist(contest: Contest, handle: str) -> Ranklist:
         rating=800,
         tags=[],
     )
+
+
+def make_ranklist(contest: Contest, handle: str) -> Ranklist:
+    """The standings of ``contest``, which ``handle`` won with problem A."""
+    problem = watermelon(contest)
     party = Party(
         contestId=contest.id,
         members=[Member(handle=handle)],
@@ -611,6 +630,251 @@ async def test_a_ranklist_shown_spends_the_server_s_cooldown(
     ctx.command.reset_cooldown.assert_not_called()
 
 
+def make_row(
+    handle: str,
+    points: float,
+    penalty: int = 0,
+    *,
+    rank: int,
+    team: Sequence[str] = (),
+) -> RanklistRow:
+    """A contestant's row, or with ``team`` a team's of those members: problem
+    A solved if it has points.
+    """
+    party = Party(
+        contestId=CONTEST_ID,
+        members=[Member(handle=member) for member in team or [handle]],
+        participantType='CONTESTANT',
+        teamId=1 if team else None,
+        teamName=handle if team else None,
+        ghost=False,
+        room=None,
+        startTimeSeconds=None,
+    )
+    result = ProblemResult(
+        points=points,
+        penalty=None,
+        rejectedAttemptCount=0,
+        type='FINAL',
+        bestSubmissionTimeSeconds=600 if points else None,
+    )
+    return RanklistRow(
+        party=party, rank=rank, points=points, penalty=penalty, problemResults=[result]
+    )
+
+
+def make_change(handle: str, rank: int, delta: int) -> RatingChange:
+    return RatingChange(
+        contestId=CONTEST_ID,
+        contestName=CONTEST_NAME,
+        handle=handle,
+        rank=rank,
+        ratingUpdateTimeSeconds=0,
+        oldRating=1500,
+        newRating=1500 + delta,
+    )
+
+
+def official_ranklist(
+    contest: Contest, rows: list[RanklistRow], *changes: RatingChange
+) -> Ranklist:
+    """``contest``'s standings with Codeforces' official ranks and rating
+    changes.
+    """
+    ranklist = Ranklist(contest, [watermelon(contest)], rows, 0.0, is_rated=True)
+    ranklist.set_official_results(changes)
+    return ranklist
+
+
+def with_official_ranks() -> Ranklist:
+    contest = make_contest('FINISHED')
+    return official_ranklist(
+        contest, [make_row('tourist', 500, rank=1)], make_change('tourist', 1, 20)
+    )
+
+
+def with_predictions() -> Ranklist:
+    contest = make_contest('FINISHED')
+    rows = [make_row('tourist', 500, rank=1)]
+    ranklist = Ranklist(contest, [watermelon(contest)], rows, 0.0, is_rated=True)
+    ranklist.predict({'tourist': 3000})
+    return ranklist
+
+
+def unrated() -> Ranklist:
+    return make_ranklist(make_contest('FINISHED'), 'tourist')
+
+
+def of_teams() -> Ranklist:
+    """A team contest's standings: final rating changes, with listed ranks."""
+    contest = make_contest('FINISHED')
+    return official_ranklist(
+        contest,
+        [make_row('tourist', 500, rank=1, team=['alice', 'bob'])],
+        make_change('alice', 1, 20),
+        make_change('bob', 1, 20),
+    )
+
+
+@pytest.mark.parametrize(
+    ('make', 'footer'),
+    [
+        (with_official_ranks, RANKLIST_OFFICIAL_NOTE),
+        (with_predictions, RANKLIST_PREDICTED_NOTE),
+        (unrated, RANKLIST_LISTED_NOTE),
+        (of_teams, RANKLIST_LISTED_NOTE),
+    ],
+    ids=['official', 'predicted', 'unrated', 'a team contest'],
+)
+async def test_a_ranklist_s_footer_says_what_its_ranks_count(
+    cog: Contests,
+    bot: MagicMock,
+    guild: MagicMock,
+    make: Callable[[], Ranklist],
+    footer: str,
+) -> None:
+    ranklist = make()
+    bot.cf_cache.contest_cache.get_contest.return_value = ranklist.contest
+    bot.cf_cache.ranklist_cache.get_ranklist.return_value = ranklist
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), make_member())
+
+    await type(cog).ranklist.callback(cog, ctx, CONTEST_ID, 'tourist')
+
+    _, contest_embed, _ = ctx.send.await_args_list
+    assert contest_embed.kwargs['embed'].footer.text == footer
+
+
+async def test_ranklist_of_a_contest_no_longer_monitored_asks_for_its_rating_changes(
+    cog: Contests, bot: MagicMock, guild: MagicMock
+) -> None:
+    # Once a contest's rating changes are saved, the ranklist cache stops
+    # monitoring it, so its ranklist comes with Codeforces' official ranks.
+    ranklist = with_official_ranks()
+    bot.cf_cache.contest_cache.get_contest.return_value = ranklist.contest
+    cache = bot.cf_cache.ranklist_cache
+    cache.get_ranklist.side_effect = RanklistNotMonitored(ranklist.contest)
+    cache.generate_ranklist = AsyncMock(return_value=ranklist)
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), make_member())
+
+    await type(cog).ranklist.callback(cog, ctx, CONTEST_ID, 'tourist')
+
+    cache.generate_ranklist.assert_awaited_once_with(
+        CONTEST_ID, fetch_changes=True, rated_only=False
+    )
+    _, contest_embed, _ = ctx.send.await_args_list
+    assert contest_embed.kwargs['embed'].footer.text == RANKLIST_OFFICIAL_NOTE
+
+
+def data_lines(page: str) -> list[list[str]]:
+    """The cells of each row of standings on ``page``, without blanks."""
+    return [
+        line.split()
+        for line in page.splitlines()
+        if line.split() and line.split()[0].isdigit()
+    ]
+
+
+async def test_a_member_left_out_of_the_public_standings_shows_their_official_rank(
+    cog: Contests, bot: MagicMock, guild: MagicMock
+) -> None:
+    # A Div. 1 round can leave rated contestants out too.
+    contest = make_contest('FINISHED')._replace(type='ICPC')
+    ranklist = official_ranklist(
+        contest,
+        [make_row('tourist', 1, 30, rank=1)],
+        make_change('hidden', 1, 50),
+        make_change('tourist', 2, 20),
+    )
+    bot.cf_cache.contest_cache.get_contest.return_value = contest
+    bot.cf_cache.ranklist_cache.get_ranklist.return_value = ranklist
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), make_member())
+
+    await type(cog).ranklist.callback(cog, ctx, CONTEST_ID, 'tourist', 'HIDDEN')
+
+    *_, standings = ctx.send.await_args_list
+    page = standings.args[0]
+    # No results: just the official rank and rating change, marked.
+    assert data_lines(page) == [
+        ['1', 'hidden:*', '+50'],
+        ['2', 'tourist:', '1', '30', '+', '+20'],
+    ]
+    assert UNLISTED_NOTE in page.splitlines()
+
+
+def test_a_member_left_out_has_a_blank_cell_for_each_column(cog: Contests) -> None:
+    # table.Table needs every cell.
+    contest = make_contest('FINISHED')
+    ranklist = official_ranklist(
+        contest, [make_row('tourist', 500, rank=2)], make_change('hidden', 1, 50)
+    )
+    hidden = [('hidden', ranklist.get_standing_row('hidden'))]
+
+    *_, cf_body = cog._get_cf_or_ioi_standings_table(
+        ['A', 'B'], hidden, [50], mode='cf'
+    )
+    *_, icpc_body = cog._get_icpc_standings_table(['A', 'B'], hidden, [50])
+
+    assert cf_body == [[1, 'hidden:*', '', '', '', '+50']]
+    assert icpc_body == [[1, 'hidden:*', '', '', '', '', '+50']]
+
+
+def test_only_a_page_with_a_member_left_out_explains_the_mark(cog: Contests) -> None:
+    contest = make_contest('FINISHED')
+    rows = [
+        make_row(f'member{rank:02}', 600 - rank, rank=rank) for rank in range(2, 19)
+    ]
+    ranklist = official_ranklist(
+        contest,
+        rows,
+        make_change('hidden', 1, 50),
+        *(make_change(f'member{rank:02}', rank, 10) for rank in range(2, 19)),
+    )
+    standings = [('hidden', ranklist.get_standing_row('hidden'))] + [
+        (Ranklist.get_ranklist_lookup_key(row), row) for row in ranklist.standings
+    ]
+
+    pages = cog._make_standings_pages(contest, ['A'], standings, [50] + [10] * 17)
+
+    first, second = (content for content, _ in pages)
+    assert UNLISTED_NOTE in first.splitlines()
+    assert UNLISTED_NOTE not in second
+
+
+async def test_standings_go_by_rank_then_by_score(
+    cog: Contests, bot: MagicMock
+) -> None:
+    # An Educational round's unrated row takes the rank of the rated row below
+    # it, and shows above it, with its better score.
+    contest = make_contest('FINISHED')._replace(
+        type='ICPC', name='Educational Codeforces Round 183 (Rated for Div. 2)'
+    )
+    ranklist = official_ranklist(
+        contest,
+        [
+            make_row('cherry', 6, 100, rank=1),
+            make_row('strong', 5, 50, rank=2),
+            make_row('bob', 5, 80, rank=3),
+        ],
+        make_change('cherry', 1, 90),
+        make_change('hidden', 2, 70),
+        make_change('bob', 3, 10),
+    )
+    bot.cf_cache.contest_cache.get_contest.return_value = contest
+    channel = make_channel(BOT_CHANNEL_ID)
+
+    await cog._show_ranklist(
+        channel, CONTEST_ID, ['bob', 'strong', 'hidden', 'cherry'], ranklist
+    )
+
+    page = channel.send.await_args.args[0]
+    assert [cells[:2] for cells in data_lines(page)] == [
+        ['1', 'cherry:'],
+        ['2', 'hidden:*'],
+        ['3', 'strong:'],
+        ['3', 'bob:'],
+    ]
+
+
 # Rated virtual contests
 
 
@@ -750,6 +1014,61 @@ async def test_ratedvc_refused_after_asking_codeforces_spends_its_cooldown(
     ctx.command.reset_cooldown.assert_not_called()
 
 
+async def test_ratedvc_refuses_a_contest_it_cannot_score_before_asking_codeforces(
+    cog: Contests,
+    bot: MagicMock,
+    user_db: UserDbConn,
+    guild: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot.cf_cache.contest_cache.get_contest.return_value = make_contest(
+        'FINISHED'
+    )._replace(type='IOI')
+    rating_changes = AsyncMock(return_value=[])
+    monkeypatch.setattr(cf.contest, 'ratingChanges', rating_changes)
+    await user_db.set_rated_vc_channel(GUILD_ID, BOT_CHANNEL_ID)
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), make_member())
+
+    with pytest.raises(ContestCogError) as refused:
+        await type(cog).ratedvc.callback(cog, ctx, CONTEST_ID, make_member())
+
+    assert str(refused.value) == UNSCORABLE_RATED_VC_TEXT.format(name=CONTEST_NAME)
+    rating_changes.assert_not_awaited()
+    ctx.command.reset_cooldown.assert_called_once_with(ctx)
+
+
+async def test_ratedvc_asks_its_members_to_start_on_their_own_within_10_minutes(
+    cog: Contests,
+    bot: MagicMock,
+    user_db: UserDbConn,
+    guild: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: 'Clock',
+) -> None:
+    bot.cf_cache.contest_cache.get_contest.return_value = make_contest('FINISHED')
+    changes = [make_change(f'rated{rank}', rank, 0) for rank in range(1, 51)]
+    monkeypatch.setattr(cf.contest, 'ratingChanges', AsyncMock(return_value=changes))
+    monkeypatch.setattr(cf_common, 'user_db', user_db)
+    monkeypatch.setattr(
+        cf_common, 'get_visited_contests', AsyncMock(return_value=set())
+    )
+    await user_db.set_handle(MEMBER_ID, GUILD_ID, 'alice')
+    await user_db.set_rated_vc_channel(GUILD_ID, BOT_CHANNEL_ID)
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), make_member())
+
+    await type(cog).ratedvc.callback(cog, ctx, CONTEST_ID, make_member())
+
+    _, alert = ctx.send.await_args_list
+    # The contest's 2 hours, and the 10 minutes to start it.
+    assert alert.kwargs['embed'].description == (
+        'You have 130 minutes to finish the contest!\n'
+        + RATED_VC_START_TEXT.format(minutes=10)
+    )
+    [vc_id] = await user_db.get_ongoing_rated_vc_ids()
+    vc = await user_db.get_rated_vc(vc_id)
+    assert (vc.start_time, vc.finish_time) == (clock.now, clock.now + 130 * 60)
+
+
 @pytest.fixture
 async def rated(user_db: UserDbConn) -> None:
     """Alice, whose handle is tourist, finished a rated virtual contest with
@@ -793,3 +1112,595 @@ async def test_vcratings_defers_its_answer_before_finding_the_members(
     await type(cog).vcratings.callback(cog, ctx)
 
     assert steps == ['typing', 'found a member', 'typed', 'answered']
+
+
+# The rated virtual contest watcher
+
+OTHER_ID = 1_400_000_000_000_000_002
+THIRD_ID = 1_400_000_000_000_000_003
+# A rated virtual contest of the 2-hour contest, which ends 10 minutes later,
+# as its members have 10 minutes to start it.
+VC_START = 1_700_000_000
+VC_FINISH = VC_START + 7200 + 10 * 60
+SUBMISSION_IDS = itertools.count(1)
+
+
+class Clock:
+    """The time, which the tests move on."""
+
+    def __init__(self) -> None:
+        self.now: float = VC_START
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    """The cog's clock."""
+    clock = Clock()
+    monkeypatch.setattr(contests, 'time', SimpleNamespace(time=clock))
+    return clock
+
+
+def virtual_submission(
+    handle: str,
+    minutes: float,
+    verdict: str | None = 'OK',
+    *,
+    started: int = VC_START + 60,
+) -> Submission:
+    """``handle``'s virtual submission for problem A, ``minutes`` after they
+    started the contest on Codeforces, at ``started``.
+    """
+    created = started + round(60 * minutes)
+    return Submission(
+        id=next(SUBMISSION_IDS),
+        contestId=CONTEST_ID,
+        problem=watermelon(make_contest('FINISHED')),
+        author=Party(
+            contestId=CONTEST_ID,
+            members=[Member(handle=handle)],
+            participantType='VIRTUAL',
+            teamId=None,
+            teamName=None,
+            ghost=False,
+            room=None,
+            startTimeSeconds=started,
+        ),
+        programmingLanguage='C++',
+        verdict=verdict,
+        creationTimeSeconds=created,
+        relativeTimeSeconds=created - started,
+        passedTestCount=3,
+    )
+
+
+class Submissions:
+    """Codeforces' answers to contest.status: each handle's submissions to the
+    contest, newest first. Each request is recorded.
+    """
+
+    def __init__(self) -> None:
+        self.by_handle: dict[str, list[Submission]] = {}
+        self.errors: dict[str, Exception] = {}
+        self.requests: list[str] = []
+        # Runs as each request is answered: time passes meanwhile.
+        self.answering: Callable[[], None] = lambda: None
+
+    async def status(
+        self, *, contest_id: int, handle: str | None = None
+    ) -> list[Submission]:
+        assert contest_id == CONTEST_ID
+        assert handle is not None
+        self.requests.append(handle)
+        self.answering()
+        if handle in self.errors:
+            raise self.errors[handle]
+        return sorted(
+            self.by_handle.get(handle, []),
+            key=lambda submission: -submission.creationTimeSeconds,
+        )
+
+
+@pytest.fixture
+def submissions(monkeypatch: pytest.MonkeyPatch) -> Submissions:
+    fake = Submissions()
+    monkeypatch.setattr(cf.contest, 'status', fake.status)
+    return fake
+
+
+class VcStandings:
+    """The ranklist cache's standings of a rated virtual contest: a point for
+    each accepted submission, and the rating change that the test sets for
+    each handle. Records the participations it scores.
+    """
+
+    def __init__(self) -> None:
+        self.deltas: dict[str, int] = {}
+        self.scored: list[dict[str, virtual.VirtualParticipation]] = []
+
+    async def generate_vc_ranklist(
+        self,
+        contest_id: int,
+        handle_to_member_id: Mapping[str, Any],
+        participations: Mapping[str, virtual.VirtualParticipation],
+    ) -> Ranklist:
+        assert contest_id == CONTEST_ID
+        self.scored.append(dict(participations))
+        contest = make_contest('FINISHED')
+        rows = [
+            RanklistRow(
+                party=participation.party,
+                rank=1,
+                points=float(
+                    sum(
+                        submission.verdict == 'OK'
+                        for submission in participation.submissions
+                    )
+                ),
+                penalty=0,
+                problemResults=[],
+            )
+            for participation in participations.values()
+        ]
+        ranklist = Ranklist(contest, [watermelon(contest)], rows, 0.0, is_rated=True)
+        ranklist.delta_by_handle = {
+            handle: self.deltas.get(handle, 0) for handle in participations
+        }
+        ranklist.deltas_status = 'Predicted'
+        return ranklist
+
+
+@pytest.fixture
+def vc_standings(bot: MagicMock) -> VcStandings:
+    standings = VcStandings()
+    bot.cf_cache.ranklist_cache.generate_vc_ranklist = standings.generate_vc_ranklist
+    bot.cf_cache.contest_cache.get_contest.return_value = make_contest('FINISHED')
+    return standings
+
+
+def vc_member(member_id: int) -> MagicMock:
+    member = MagicMock(spec=discord.Member, id=member_id)
+    member.mention = f'<@{member_id}>'
+    return member
+
+
+@pytest.fixture
+def vc_channel(bot: MagicMock, guild: MagicMock) -> MagicMock:
+    """The rated virtual contest channel, which the bot finds; posts in it are
+    recorded.
+    """
+    channel = make_channel(BOT_CHANNEL_ID)
+    channel.guild = guild
+    members = {
+        member_id: vc_member(member_id) for member_id in (MEMBER_ID, OTHER_ID, THIRD_ID)
+    }
+    guild.get_member.side_effect = members.get
+    bot.get_channel.side_effect = {BOT_CHANNEL_ID: channel}.get
+    return channel
+
+
+async def start_vc(user_db: UserDbConn, handles: Mapping[int, str | None]) -> int:
+    """A rated virtual contest for the members with ``handles``, by id; a
+    member with None has no handle.
+    """
+    await user_db.set_rated_vc_channel(GUILD_ID, BOT_CHANNEL_ID)
+    for member_id, handle in handles.items():
+        if handle is not None:
+            await user_db.set_handle(member_id, GUILD_ID, handle)
+    vc_id = await user_db.create_rated_vc(
+        CONTEST_ID, VC_START, VC_FINISH, GUILD_ID, list(handles)
+    )
+    assert vc_id is not None
+    return vc_id
+
+
+async def tick(cog: Contests) -> None:
+    """Run the rated virtual contest watcher once, as its task does every 5
+    minutes.
+    """
+    task = cog._watch_rated_vcs_task
+    assert isinstance(task, tasks.Task)
+    await task.func(cog, None)
+
+
+async def vc_rating(user_db: UserDbConn, member_id: int) -> int | None:
+    return await user_db.get_vc_rating(str(member_id), default_if_not_exist=False)
+
+
+def logged(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str, bool]]:
+    """What the cog logged: each record's level, text and whether it has a
+    traceback.
+    """
+    return [
+        (record.levelno, record.getMessage(), record.exc_info is not None)
+        for record in caplog.records
+        if record.name == 'Contests'
+    ]
+
+
+async def test_while_a_rated_virtual_contest_runs_its_standings_are_posted(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    vc_id = await start_vc(
+        user_db, {MEMBER_ID: 'alice', OTHER_ID: 'bob', THIRD_ID: None}
+    )
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10)]
+    clock.now = VC_START + 30 * 60
+
+    await tick(cog)
+
+    # One request for each member with a handle.
+    assert sorted(submissions.requests) == ['alice', 'bob']
+    [scored] = vc_standings.scored
+    assert list(scored) == ['alice']
+    embed_post, standings_post = vc_channel.send.await_args_list
+    assert embed_post.kwargs['embed'].footer.text == VC_RANKLIST_NOTE
+    assert data_lines(standings_post.args[0]) == [['1', 'alice:#', '1', '+0']]
+    assert await user_db.get_ongoing_rated_vc_ids() == [vc_id]
+
+
+async def test_at_its_end_a_rated_virtual_contest_saves_and_posts_the_ratings(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    vc_id = await start_vc(
+        user_db, {MEMBER_ID: 'alice', OTHER_ID: 'bob', THIRD_ID: None}
+    )
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10)]
+    vc_standings.deltas['alice'] = 40
+    clock.now = VC_FINISH + 60
+
+    await tick(cog)
+
+    assert await user_db.get_ongoing_rated_vc_ids() == []
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+    # Those who took no part leave it, so that it doesn't rate them.
+    assert await user_db.get_rated_vc_user_ids(vc_id) == [str(MEMBER_ID)]
+    results, standings_post = vc_channel.send.await_args_list
+    embed = results.kwargs['embed']
+    assert embed.author.name == 'Virtual contest results'
+    assert '1500 \N{HORIZONTAL BAR} **+40** \N{LONG RIGHTWARDS ARROW} 1540' in (
+        embed.fields[0].value
+    )
+    assert data_lines(standings_post.args[0]) == [['1', 'alice:#', '1', '+40']]
+
+
+@pytest.mark.parametrize(
+    'error',
+    [
+        cf.HandleNotFoundError('handle: User with handle renamed not found', 'renamed'),
+        cf.HandleInvalidError(
+            'handle: Field should contain only Latin letters, digits, underscore '
+            'or dash characters',
+            'renamed',
+        ),
+    ],
+    ids=['not found', 'invalid'],
+)
+async def test_a_handle_codeforces_does_not_know_takes_no_part(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    error: cf.TrueApiError,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice', OTHER_ID: 'renamed'})
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10)]
+    submissions.errors['renamed'] = error
+    vc_standings.deltas['alice'] = 40
+    clock.now = VC_FINISH + 60
+    caplog.set_level(logging.INFO, logger='Contests')
+
+    await tick(cog)
+
+    assert sorted(submissions.requests) == ['alice', 'renamed']
+    [(level, text, traceback)] = logged(caplog)
+    assert (level, traceback) == (logging.INFO, False)
+    assert text.startswith(f'Rated virtual contest {vc_id}: renamed took no part.')
+    assert await user_db.get_rated_vc_user_ids(vc_id) == [str(MEMBER_ID)]
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+
+
+async def test_a_submission_still_being_judged_keeps_the_contest_open(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice'})
+    submissions.by_handle['alice'] = [
+        virtual_submission('alice', 10),
+        virtual_submission('alice', 125, 'TESTING'),
+    ]
+    clock.now = VC_FINISH + 60
+
+    await tick(cog)
+
+    alert, _, standings_post = vc_channel.send.await_args_list
+    assert alert.kwargs['embed'].description == (
+        'Some submissions are still being judged'
+    )
+    assert 'alice:#' in standings_post.args[0]
+    assert await user_db.get_ongoing_rated_vc_ids() == [vc_id]
+    assert await vc_rating(user_db, MEMBER_ID) is None
+
+
+async def test_submissions_after_its_end_count_for_nothing(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    # Alice started 40 minutes late: her virtual contest on Codeforces goes on
+    # after the rated one has ended.
+    await start_vc(user_db, {MEMBER_ID: 'alice'})
+    started = VC_START + 40 * 60
+    in_time = virtual_submission('alice', 10, started=started)
+    submissions.by_handle['alice'] = [
+        in_time,
+        virtual_submission('alice', 115, started=started),
+        virtual_submission('alice', 118, 'TESTING', started=started),
+    ]
+    vc_standings.deltas['alice'] = 25
+    clock.now = VC_FINISH + 60
+
+    await tick(cog)
+
+    # Scored on a shorter contest, and not held open by the late submission
+    # still being judged.
+    [scored] = vc_standings.scored
+    assert scored['alice'].submissions == (in_time,)
+    assert await user_db.get_ongoing_rated_vc_ids() == []
+    assert await vc_rating(user_db, MEMBER_ID) == 1525
+
+
+async def test_a_member_may_start_up_to_10_minutes_before_it(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    # Alice started on Codeforces 10 minutes before the bot's command, and Bob
+    # a second earlier still; both submitted after it.
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice', OTHER_ID: 'bob'})
+    submissions.by_handle['alice'] = [
+        virtual_submission('alice', 15, started=VC_START - 10 * 60)
+    ]
+    submissions.by_handle['bob'] = [
+        virtual_submission('bob', 15, started=VC_START - 10 * 60 - 1)
+    ]
+    vc_standings.deltas.update(alice=40, bob=-30)
+    clock.now = VC_FINISH + 60
+
+    await tick(cog)
+
+    [scored] = vc_standings.scored
+    assert list(scored) == ['alice']
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+    assert await vc_rating(user_db, OTHER_ID) is None
+    assert await user_db.get_rated_vc_user_ids(vc_id) == [str(MEMBER_ID)]
+
+
+async def test_a_contest_that_ends_while_its_submissions_come_waits_a_tick(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice'})
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10)]
+    vc_standings.deltas['alice'] = 40
+    clock.now = VC_FINISH - 1
+
+    def time_passes() -> None:
+        clock.now += 5
+
+    submissions.answering = time_passes
+
+    # Its submissions came from before its end, so they don't finish it.
+    await tick(cog)
+    assert await user_db.get_ongoing_rated_vc_ids() == [vc_id]
+
+    await tick(cog)
+    assert await user_db.get_ongoing_rated_vc_ids() == []
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+
+
+async def test_a_finish_tried_again_after_a_failure_changes_each_rating_once(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice', OTHER_ID: 'bob'})
+    for handle in ('alice', 'bob'):
+        submissions.by_handle[handle] = [virtual_submission(handle, 10)]
+    vc_standings.deltas.update(alice=40, bob=-30)
+    clock.now = VC_FINISH + 60
+    # The database fails as the second rating is saved.
+    save = user_db.update_vc_rating
+    saves = itertools.count(1)
+
+    async def failing_once(vc_id: int, user_id: str, rating: int) -> None:
+        if next(saves) == 2:
+            raise sqlite3.OperationalError('disk I/O error')
+        await save(vc_id, user_id, rating)
+
+    monkeypatch.setattr(user_db, 'update_vc_rating', failing_once)
+
+    await tick(cog)
+    assert await user_db.get_ongoing_rated_vc_ids() == [vc_id]
+    await tick(cog)
+
+    assert await user_db.get_ongoing_rated_vc_ids() == []
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+    assert await vc_rating(user_db, OTHER_ID) == 1470
+
+
+async def test_a_contest_whose_channel_is_gone_finishes_an_hour_late_unposted(
+    cog: Contests,
+    bot: MagicMock,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot.get_channel.return_value = None
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice', OTHER_ID: 'bob'})
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10)]
+    vc_standings.deltas['alice'] = 40
+    caplog.set_level(logging.INFO, logger='Contests')
+
+    # It waits for its channel, without asking Codeforces anything.
+    clock.now = VC_FINISH + 59 * 60
+    await tick(cog)
+    assert submissions.requests == []
+    assert await user_db.get_ongoing_rated_vc_ids() == [vc_id]
+
+    clock.now = VC_FINISH + 61 * 60
+    await tick(cog)
+
+    # Its members' handles come from its server.
+    assert sorted(submissions.requests) == ['alice', 'bob']
+    assert await user_db.get_ongoing_rated_vc_ids() == []
+    assert await vc_rating(user_db, MEMBER_ID) == 1540
+    assert await user_db.get_rated_vc_user_ids(vc_id) == [str(MEMBER_ID)]
+    assert logged(caplog) == [
+        (logging.INFO, f'Rated virtual contest {vc_id} has no channel yet.', False),
+        (
+            logging.WARNING,
+            f'Rated virtual contest {vc_id} finished without a post: its channel '
+            'is gone.',
+            False,
+        ),
+    ]
+
+
+async def test_a_contest_unfinished_an_hour_after_its_end_is_warned_of_once(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice'})
+    submissions.errors['alice'] = cf.ClientError()
+    caplog.set_level(logging.INFO, logger='Contests')
+
+    for minutes in (30, 55, 60, 65):
+        clock.now = VC_FINISH + minutes * 60
+        await tick(cog)
+
+    error = "ClientError('Error connecting to Codeforces API')"
+    not_updated = (
+        logging.INFO,
+        f'Rated virtual contest {vc_id} not updated. {error}',
+        False,
+    )
+    assert logged(caplog) == [
+        not_updated,
+        not_updated,
+        not_updated,
+        (
+            logging.WARNING,
+            f'Rated virtual contest {vc_id} has not finished an hour after its '
+            f'end; the last error: {error}',
+            False,
+        ),
+        not_updated,
+    ]
+
+
+async def test_an_overdue_contest_that_did_not_fail_is_warned_of_without_an_error(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    vc_id = await start_vc(user_db, {MEMBER_ID: 'alice'})
+    submissions.errors['alice'] = cf.ClientError()
+    clock.now = VC_FINISH + 30 * 60
+    await tick(cog)
+    # Codeforces answers again, but a submission is still being judged.
+    del submissions.errors['alice']
+    submissions.by_handle['alice'] = [virtual_submission('alice', 10, 'TESTING')]
+    caplog.set_level(logging.WARNING, logger='Contests')
+
+    clock.now = VC_FINISH + 60 * 60
+    await tick(cog)
+
+    assert logged(caplog) == [
+        (
+            logging.WARNING,
+            f'Rated virtual contest {vc_id} has not finished an hour after its end',
+            False,
+        )
+    ]
+
+
+async def test_one_contest_s_failure_does_not_hold_the_others_back(
+    cog: Contests,
+    user_db: UserDbConn,
+    clock: Clock,
+    submissions: Submissions,
+    vc_standings: VcStandings,
+    vc_channel: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    down = await start_vc(user_db, {MEMBER_ID: 'alice'})
+    broken = await start_vc(user_db, {OTHER_ID: 'bob'})
+    await start_vc(user_db, {THIRD_ID: 'carol'})
+    submissions.errors['alice'] = cf.ClientError()
+    submissions.errors['bob'] = RuntimeError('broken')
+    submissions.by_handle['carol'] = [virtual_submission('carol', 10)]
+    clock.now = VC_START + 30 * 60
+    caplog.set_level(logging.INFO, logger='Contests')
+
+    await tick(cog)
+
+    # A Codeforces failure is no bug: the next tick tries again.
+    assert logged(caplog) == [
+        (
+            logging.INFO,
+            f'Rated virtual contest {down} not updated. '
+            "ClientError('Error connecting to Codeforces API')",
+            False,
+        ),
+        (
+            logging.WARNING,
+            f"Rated virtual contest {broken} not updated. RuntimeError('broken')",
+            True,
+        ),
+    ]
+    assert 'carol:#' in vc_channel.send.await_args.args[0]

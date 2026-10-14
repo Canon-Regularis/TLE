@@ -1,71 +1,117 @@
 {
   "contest": {
-    "id": 1,
-    "name": "Codeforces Beta Round #1",
+    "id": 2273,
+    "name": "Codeforces Round 1127 (Div. 1, Based on Mexican Olympiad in Informatics 2026)",
     "type": "CF",
     "phase": "FINISHED",
     "frozen": false,
     "durationSeconds": 7200,
-    "startTimeSeconds": 1265979600,
-    "relativeTimeSeconds": 2147483647,
-    "preparedBy": null
+    "startTimeSeconds": 1791743700,
+    "relativeTimeSeconds": 103384
   },
   "problems": [
-    {
-      "contestId": 1,
-      "index": "A",
-      "name": "Theatre Square",
-      "type": "PROGRAMMING",
-      "points": 500.0,
-      "rating": 1000,
-      "tags": ["math"],
-      "problemsetName": null
-    },
-    {
-      "contestId": 1,
-      "index": "B",
-      "name": "Spreadsheets",
-      "type": "PROGRAMMING",
-      "points": 1000.0,
-      "rating": 1600,
-      "tags": ["implementation", "math"],
-      "problemsetName": null
-    }
+    {"contestId": 2273, "index": "A", "name": "First", "type": "PROGRAMMING", "points": 500.0, "tags": ["greedy"]},
+    {"contestId": 2273, "index": "B", "name": "Second", "type": "PROGRAMMING", "points": 1000.0, "tags": ["math"]},
+    {"contestId": 2273, "index": "C", "name": "Third", "type": "PROGRAMMING", "points": 1250.0, "tags": ["constructive algorithms"]},
+    {"contestId": 2273, "index": "D", "name": "Fourth", "type": "PROGRAMMING", "points": 2000.0, "tags": ["dp"]},
+    {"contestId": 2273, "index": "E", "name": "Fifth", "type": "PROGRAMMING", "points": 2250.0, "tags": ["graphs"]},
+    {"contestId": 2273, "index": "F", "name": "Sixth", "type": "PROGRAMMING", "points": 3500.0, "tags": []}
   ],
   "rows": [
     {
-      "party": {
-        "contestId": 1,
-        "members": [
-          {
-            "handle": "tourist"
-          }
-        ],
-        "participantType": "CONTESTANT",
-        "teamId": null,
-        "teamName": null,
-        "ghost": false,
-        "room": null,
-        "startTimeSeconds": 1265979600
-      },
+      "party": {"contestId": 2273, "participantId": 186000101, "members": [{"handle": "Alice"}], "participantType": "CONTESTANT", "ghost": false, "room": 7, "startTimeSeconds": 1791743700},
       "rank": 1,
-      "points": 1500.0,
-      "penalty": 120,
+      "points": 4405.0,
+      "penalty": 0,
+      "successfulHackCount": 1,
+      "unsuccessfulHackCount": 0,
       "problemResults": [
-        {
-          "points": 500.0,
-          "penalty": null,
-          "rejectedAttemptCount": 0,
-          "type": "FINAL",
-          "bestSubmissionTimeSeconds": 300
-        },
-        {
-          "points": 1000.0,
-          "penalty": null,
-          "rejectedAttemptCount": 1,
-          "type": "FINAL",
-          "bestSubmissionTimeSeconds": 1200
-        }
+        {"points": 492.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 240},
+        {"points": 956.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 660},
+        {"points": 1155.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 1140},
+        {"points": 1702.0, "rejectedAttemptCount": 1, "type": "FINAL", "bestSubmissionTimeSeconds": 1860},
+        {"points": 0.0, "rejectedAttemptCount": 2, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
+      ]
+    },
+    {
+      "party": {"contestId": 2273, "participantId": 186000102, "members": [{"handle": "Bob"}], "participantType": "CONTESTANT", "ghost": false, "room": 3, "startTimeSeconds": 1791743700},
+      "rank": 2,
+      "points": 2380.0,
+      "penalty": 0,
+      "successfulHackCount": 0,
+      "unsuccessfulHackCount": 1,
+      "problemResults": [
+        {"points": 490.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 300},
+        {"points": 890.0, "rejectedAttemptCount": 1, "type": "FINAL", "bestSubmissionTimeSeconds": 900},
+        {"points": 1050.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 2400},
+        {"points": 0.0, "rejectedAttemptCount": 1, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
+      ]
+    },
+    {
+      "party": {"contestId": 2273, "participantId": 186000103, "members": [{"handle": "Carol"}], "participantType": "CONTESTANT", "ghost": false, "room": 12, "startTimeSeconds": 1791743700},
+      "rank": 3,
+      "points": 1380.0,
+      "penalty": 0,
+      "successfulHackCount": 0,
+      "unsuccessfulHackCount": 0,
+      "problemResults": [
+        {"points": 480.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 600},
+        {"points": 900.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 1500},
+        {"points": 0.0, "rejectedAttemptCount": 1, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
+      ]
+    },
+    {
+      "party": {"contestId": 2273, "participantId": 186000104, "members": [{"handle": "Dave"}], "participantType": "CONTESTANT", "ghost": false, "room": 5, "startTimeSeconds": 1791743700},
+      "rank": 3,
+      "points": 1380.0,
+      "penalty": 0,
+      "successfulHackCount": 0,
+      "unsuccessfulHackCount": 0,
+      "problemResults": [
+        {"points": 480.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 600},
+        {"points": 900.0, "rejectedAttemptCount": 0, "type": "FINAL", "bestSubmissionTimeSeconds": 1500},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
+      ]
+    },
+    {
+      "party": {"contestId": 2273, "participantId": 186000105, "members": [{"handle": "Erin"}], "participantType": "CONTESTANT", "ghost": false, "room": 9, "startTimeSeconds": 1791743700},
+      "rank": 5,
+      "points": 0.0,
+      "penalty": 0,
+      "successfulHackCount": 0,
+      "unsuccessfulHackCount": 0,
+      "problemResults": [
+        {"points": 0.0, "rejectedAttemptCount": 2, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
+      ]
+    },
+    {
+      "party": {"contestId": 2273, "participantId": 186000106, "members": [{"handle": "Frank"}], "participantType": "CONTESTANT", "ghost": false, "room": 1, "startTimeSeconds": 1791743700},
+      "rank": 5,
+      "points": 0.0,
+      "penalty": 0,
+      "successfulHackCount": 0,
+      "unsuccessfulHackCount": 0,
+      "problemResults": [
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"},
+        {"points": 0.0, "rejectedAttemptCount": 0, "type": "FINAL"}
       ]
     }
   ]

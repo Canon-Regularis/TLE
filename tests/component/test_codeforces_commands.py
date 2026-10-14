@@ -87,6 +87,16 @@ UPCOMING = Contest(
     preparedBy=None,
 )
 UNKNOWN_CONTEST_ID = 3  # not in the bot's contest list
+# A finished contest in a format that the bot can't score.
+IOI_CONTEST = Contest(
+    id=4,
+    name='Olympiad Mirror (IOI format)',
+    startTimeSeconds=1_000_000,
+    durationSeconds=5 * 60 * 60,
+    type='IOI',
+    phase='FINISHED',
+    preparedBy=None,
+)
 # The commands of TLE's cogs that have a cooldown and take arguments.
 COOLED_DOWN = [
     'upsolve',
@@ -491,9 +501,9 @@ def standings() -> Ranklist:
 @pytest.fixture
 def contests(bot: TLEBot) -> None:
     """The bot's Codeforces contest list: CONTEST, whose standings the cache
-    keeps, and UPCOMING.
+    keeps, UPCOMING and IOI_CONTEST.
     """
-    known = {contest.id: contest for contest in (CONTEST, UPCOMING)}
+    known = {contest.id: contest for contest in (CONTEST, UPCOMING, IOI_CONTEST)}
 
     def get_contest(contest_id: int) -> Contest:
         if contest_id not in known:
@@ -637,6 +647,10 @@ async def test_ratedvc_refused_before_it_asks_codeforces_costs_no_wait(
     await use_prefix(
         bot, member, BOT_CHANNEL_ID, f';ratedvc {UNKNOWN_CONTEST_ID} <@{OTHER_ID}>'
     )
+    # The bot couldn't score it.
+    await use_prefix(
+        bot, member, BOT_CHANNEL_ID, f';ratedvc {IOI_CONTEST.id} <@{OTHER_ID}>'
+    )
     rating_changes.assert_not_awaited()
     # This one asks Codeforces, so it counts.
     await use_prefix(bot, member, BOT_CHANNEL_ID, ratedvc)
@@ -648,6 +662,8 @@ async def test_ratedvc_refused_before_it_asks_codeforces_costs_no_wait(
         f'Use this command in <#{GENERAL_ID}>, the rated virtual contest channel.',
         'Name the members who take part, yourself included if you do.',
         f'Contest with ID `{UNKNOWN_CONTEST_ID}` not found',
+        f"`{IOI_CONTEST.name}` can't be a rated virtual contest: the bot scores "
+        'only contests in Codeforces or ICPC format.',
         f"`{CONTEST.name}` can't be a rated virtual contest: fewer than 50 "
         "contestants were rated in it, or its rating changes aren't out yet.",
     ]
