@@ -13,6 +13,7 @@ discord.py does before it runs one.
 
 import asyncio
 import contextlib
+import warnings
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -27,13 +28,20 @@ from tle.access.context import TLEContext
 from tle.access.help import describe_cooldown, split_help
 from tle.access.rules import Decision, Effective, Outcome, Where, Who
 from tle.access.service import cache_decision
+from tle.cogs import graphs
 from tle.cogs.graphs import (
+    EXTREMES_LEFT_OUT_NOTE,
+    EXTREMES_LEFT_OUT_ONE_NOTE,
     NO_COUNTRIES_MESSAGE,
+    NO_EXTREMES_MESSAGE,
+    NO_RATED_EXTREMES_MESSAGE,
     NO_RATED_MEMBERS_MESSAGE,
     PLOT_COOLDOWN_SECONDS,
     GraphCogError,
     Graphs,
 )
+from tle.util import codeforces_api as cf
+from tle.util.cache import ContestNotFound, ProblemsetNotCached
 from tle.util.db.user_db_conn import UserDbConn
 
 # Real snowflakes are 64-bit, so use big ones.
@@ -565,6 +573,335 @@ async def test_the_plot_by_country_counts_the_members_of_each_country(
 
     embed, _ = plot_sent(posted)
     assert embed.title == 'Distribution of server members by country'
+
+
+# The plot of extremes, from the problems the bot has
+
+# The rated contests of the handle plotted: the bot has the problems of
+# CACHED, knows the contest UNCACHED without its problems, and has no contest
+# UNKNOWN in its contest list.
+CACHED, OTHER_CACHED, UNCACHED, UNKNOWN = 2201, 2202, 2203, 2204
+EXTREME_HANDLE = 'tourist'
+
+
+def extreme_contest(contest_id: int) -> cf.Contest:
+    return cf.Contest(
+        id=contest_id,
+        name=f'Codeforces Round {contest_id}',
+        startTimeSeconds=1_700_000_000 + (contest_id - CACHED) * 7 * 24 * 60 * 60,
+        durationSeconds=2 * 60 * 60,
+        type='CF',
+        phase='FINISHED',
+        preparedBy=None,
+    )
+
+
+def extreme_problem(contest_id: int, index: str, rating: int) -> cf.Problem:
+    return cf.Problem(
+        contestId=contest_id,
+        problemsetName=None,
+        index=index,
+        name=f'Problem {contest_id}{index}',
+        type='PROGRAMMING',
+        points=None,
+        rating=rating,
+        tags=[],
+    )
+
+
+# The problems the bot has: A, B and C of each contest it has.
+EXTREME_PROBLEMS = {
+    contest_id: [
+        extreme_problem(contest_id, index, rating)
+        for index, rating in (('A', 800), ('B', 1400), ('C', 2000))
+    ]
+    for contest_id in (CACHED, OTHER_CACHED)
+}
+
+
+def unrated(contest_id: int) -> list[cf.Problem]:
+    """The problems of ``contest_id`` that the bot has, as they are until
+    Codeforces rates them, days after the contest.
+    """
+    return [problem._replace(rating=None) for problem in EXTREME_PROBLEMS[contest_id]]
+
+
+def contest_submission(problem: cf.Problem, verdict: str) -> cf.Submission:
+    """``EXTREME_HANDLE``'s submission to ``problem`` during its contest."""
+    assert problem.contestId is not None
+    return cf.Submission(
+        id=problem.contestId * 1000 + ord(problem.index),
+        contestId=problem.contestId,
+        problem=problem,
+        author=cf.Party(
+            contestId=problem.contestId,
+            members=[cf.Member(EXTREME_HANDLE)],
+            participantType='CONTESTANT',
+            teamId=None,
+            teamName=None,
+            ghost=False,
+            room=None,
+            startTimeSeconds=None,
+        ),
+        programmingLanguage='C++',
+        verdict=verdict,
+        creationTimeSeconds=0,
+        relativeTimeSeconds=0,
+    )
+
+
+def rated_in(contest_id: int, new_rating: int) -> cf.RatingChange:
+    return cf.RatingChange(
+        contestId=contest_id,
+        contestName=f'Codeforces Round {contest_id}',
+        handle=EXTREME_HANDLE,
+        rank=100,
+        ratingUpdateTimeSeconds=1_700_000_000 + contest_id,
+        oldRating=new_rating - 10,
+        newRating=new_rating,
+    )
+
+
+class ExtremesCodeforces:
+    """What the plot of extremes reads: the handle's rating changes and
+    submissions from Codeforces, and the bot's contests and problems.
+    """
+
+    def __init__(
+        self,
+        bot: GraphsBot,
+        monkeypatch: pytest.MonkeyPatch,
+        events: list[str],
+        contest_ids: list[int],
+        submissions: list[cf.Submission],
+    ) -> None:
+        changes = [
+            rated_in(contest_id, 1500 + n) for n, contest_id in enumerate(contest_ids)
+        ]
+        self.rating = AsyncMock(return_value=changes)
+        self.status = AsyncMock(
+            side_effect=recorded(events, 'read submissions', self._status)
+        )
+        self.submissions = submissions
+        monkeypatch.setattr(cf.user, 'rating', self.rating)
+        monkeypatch.setattr(cf.user, 'status', self.status)
+
+        def get_contest(contest_id: int) -> cf.Contest:
+            if contest_id == UNKNOWN:
+                raise ContestNotFound(contest_id)
+            return extreme_contest(contest_id)
+
+        async def get_problemset(contest_id: int) -> list[cf.Problem]:
+            if contest_id not in EXTREME_PROBLEMS:
+                raise ProblemsetNotCached(contest_id)
+            return EXTREME_PROBLEMS[contest_id]
+
+        bot.cf_cache.contest_cache.get_contest.side_effect = get_contest
+        bot.cf_cache.problemset_cache.get_problemset = AsyncMock(
+            side_effect=get_problemset
+        )
+        # What each plot was drawn from: (contest ID, submissions) by contest.
+        self.plotted: list[list[tuple[int, list[cf.Submission]]]] = []
+        plot = graphs._plot_extreme
+
+        def drawn(
+            handle: str,
+            rating: int,
+            packed: list[tuple[cf.Contest, list[cf.Problem], list[cf.Submission]]],
+            *args: Any,
+        ) -> None:
+            self.plotted.append([(contest.id, subs) for contest, _, subs in packed])
+            plot(handle, rating, packed, *args)
+
+        monkeypatch.setattr(graphs, '_plot_extreme', drawn)
+
+    async def _status(self, *, handle: str) -> list[cf.Submission]:
+        assert handle == EXTREME_HANDLE
+        return self.submissions
+
+
+SOLVED_A_AND_B = [
+    contest_submission(EXTREME_PROBLEMS[CACHED][0], 'OK'),
+    contest_submission(EXTREME_PROBLEMS[CACHED][1], 'OK'),
+    contest_submission(EXTREME_PROBLEMS[CACHED][2], 'WRONG_ANSWER'),
+]
+
+
+@pytest.mark.parametrize(
+    ('contest_ids', 'note'),
+    [
+        ([CACHED, UNCACHED, UNKNOWN], EXTREMES_LEFT_OUT_NOTE.format(count=2)),
+        ([CACHED, UNCACHED], EXTREMES_LEFT_OUT_ONE_NOTE),
+        ([UNKNOWN, CACHED], EXTREMES_LEFT_OUT_ONE_NOTE),
+        ([CACHED], None),
+    ],
+    ids=['two left out', 'one without problems', 'one unknown', 'none left out'],
+)
+async def test_the_extremes_plot_leaves_out_contests_whose_problems_it_lacks(
+    bot: GraphsBot,
+    cog: Graphs,
+    guild: MagicMock,
+    events: list[str],
+    posted: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    contest_ids: list[int],
+    note: str | None,
+) -> None:
+    # A submission to a contest left out, which the plot doesn't read.
+    elsewhere = contest_submission(extreme_problem(UNCACHED, 'A', 800), 'OK')
+    codeforces = ExtremesCodeforces(
+        bot, monkeypatch, events, contest_ids, [*SOLVED_A_AND_B, elsewhere]
+    )
+    ctx = make_context(bot, guild, 'plot extreme', events, slash=False)
+
+    await Graphs.extreme.callback(cog, ctx, EXTREME_HANDLE)
+
+    assert codeforces.plotted == [[(CACHED, SOLVED_A_AND_B)]]
+    embed, _ = plot_sent(posted)
+    assert embed.title == 'Codeforces extremes graph'
+    assert embed.description == note
+
+
+async def test_the_extremes_plot_says_so_when_the_bot_has_no_problems_to_plot(
+    bot: GraphsBot,
+    cog: Graphs,
+    guild: MagicMock,
+    events: list[str],
+    posted: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codeforces = ExtremesCodeforces(
+        bot, monkeypatch, events, [UNCACHED, UNKNOWN], SOLVED_A_AND_B
+    )
+    ctx = make_context(bot, guild, 'plot extreme', events, slash=False)
+
+    with pytest.raises(GraphCogError) as raised:
+        await Graphs.extreme.callback(cog, ctx, EXTREME_HANDLE)
+
+    assert str(raised.value) == (
+        "The bot doesn't have the problems of `tourist`'s contests yet, so there "
+        'is nothing to plot.'
+    )
+    assert str(raised.value) == NO_EXTREMES_MESSAGE.format(handle=EXTREME_HANDLE)
+    # Refused before the submissions are asked for.
+    codeforces.status.assert_not_awaited()
+    assert codeforces.plotted == []
+    posted.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    'contest_ids',
+    [[CACHED], [CACHED, OTHER_CACHED]],
+    ids=['one contest', 'two contests'],
+)
+async def test_the_extremes_plot_says_so_when_codeforces_has_not_rated_the_problems(
+    bot: GraphsBot,
+    cog: Graphs,
+    guild: MagicMock,
+    events: list[str],
+    posted: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    contest_ids: list[int],
+) -> None:
+    # The bot has the problems of every contest of the handle, but they ended
+    # too recently to be rated: in the bot's problems and in the submissions.
+    # Such as a newcomer's first contest, for days after it.
+    for contest_id in contest_ids:
+        monkeypatch.setitem(EXTREME_PROBLEMS, contest_id, unrated(contest_id))
+    submissions = [
+        contest_submission(problem, 'OK')
+        for contest_id in contest_ids
+        for problem in EXTREME_PROBLEMS[contest_id][:2]
+    ]
+    codeforces = ExtremesCodeforces(bot, monkeypatch, events, contest_ids, submissions)
+    ctx = make_context(bot, guild, 'plot extreme', events, slash=False)
+
+    with pytest.raises(GraphCogError) as raised:
+        await Graphs.extreme.callback(cog, ctx, EXTREME_HANDLE)
+
+    assert str(raised.value) == (
+        "Codeforces hasn't rated the problems of `tourist`'s contests yet, so "
+        'there is nothing to plot.'
+    )
+    assert str(raised.value) == NO_RATED_EXTREMES_MESSAGE.format(handle=EXTREME_HANDLE)
+    # Refused before the submissions are asked for, rather than posting a
+    # plot without a point.
+    codeforces.status.assert_not_awaited()
+    assert codeforces.plotted == []
+    posted.assert_not_awaited()
+
+
+async def test_the_extremes_plot_is_sent_when_any_contest_has_rated_problems(
+    bot: GraphsBot,
+    cog: Graphs,
+    guild: MagicMock,
+    events: list[str],
+    posted: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # OTHER_CACHED's problems aren't rated yet, so it gives no point, but
+    # CACHED's are. The note counts only UNCACHED, whose problems the bot
+    # doesn't have.
+    monkeypatch.setitem(EXTREME_PROBLEMS, OTHER_CACHED, unrated(OTHER_CACHED))
+    recent = [contest_submission(EXTREME_PROBLEMS[OTHER_CACHED][0], 'OK')]
+    codeforces = ExtremesCodeforces(
+        bot,
+        monkeypatch,
+        events,
+        [CACHED, OTHER_CACHED, UNCACHED],
+        [*SOLVED_A_AND_B, *recent],
+    )
+    ctx = make_context(bot, guild, 'plot extreme', events, slash=False)
+
+    await Graphs.extreme.callback(cog, ctx, EXTREME_HANDLE)
+
+    assert codeforces.plotted == [[(CACHED, SOLVED_A_AND_B), (OTHER_CACHED, recent)]]
+    embed, _ = plot_sent(posted)
+    assert embed.title == 'Codeforces extremes graph'
+    assert embed.description == EXTREMES_LEFT_OUT_ONE_NOTE
+
+
+def test_the_notes_about_contests_left_out_count_them() -> None:
+    assert EXTREMES_LEFT_OUT_NOTE.format(count=3) == (
+        "Leaves out 3 contests whose problems the bot doesn't have yet."
+    )
+    assert EXTREMES_LEFT_OUT_ONE_NOTE == (
+        "Leaves out 1 contest whose problems the bot doesn't have yet."
+    )
+
+
+@pytest.mark.parametrize('legend', [True, False])
+async def test_the_extremes_plot_of_contests_all_solved_or_none_solved(
+    bot: GraphsBot,
+    cog: Graphs,
+    guild: MagicMock,
+    events: list[str],
+    posted: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    legend: bool,
+) -> None:
+    # Every problem of one contest, and none of the other: no contest has
+    # both a hardest solved and an easiest unsolved problem.
+    submissions = [
+        contest_submission(each, 'OK') for each in EXTREME_PROBLEMS[CACHED]
+    ] + [contest_submission(EXTREME_PROBLEMS[OTHER_CACHED][0], 'WRONG_ANSWER')]
+    codeforces = ExtremesCodeforces(
+        bot, monkeypatch, events, [CACHED, OTHER_CACHED], submissions
+    )
+    ctx = make_context(bot, guild, 'plot extreme', events, slash=False)
+    args = [EXTREME_HANDLE] if legend else [EXTREME_HANDLE, '+nolegend']
+
+    # Plotted, without matplotlib's warning about a legend with no labels.
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error', 'No artists with labels')
+        await Graphs.extreme.callback(cog, ctx, *args)
+
+    assert [contest_id for contest_id, _ in codeforces.plotted[0]] == [
+        CACHED,
+        OTHER_CACHED,
+    ]
+    embed, _ = plot_sent(posted)
+    assert embed.description is None
 
 
 # The help of the plot group

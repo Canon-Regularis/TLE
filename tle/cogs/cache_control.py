@@ -13,6 +13,32 @@ UNKNOWN_CONTEST_TEXT = (
     "No contest in the bot's Codeforces contest list has that ID. If the "
     'contest is new, reload the list with `;cache contests` first.'
 )
+# What ;cache problemsets all says when it is done: how many problems were new
+# or had changed, and so were saved.
+PROBLEMSETS_SAVED_TEXT = 'Done, saved {count} new or changed problems'
+PROBLEMSETS_SAVED_ONE_TEXT = 'Done, saved 1 new or changed problem'
+# What ;cache problemsets all adds when Codeforces didn't give the problems
+# of some contests, naming at most FAILED_CONTESTS_SHOWN of them.
+PROBLEMSETS_FAILED_TEXT = (
+    "Codeforces didn't give the problems of {count} contests, so the bot still "
+    'lacks them: {ids}.'
+)
+PROBLEMSETS_FAILED_ONE_TEXT = (
+    "Codeforces didn't give the problems of contest {id}, so the bot still lacks them."
+)
+FAILED_CONTESTS_SHOWN = 20
+
+
+def problemsets_failed_text(contest_ids: list[int]) -> str:
+    """What ;cache problemsets all says of the contests in ``contest_ids``,
+    whose problems Codeforces didn't give.
+    """
+    if len(contest_ids) == 1:
+        return PROBLEMSETS_FAILED_ONE_TEXT.format(id=contest_ids[0])
+    ids = ', '.join(map(str, contest_ids[:FAILED_CONTESTS_SHOWN]))
+    if len(contest_ids) > FAILED_CONTESTS_SHOWN:
+        ids += f' and {len(contest_ids) - FAILED_CONTESTS_SHOWN} more'
+    return PROBLEMSETS_FAILED_TEXT.format(count=len(contest_ids), ids=ids)
 
 
 def timed_command(
@@ -110,12 +136,15 @@ class CacheControl(commands.Cog):
         await ctx.send(f'Done, fetched {count} changes and recached handle ratings')
 
     @cache.command(brief='Fetch the problems of Codeforces contests')
-    @app_commands.describe(contest_id='A contest ID, or all for every finished contest')
+    @app_commands.describe(
+        contest_id='A contest ID, or all for every finished contest that the bot lacks'
+    )
     @timed_command
     async def problemsets(self, ctx: commands.Context, contest_id: str) -> None:
-        """Fetch the problems of one Codeforces contest again, or of every
-        finished contest with `all`. The bot itself fetches those of contests
-        that ended in the last 14 days, every hour.
+        """Fetch the problems of one Codeforces contest again, or with `all`
+        those of every finished contest that the bot lacks. Every hour the bot
+        updates them from Codeforces' problem list itself, and fetches the
+        standings of new contests that the list leaves incomplete.
 
         Examples:
             ;cache problemsets 1950
@@ -123,13 +152,20 @@ class CacheControl(commands.Cog):
         """
         if contest_id == 'all':
             await ctx.send('This will take a while')
-            count = await self.bot.cf_cache.problemset_cache.update_for_all()
+            update = await self.bot.cf_cache.problemset_cache.update_for_all()
+            await ctx.send(
+                PROBLEMSETS_SAVED_ONE_TEXT
+                if update.problems == 1
+                else PROBLEMSETS_SAVED_TEXT.format(count=update.problems)
+            )
+            if update.failed:
+                await ctx.send(problemsets_failed_text(update.failed))
         else:
             contest_id_int = self._contest_id(contest_id, NOT_A_PROBLEMSETS_MODE)
             count = await self.bot.cf_cache.problemset_cache.update_for_contest(
                 contest_id_int
             )
-        await ctx.send(f'Done, fetched {count} problems')
+            await ctx.send(f'Done, fetched {count} problems')
 
 
 async def setup(bot: commands.Bot) -> None:
