@@ -8,6 +8,7 @@ the slash command's interaction, privately, or else by direct message. It
 never posts in a channel.
 """
 
+import asyncio
 import html
 import logging
 import secrets
@@ -154,6 +155,15 @@ def decode_id_token(
     )
 
 
+def _describe(error: BaseException) -> str:
+    """``error`` for the log: 'Type: message', or the type alone, as a timeout
+    has no message. Not its repr, which for an aiohttp error holds the headers
+    of the request and of the answer.
+    """
+    detail = str(error)
+    return f'{type(error).__name__}: {detail}' if detail else type(error).__name__
+
+
 _SUCCESS_HTML = """\
 <!DOCTYPE html>
 <html><head><title>Success</title></head>
@@ -285,19 +295,27 @@ class OAuthServer:
             return web.Response(
                 text=_ERROR_HTML.format(message=page), content_type='text/html'
             )
+        except (
+            cf.CodeforcesApiError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ) as error:
+            # Codeforces failing, at its token endpoint or through the client,
+            # is no bug, and trying again may work, so the member is told to.
+            # The client warns when its own calls fail for long; the token
+            # endpoint is outside it, so its failures are only logged here, as
+            # is a dropped connection to Discord. A timeout at the token
+            # endpoint is an asyncio.TimeoutError, which is no
+            # aiohttp.ClientError.
+            logger.info(
+                'Could not link the Codeforces account of user %d: %s',
+                pending.user_id,
+                _describe(error),
+            )
+            return await self._link_failed(pending)
         except Exception:
             logger.exception('OAuth callback error')
-            failed = discord.Embed(
-                description=LINK_FAILED_TEXT, color=discord.Color.red()
-            )
-            await self._tell(pending, failed)
-            return web.Response(
-                text=_ERROR_HTML.format(
-                    message='An error occurred.'
-                    ' Please try the command again in Discord.'
-                ),
-                content_type='text/html',
-            )
+            return await self._link_failed(pending)
 
         # Outside the try above: the account is linked, whatever happens to
         # the message that says so.
@@ -305,6 +323,19 @@ class OAuthServer:
 
         await self._tell(pending, _make_profile_embed(member, user, mode='set'))
         return web.Response(text=_SUCCESS_HTML, content_type='text/html')
+
+    async def _link_failed(self, pending: OAuthPending) -> web.Response:
+        """Tell the member who signed in that linking failed, and to try
+        again; the page that says so.
+        """
+        failed = discord.Embed(description=LINK_FAILED_TEXT, color=discord.Color.red())
+        await self._tell(pending, failed)
+        return web.Response(
+            text=_ERROR_HTML.format(
+                message='An error occurred. Please try the command again in Discord.'
+            ),
+            content_type='text/html',
+        )
 
     async def _tell(self, pending: OAuthPending, embed: discord.Embed) -> None:
         """Tell the member who signed in how it went, in ``embed``.

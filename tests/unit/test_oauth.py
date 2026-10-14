@@ -1,17 +1,23 @@
 """Tests for tle.util.oauth module."""
 
+import asyncio
 import dataclasses
 import time
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
+import aiohttp
 import discord
 import jwt
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
+from tle.util import codeforces_api as cf
 from tle.util.oauth import (
     OAuthPending,
     OAuthStateStore,
+    _describe,
     build_auth_url,
     decode_id_token,
     exchange_code,
@@ -208,3 +214,35 @@ class TestExchangeCode:
 
         with pytest.raises(ValueError, match='Token exchange failed'):
             await exchange_code('bad', 'cid', 'csecret', 'https://cb', session)
+
+
+class TestDescribe:
+    """How the callback logs Codeforces failing: the error's type and text."""
+
+    def test_an_error_is_its_type_and_text(self):
+        assert _describe(cf.ClientError()) == (
+            'ClientError: Error connecting to Codeforces API'
+        )
+
+    def test_a_timeout_without_text_is_its_type(self):
+        assert _describe(asyncio.TimeoutError()) == 'TimeoutError'
+
+    def test_an_aiohttp_error_leaves_out_the_headers(self):
+        # Its repr holds the headers of the request and of the answer, and
+        # their cookies with them.
+        url = URL('https://codeforces.com/oauth/token')
+        cookie = CIMultiDictProxy(CIMultiDict(Cookie='JSESSIONID=1'))
+        request = aiohttp.RequestInfo(url, 'POST', cookie, url)
+        set_cookie = CIMultiDictProxy(CIMultiDict({'Set-Cookie': '__cf_bm=2'}))
+        error = aiohttp.ContentTypeError(
+            request,
+            (),
+            status=502,
+            message='Attempt to decode JSON with unexpected mimetype: text/html',
+            headers=set_cookie,
+        )
+
+        assert _describe(error) == (
+            "ContentTypeError: 502, message='Attempt to decode JSON with unexpected"
+            " mimetype: text/html', url='https://codeforces.com/oauth/token'"
+        )

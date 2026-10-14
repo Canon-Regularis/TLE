@@ -1,13 +1,20 @@
 """Tests for tle.util.tasks.
 
-Waiter, ExceptionHandler, Task, TaskSpec, decorators.
+Waiter, ExceptionHandler, Task, TaskSpec, decorators, and what a task logs
+when it fails.
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from discord.ext import commands
 
+# Imported before tle.util.tasks, which can't be imported first: its import of
+# codeforces_common loads the caches, which import tasks back.
+import tle.util.codeforces_common  # noqa: F401
+from tle.util import codeforces_api as cf
 from tle.util.events import ContestListRefresh
 from tle.util.tasks import (
     ExceptionHandler,
@@ -267,6 +274,143 @@ class TestTask:
             await t.stop()
         await asyncio.sleep(0.01)
         assert t.running is False
+
+
+# --- Errors in a task ---
+
+
+def logged(caplog):
+    """Each captured record's level and message."""
+    return [(record.levelno, record.getMessage()) for record in caplog.records]
+
+
+def failing_task(error, handled):
+    """A task named as the contest list's, whose runs raise `error`; its
+    exception handler collects what it is given in `handled`.
+    """
+
+    async def func(arg):
+        raise error
+
+    async def handle(ex):
+        handled.append(ex)
+
+    return Task('ContestCacheUpdate', func, None, ExceptionHandler(handle))
+
+
+class TestTaskErrors:
+    @pytest.mark.parametrize(
+        'make_error',
+        [
+            # Any Codeforces error, whatever the client made of the answer.
+            pytest.param(cf.CodeforcesApiError, id='any'),
+            # No useful answer, after the client's tries: Codeforces down, an
+            # error page or a timeout.
+            pytest.param(cf.ClientError, id='no-answer'),
+            pytest.param(
+                lambda: cf.CallLimitExceededError('Call limit exceeded'),
+                id='call-limit',
+            ),
+            # A refusal; the client warns about it itself if it doesn't
+            # expect it.
+            pytest.param(
+                lambda: cf.TrueApiError(
+                    'contestId: Non-gym contest standings for non-admin users are'
+                    ' available only via anonymous GET requests with no extra'
+                    ' parameters'
+                ),
+                id='refused',
+            ),
+        ],
+    )
+    async def test_a_codeforces_error_is_information_without_a_traceback(
+        self, make_error, caplog
+    ):
+        error = make_error()
+        handled = []
+        t = failing_task(error, handled)
+
+        with caplog.at_level(logging.INFO, logger='Task'):
+            await t.manual_trigger()
+
+        assert logged(caplog) == [
+            (logging.INFO, 'Manually triggering task `ContestCacheUpdate`.'),
+            (
+                logging.INFO,
+                'Task `ContestCacheUpdate` stopped on a Codeforces error,'
+                f' ignoring: {error!r}',
+            ),
+        ]
+        assert all(record.exc_info is None for record in caplog.records)
+        # Still reported: the contest list, for one, then retries sooner.
+        assert handled == [error]
+
+    @pytest.mark.parametrize(
+        'make_error',
+        [
+            pytest.param(lambda: ValueError('boom'), id='bug'),
+            pytest.param(lambda: KeyError('result'), id='missing-key'),
+            # A command error, but not a Codeforces one.
+            pytest.param(
+                lambda: commands.CommandError('No channel for rated virtual contests'),
+                id='other-command-error',
+            ),
+        ],
+    )
+    async def test_any_other_error_is_a_warning_with_its_traceback(
+        self, make_error, caplog
+    ):
+        error = make_error()
+        handled = []
+        t = failing_task(error, handled)
+
+        with caplog.at_level(logging.INFO, logger='Task'):
+            await t.manual_trigger()
+
+        assert logged(caplog) == [
+            (logging.INFO, 'Manually triggering task `ContestCacheUpdate`.'),
+            (logging.WARNING, 'Exception in task `ContestCacheUpdate`, ignoring.'),
+        ]
+        assert caplog.records[-1].exc_info[1] is error
+        assert handled == [error]
+
+    async def test_the_task_runs_again_after_a_codeforces_error(self, caplog):
+        error = cf.ClientError()
+        # The waiter hands each run its argument when the test says so, so
+        # nothing waits on the clock.
+        turns = asyncio.Queue()
+        runs = asyncio.Queue()
+
+        async def func(arg):
+            await runs.put(arg)
+            if arg == 'down':
+                raise error
+
+        async def wait():
+            return await turns.get()
+
+        t = Task('ContestCacheUpdate', func, Waiter(wait, run_first=True))
+        with caplog.at_level(logging.INFO, logger='Task'):
+            t.start()
+            try:
+                for arg in ('down', 'up'):
+                    await turns.put(arg)
+                    # Bounded, so that a task that died fails the test instead
+                    # of hanging it.
+                    assert await asyncio.wait_for(runs.get(), 5) == arg
+                assert t.running is True
+            finally:
+                await t.stop()
+
+        assert logged(caplog) == [
+            (logging.INFO, 'Starting up task `ContestCacheUpdate`.'),
+            (
+                logging.INFO,
+                'Task `ContestCacheUpdate` stopped on a Codeforces error,'
+                f' ignoring: {error!r}',
+            ),
+            (logging.INFO, 'Stopping task `ContestCacheUpdate`.'),
+        ]
 
 
 # --- TaskSpec ---

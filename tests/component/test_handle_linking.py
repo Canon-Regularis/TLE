@@ -5,6 +5,7 @@ fixture). Discord's guilds, members and roles are mocks, and Codeforces is
 patched, so no test reaches it.
 """
 
+import asyncio
 import datetime as dt
 import html
 import logging
@@ -12,9 +13,11 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
-from aiohttp.test_utils import make_mocked_request
+from aiohttp import web
+from aiohttp.test_utils import TestServer, make_mocked_request
 from discord.ext import commands
 
 from tle import constants
@@ -32,6 +35,8 @@ LOGGER_NAME = 'test.handle_linking'
 # Members rated 1900+ before this time (o1's release) become Trusted.
 TRUSTED_CUTOFF = dt.datetime(2024, 9, 11, tzinfo=dt.timezone.utc)
 TRUSTED_REASON = 'Historical rating >= 1900 before Aug 2024'
+# The real request to Codeforces' token endpoint, which most tests replace.
+EXCHANGE_CODE = oauth.exchange_code
 
 
 def codeforces_user(rating: int | None = EXPERT) -> cf.User:
@@ -105,6 +110,11 @@ def logged(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
         for record in caplog.records
         if record.name == LOGGER_NAME
     ]
+
+
+def warned(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The captured records at WARNING or above, which reach the log channel."""
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
 @pytest.fixture(autouse=True)
@@ -460,24 +470,40 @@ class TestMaybeAddTrustedRole:
         rating_history.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        ('error', 'level', 'message'),
+        ('error', 'message'),
         [
             (
                 cf.HandleNotFoundError('handles: User not found', HANDLE),
-                logging.INFO,
                 f'INFO: Rating history not found for handle {HANDLE}'
                 ' during trusted check.',
             ),
+            # Codeforces down, after the client's tries. The client warns
+            # itself once an outage lasts.
             (
                 cf.ClientError(),
-                logging.WARNING,
-                f'WARN: API Error fetching rating for {HANDLE} during trusted'
-                ' check: Error connecting to Codeforces API',
+                f'INFO: Rating history of {HANDLE} not fetched during trusted'
+                " check: ClientError('Error connecting to Codeforces API')",
+            ),
+            # The call limit, after the client's tries.
+            (
+                cf.CallLimitExceededError('Call limit exceeded'),
+                f'INFO: Rating history of {HANDLE} not fetched during trusted'
+                " check: CallLimitExceededError('Codeforces API call limit"
+                " exceeded')",
+            ),
+            # A refusal the client doesn't expect, which it warns about itself.
+            (
+                cf.TrueApiError(
+                    'handle: Rating history is available only via anonymous GET'
+                    ' requests'
+                ),
+                f'INFO: Rating history of {HANDLE} not fetched during trusted'
+                " check: TrueApiError('Codeforces API error')",
             ),
         ],
-        ids=['unknown-handle', 'codeforces-down'],
+        ids=['unknown-handle', 'codeforces-down', 'call-limit', 'refused'],
     )
-    async def test_codeforces_errors_are_logged_not_raised(
+    async def test_codeforces_errors_are_information_not_raised(
         self,
         user_db: UserDbConn,
         linked_member: MagicMock,
@@ -485,7 +511,6 @@ class TestMaybeAddTrustedRole:
         log: logging.Logger,
         caplog: pytest.LogCaptureFixture,
         error: cf.CodeforcesApiError,
-        level: int,
         message: str,
     ) -> None:
         rating_history.side_effect = error
@@ -495,7 +520,23 @@ class TestMaybeAddTrustedRole:
                 linked_member, user_db=user_db, log=log
             )
 
-        assert logged(caplog) == [(level, message)]
+        # Only WARNING and above reach the log channel.
+        assert logged(caplog) == [(logging.INFO, message)]
+        assert all(record.exc_info is None for record in caplog.records)
+        linked_member.add_roles.assert_not_awaited()
+
+    async def test_another_error_is_raised(
+        self,
+        user_db: UserDbConn,
+        linked_member: MagicMock,
+        rating_history: AsyncMock,
+    ) -> None:
+        # Anything else, such as a bug, reaches the caller as before.
+        rating_history.side_effect = KeyError('newRating')
+
+        with pytest.raises(KeyError):
+            await handle_linking.maybe_add_trusted_role(linked_member, user_db=user_db)
+
         linked_member.add_roles.assert_not_awaited()
 
     @pytest.mark.parametrize(
@@ -596,6 +637,53 @@ class TestHandlesCog:
         await cog.maybe_add_trusted_role(member)
 
         check.assert_awaited_once_with(member, user_db=cog.bot.user_db, log=cog.logger)
+
+    async def test_a_rank_update_while_codeforces_fails_logs_no_warning(
+        self,
+        cog: Any,
+        guild: MagicMock,
+        roles: dict[str, MagicMock],
+        user_db: UserDbConn,
+        user_info: AsyncMock,
+        rating_history: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # After each rated round, every member of Candidate Master or above
+        # without the trusted role gets the trusted check. With Codeforces
+        # failing, each check used to post a warning naming the member's
+        # handle, so the log channel got one post per member.
+        other_handle = 'Other_Coder'
+        accounts = {
+            HANDLE: codeforces_user(1950),
+            other_handle: codeforces_user(2050)._replace(handle=other_handle),
+        }
+        user_info.side_effect = lambda handles: [accounts[h] for h in handles]
+        rating_history.side_effect = cf.ClientError()
+        members = {
+            MEMBER_ID: make_member(guild, roles['Expert']),
+            OTHER_MEMBER_ID: make_member(guild, member_id=OTHER_MEMBER_ID),
+        }
+        guild.get_member.side_effect = members.get
+        await user_db.set_handle(MEMBER_ID, GUILD_ID, HANDLE)
+        await user_db.set_handle(OTHER_MEMBER_ID, GUILD_ID, other_handle)
+
+        with caplog.at_level(logging.INFO):
+            await cog._update_ranks_all(guild)
+
+        assert warned(caplog) == []
+        not_fetched = sorted(
+            record.getMessage()
+            for record in caplog.records
+            if record.name == cog.logger.name and 'trusted check' in record.getMessage()
+        )
+        assert not_fetched == [
+            f'INFO: Rating history of {handle} not fetched during trusted check:'
+            " ClientError('Error connecting to Codeforces API')"
+            for handle in sorted(accounts)
+        ]
+        # Both still get their rank role.
+        assert members[MEMBER_ID].roles == [roles['Candidate Master']]
+        assert members[OTHER_MEMBER_ID].roles == [roles['Candidate Master']]
 
     async def test_handle_set_links_the_member(
         self,
@@ -708,6 +796,12 @@ def oauth_flow(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def token_exchange(oauth_flow: None) -> Any:
+    """Codeforces' token endpoint, the mock that ``oauth_flow`` set up."""
+    return oauth.exchange_code
+
+
+@pytest.fixture
 def bot(user_db: UserDbConn, guild: MagicMock, member: MagicMock) -> MagicMock:
     """A bot without TLE's Handles cog, in whose guild ``member`` is.
 
@@ -733,17 +827,21 @@ def interaction() -> MagicMock:
 
 
 async def oauth_callback(
-    bot: MagicMock, interaction: discord.Interaction | None = None
+    bot: MagicMock,
+    interaction: discord.Interaction | None = None,
+    *,
+    session: aiohttp.ClientSession | None = None,
 ) -> Any:
     """Codeforces redirecting the member back, after they authorized the bot.
 
     The member signed in with /handle identify, whose ``interaction`` is
-    kept, or without one with ;handle identify.
+    kept, or without one with ;handle identify. ``session`` is what start()
+    opens, which only exchange_code uses: a mock, unless given.
     """
     store = oauth.OAuthStateStore()
     state = store.create(MEMBER_ID, GUILD_ID, interaction=interaction)
     server = oauth.OAuthServer(bot, store, port=0)
-    server._session = MagicMock()  # what start() opens, used only by exchange_code
+    server._session = MagicMock() if session is None else session
     request = make_mocked_request('GET', f'/callback?state={state}&code=test-code')
     return await server._handle_callback(request)
 
@@ -760,7 +858,9 @@ LINKED = (
     f'Handle for <@{MEMBER_ID}> successfully set to'
     f' **[{HANDLE}](https://codeforces.com/profile/{HANDLE})**'
 )
+NOT_LINKED = f'Could not link the Codeforces account of user {MEMBER_ID}'
 NOT_TOLD = f'Could not tell user {MEMBER_ID} how linking their Codeforces account went'
+TRY_AGAIN_PAGE = 'An error occurred. Please try the command again in Discord.'
 
 
 # The success page names the linked account with the profile embed of the
@@ -896,6 +996,126 @@ class TestOAuthCallback:
         assert record.getMessage() == 'OAuth callback error'
         assert record.exc_info is not None
         assert str(record.exc_info[1]) == 'Guild not found'
+
+    @pytest.mark.parametrize('slash', [False, True], ids=['prefix', 'slash'])
+    @pytest.mark.parametrize(
+        ('failing', 'error', 'described'),
+        [
+            # Codeforces down, after the client's tries.
+            (
+                'user info',
+                cf.ClientError(),
+                'ClientError: Error connecting to Codeforces API',
+            ),
+            # The token endpoint, which the client doesn't ask.
+            (
+                'token',
+                aiohttp.ClientConnectionError('Connection reset by peer'),
+                'ClientConnectionError: Connection reset by peer',
+            ),
+            ('token', asyncio.TimeoutError(), 'TimeoutError'),
+        ],
+        ids=['codeforces-down', 'token-connection', 'token-timeout'],
+    )
+    async def test_codeforces_failing_says_to_try_again_and_is_no_error(
+        self,
+        bot: MagicMock,
+        member: MagicMock,
+        interaction: MagicMock,
+        user_db: UserDbConn,
+        user_info: AsyncMock,
+        token_exchange: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+        slash: bool,
+        failing: str,
+        error: Exception,
+        described: str,
+    ) -> None:
+        if failing == 'token':
+            token_exchange.side_effect = error
+        else:
+            user_info.side_effect = error
+
+        with caplog.at_level(logging.INFO):
+            response = await oauth_callback(bot, interaction if slash else None)
+
+        assert TRY_AGAIN_PAGE in response.text
+        assert await handle_of(user_db) is None
+        send = interaction.followup.send if slash else member.send
+        send.assert_awaited_once()
+        assert send.await_args.kwargs['embed'].description == oauth.LINK_FAILED_TEXT
+        # It used to be posted as an error, with its traceback.
+        assert oauth_logs(caplog) == [(logging.INFO, f'{NOT_LINKED}: {described}')]
+        assert warned(caplog) == []
+        assert all(record.exc_info is None for record in caplog.records)
+
+    async def test_a_502_page_from_the_token_endpoint_says_to_try_again(
+        self,
+        bot: MagicMock,
+        member: MagicMock,
+        user_db: UserDbConn,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Codeforces' error page, which isn't JSON, to the real exchange_code.
+        async def token(request: web.Request) -> web.Response:
+            return web.Response(
+                status=502, text='<h1>502 Bad Gateway</h1>', content_type='text/html'
+            )
+
+        app = web.Application()
+        app.router.add_post('/oauth/token', token)
+        monkeypatch.setattr(oauth, 'exchange_code', EXCHANGE_CODE)
+        async with (
+            TestServer(app, host='127.0.0.1') as server,
+            aiohttp.ClientSession() as session,
+        ):
+            url = str(server.make_url('/oauth/token'))
+            monkeypatch.setattr(oauth, '_CF_TOKEN_URL', url)
+            with caplog.at_level(logging.INFO):
+                response = await oauth_callback(bot, session=session)
+
+        assert TRY_AGAIN_PAGE in response.text
+        assert await handle_of(user_db) is None
+        member.send.assert_awaited_once()
+        embed = member.send.await_args.kwargs['embed']
+        assert embed.description == oauth.LINK_FAILED_TEXT
+        # Its type and text only: its repr would add the headers.
+        assert oauth_logs(caplog) == [
+            (
+                logging.INFO,
+                f'{NOT_LINKED}: ContentTypeError: 502, message='
+                "'Attempt to decode JSON with unexpected mimetype: text/html;"
+                f" charset=utf-8', url='{url}'",
+            )
+        ]
+        assert warned(caplog) == []
+
+    async def test_a_refusal_from_the_token_endpoint_is_still_an_error(
+        self,
+        bot: MagicMock,
+        member: MagicMock,
+        token_exchange: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Such as a wrong client secret, or Codeforces changing its rules:
+        # trying again won't help, so it keeps its traceback.
+        refusal = ValueError("Token exchange failed: {'error': 'invalid_client'}")
+        token_exchange.side_effect = refusal
+
+        with caplog.at_level(logging.INFO):
+            response = await oauth_callback(bot)
+
+        assert TRY_AGAIN_PAGE in response.text
+        assert member.send.await_args.kwargs['embed'].description == (
+            oauth.LINK_FAILED_TEXT
+        )
+        [record] = warned(caplog)
+        assert (record.levelno, record.getMessage()) == (
+            logging.ERROR,
+            'OAuth callback error',
+        )
+        assert record.exc_info is not None and record.exc_info[1] is refusal
 
     @pytest.mark.parametrize(
         'slash', [False, True], ids=['direct messages closed', 'interaction expired']

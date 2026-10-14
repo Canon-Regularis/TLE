@@ -162,9 +162,12 @@ async def maybe_add_trusted_role(
             )
             return
         except cf.CodeforcesApiError as e:
-            log.warning(
-                f'WARN: API Error fetching rating for {handle}'
-                f' during trusted check: {e}'
+            # Such as Codeforces being down: no bug. As a warning, it would
+            # post a line for each member checked. The client warns about what
+            # matters: an outage that lasts, or a refusal it doesn't expect.
+            log.info(
+                f'INFO: Rating history of {handle} not fetched during trusted'
+                f' check: {e!r}'
             )
             return
 
