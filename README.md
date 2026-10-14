@@ -53,9 +53,28 @@ everything.
   `/handle refer`, `;handle grandfather` and a handle rated 1900 or more
   before 11 September 2024 give it. Rank roles are named after Codeforces
   ranks, such as Expert.
+- **Ranklists.** Codeforces' public standings list only official
+  contestants, and in some rounds, such as Div. 2, Div. 3 and Educational
+  rounds, only those it trusts, ranked among themselves. So until a
+  contest's rating changes are out, the ranks and predicted rating changes
+  of `;ranklist` count only the contestants listed, and members left out
+  aren't shown. Once the rating changes are out, everyone takes their
+  official rank, and members left out appear marked `*`, with only their
+  official rank and rating change. Virtual and out-of-competition
+  contestants no longer appear, and `+official` leaves out the contestants
+  that an Educational round doesn't rate. A ranklist's footer says which
+  ranks it shows.
 - **Rated virtual contests.** `;ratedvc` works only in its channel, which
   must be a bot channel that members can read, so not the staff channel;
-  `/set_ratedvc_channel` and `/access show` warn when it isn't.
+  `/set_ratedvc_channel` and `/access show` warn when it isn't. The bot
+  scores each member from their own virtual submissions, by Codeforces'
+  rules, so it takes only contests in Codeforces or ICPC format. Members
+  start the contest on Codeforces as a virtual contest, on their own, within
+  10 minutes of `;ratedvc`; what they submit after the time it gives them
+  doesn't count. The standings that the bot posts rank them among the
+  contestants that Codeforces lists, and their rating changes are predicted
+  among everyone Codeforces rated in the contest, at the official rank that
+  their score would have earned.
 - **Duels.** `/duel recent` and `/duel ongoing` show only duels between
   members of this server. The Accept, Decline and Withdraw buttons under a
   challenge follow who may use `duel accept`, `duel decline` and
@@ -119,7 +138,10 @@ works in the staff channel alone: developers without Manage Server use
 `;kcpc status` there, or `/kcpc status` once an admin shows `/kcpc` to the
 developer role (Server Settings → Integrations, see §3). Only the bot owner
 sees KCPC's extensions, jobs and their last errors, on `/kcpc status`, which
-answers privately.
+answers privately. A site that is down doesn't count as a failure of the
+jobs that read it, such as `problems.refresh` and the syncs
+(`contests.sync.*`, `workshops.sync`): they keep what they have, try again,
+and warn in the log channel if it lasts (see §5).
 
 The features are `algo`, `contests`, `weekly` and `workshops`.
 
@@ -389,6 +411,10 @@ topic. A server never gets the same problem twice.
 
 The bot reads the lists of problems from Codeforces' API (through TLE's
 client) every 6 hours and from AtCoder Problems (kenkoooo.com) every day.
+If a site is down, the bot keeps the list it has and tries again every 30
+minutes, and at the 3rd failed try in a row it warns in the log channel. A
+failed request to AtCoder Problems is also posted at once, by KCPC's HTTP
+client (see §5).
 Random picks, for the weekly problem and `/randproblem`, take Codeforces'
 rated problems of standard rounds, leaving out April Fools, Kotlin Heroes and
 other special contests as TLE does, and AtCoder's ABC, ARC and AGC problems
@@ -565,6 +591,15 @@ docker compose up -d           # recreate the container on the new image
 
 Coming from a version without the access rules of §3, follow the steps of
 §4 too.
+
+Coming from a version from before mid-October 2026, run
+`;cache problemsets all` once after the update; it takes a while. From late
+April 2026, Codeforces refused those versions' requests for standings, so
+the bot lacks the problems of contests held alongside another, such as the
+divisions of a round, or missing from Codeforces' problem list, that ended
+more than 14 days before the update. Without them, `;vc` can recommend such
+a contest to a member who took part in it, `;ratedvc` accepts it, and
+`;fullsolve` and `;plot extreme` leave it out.
 
 ---
 
@@ -817,7 +852,7 @@ What else changes:
 | Variable | Required | Example | Description |
 |----------|----------|---------|-------------|
 | `BOT_TOKEN` | ✅ | `MTEz…` | Discord bot token from the Dev Portal |
-| `LOGGING_COG_CHANNEL_ID` | ✅ | `123456789012345678` | channel where uncaught errors are sent |
+| `LOGGING_COG_CHANNEL_ID` | ✅ | `123456789012345678` | the log channel, for the bot's warnings and errors, with repeats summed up (see below) |
 | `ALLOW_DUEL_SELF_REGISTER` | ❌ | `true` | let users self-register for duels |
 | `ALLOWED_GUILD_IDS` | ❌ | `123456789012345678,234567890123456789` | the servers the bot may be used in, by ID; unset, any server (see below) |
 | `TLE_ADMIN` | ❌ | `123456789012345678` | the admin role, by ID (recommended, see below) or name; unset, the role named `Admin` |
@@ -862,6 +897,50 @@ Feel free to add any extra variables your cogs consume; Compose passes
 every key in `.env` to the container. Run without Docker, the bot reads
 `.env` itself; variables already set in the environment take precedence.
 
+### The log channel
+
+The bot posts its warnings and errors, TLE's and KCPC's, in the channel that
+`LOGGING_COG_CHANNEL_ID` names, without pinging anyone. Everything from INFO
+up also goes to the console, which `docker compose logs` shows, and to the
+log file, `logs/tle.log` in the container.
+
+- **Repeats.** A warning that repeats one posted lately, give or take the
+  numbers in it, such as a contest ID, is held. The first is posted in full,
+  then the repeats are summed up, each summary in one message with the last
+  repeat: every hour for a flood, and further apart for rarer repeats, up to
+  once a day. A warning not seen for 24 hours is posted in full again. A bug
+  in a command is told apart by its real error, not by discord.py's wrapper
+  around it: errors repeat each other only when their real errors are of the
+  same type and raised from the same line. So a new bug is posted in full,
+  with its traceback, even while another bug in the same command repeats.
+- **Codeforces outages.** The bot tries each request to Codeforces 3 times,
+  and its jobs try again later, so a short outage posts nothing. Nor does a
+  `/handle identify` during which Codeforces fails: the member is told to
+  try again. An outage that lasts 15 minutes posts one
+  line. If it goes on, KCPC can add one for its problem list (below), and a
+  rated virtual contest that can't finish gets one an hour after its end. A
+  refusal that the bot doesn't expect is posted, as it can mean that
+  Codeforces has changed its rules. A bug is still posted, with its
+  traceback.
+- **KCPC.** KCPC reads Codeforces through TLE, as above. It reads the other
+  sites (AtCoder, AtCoder Problems at kenkoooo.com, clist.by, icpc.global
+  and Luma) through its own HTTP client, which tries each request 3 times.
+  When a request to one of them fails, the client posts a line at once, then
+  at most one an hour for that site while the failures go on, so even a
+  short outage of those sites posts a line. The jobs that read a list, of
+  problems, contests or workshops, also warn once, at their 3rd failure in a
+  row: a problem list about an hour in, Codeforces' too, the workshop
+  calendar about 20 minutes in, and each contest list on its own, so the
+  four from clist.by warn apart. The refresh of members' ratings, every 6
+  hours, warns at its first run that can't reach a site other than
+  Codeforces, even in a short outage, then at most once a day; it leaves
+  Codeforces' failures to TLE.
+- **A channel the bot can't post in**, deleted or closed to it, is tried
+  again every 10 minutes. The next post says how many records it couldn't
+  post; the log file has them. A warning or error whose own post failed,
+  rather than a summary of its repeats, is posted in full when it comes
+  again.
+
 ---
 
 ## 6 · Data folder
@@ -885,9 +964,18 @@ every key in `.env` to the container. Run without Docker, the bot reads
   it. If you set `KCPC_DB_PATH`, these files are there instead; under Docker,
   keep that path inside `data/`, or they are lost when the container is
   recreated.
-- `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself,
-  but the bot owner has to refill the rating changes and problemsets with
-  `;cache ratingchanges all` and `;cache problemsets all`.
+- `db/cache.db`: TLE's Codeforces cache. The bot refills most of it by itself.
+  Every hour it takes the problems of finished contests from Codeforces'
+  problem list, and downloads the standings once for each new contest that
+  the list leaves incomplete (one held alongside another, such as each
+  division of a Div. 1/Div. 2 round, or one that the list misses), in the 14
+  days after the contest. The bot owner refills the rest: the rating changes
+  with `;cache ratingchanges all`, and the problems of older contests that
+  the list leaves incomplete with `;cache problemsets all`, which takes a
+  while. `;cache ratingchanges` replaces a contest's stored rating changes
+  only when new ones arrive, so a Codeforces failure keeps them:
+  `;cache ratingchanges <id>` replies with the failure, and `all` goes on to
+  the next contest.
 - `misc/contest_writers.json`: an optional list of contest writers, made with
   `extra/scrape_cf_contest_writers.py`.
 - `temp/`: images the bot is drawing.
