@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import random
 from collections import defaultdict, namedtuple
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, cast
 
 import discord
@@ -26,6 +26,14 @@ _DUEL_EXPIRY_TIME = 5 * 60
 _DUEL_RATING_DELTA = -400
 _DUEL_NO_DRAW_TIME = 10 * 60
 _ELO_CONSTANT = 60
+# The lowest and highest ratings that Codeforces gives a problem, in hundreds.
+_MIN_PROBLEM_RATING = 800
+_MAX_PROBLEM_RATING = 3500
+# Every rating that a challenge accepts, by its text.
+_PROBLEM_RATINGS = {
+    str(rating): rating
+    for rating in range(_MIN_PROBLEM_RATING, _MAX_PROBLEM_RATING + 1, 100)
+}
 # The most duels that duel recent lists.
 _RECENT_DUELS = 7
 
@@ -62,6 +70,23 @@ def elo_prob(player: float, opponent: float) -> float:
 
 def elo_delta(player: float, opponent: float, win: float) -> float:
     return _ELO_CONSTANT * (win - elo_prob(player, opponent))
+
+
+def _parse_challenge_rating(args: Iterable[str]) -> int | None:
+    """The rating among the arguments of a challenge; None if there is none.
+
+    Raises ``DuelCogError`` for anything else that isn't a tag.
+    """
+    words = [arg for arg in args if not arg.startswith(('+', '~'))]
+    if not words:
+        return None
+    if len(words) > 1 or words[0] not in _PROBLEM_RATINGS:
+        raise DuelCogError(
+            'Give at most one rating, a multiple of 100 from'
+            f' {_MIN_PROBLEM_RATING} to {_MAX_PROBLEM_RATING}.'
+            ' Tags start with + or ~.'
+        )
+    return _PROBLEM_RATINGS[words[0]]
 
 
 def check_if_allow_self_register(ctx: commands.Context) -> bool:
@@ -353,8 +378,9 @@ class Dueling(commands.Cog):
         cooldown_after_parsing=True,
         help=f"""Challenge a member to a duel on a Codeforces problem that neither
         of you has solved, rated about {-_DUEL_RATING_DELTA} below the lower of
-        your Codeforces ratings unless you give a rating. A higher rating, or
-        tags to include (+tag) or leave out (~tag), make the duel unofficial: it
+        your Codeforces ratings unless you give a rating: a multiple of 100 from
+        {_MIN_PROBLEM_RATING} to {_MAX_PROBLEM_RATING}. A higher rating, or tags
+        to include (+tag) or leave out (~tag), make the duel unofficial: it
         changes no duel ratings. The challenge expires after
         {cf_common.pretty_time_format(_DUEL_EXPIRY_TIME)}.
 
@@ -368,6 +394,14 @@ class Dueling(commands.Cog):
     async def challenge(
         self, ctx: commands.Context, opponent: discord.Member, *args: str
     ) -> None:
+        try:
+            rating = _parse_challenge_rating(args)
+        except DuelCogError:
+            discord_common.undo_cooldown(ctx)
+            raise
+        tags = cf_common.parse_tags(args, prefix='+')
+        bantags = cf_common.parse_tags(args, prefix='~')
+
         challenger_id = ctx.author.id
         challengee_id = opponent.id
 
@@ -395,13 +429,14 @@ class Dueling(commands.Cog):
 
         # Only now, so that a refused challenge asks Codeforces nothing.
         submissions = [await cf.user.status(handle=handle) for handle in handles]
-        tags = cf_common.parse_tags(args, prefix='+')
-        bantags = cf_common.parse_tags(args, prefix='~')
-        rating = cf_common.parse_rating(args)
         users = [await self.bot.user_db.fetch_cf_user(handle) for handle in handles]
         lowest_rating = min(user.rating or 0 for user in users)
-        suggested_rating = max(round(lowest_rating, -2) + _DUEL_RATING_DELTA, 500)
-        rating = round(rating, -2) if rating else suggested_rating
+        suggested_rating = min(
+            max(round(lowest_rating, -2) + _DUEL_RATING_DELTA, _MIN_PROBLEM_RATING),
+            _MAX_PROBLEM_RATING,
+        )
+        if rating is None:
+            rating = suggested_rating
         unofficial = rating > suggested_rating or tags or bantags
         dtype = DuelType.UNOFFICIAL if unofficial else DuelType.OFFICIAL
 
@@ -417,12 +452,9 @@ class Dueling(commands.Cog):
             for (name,) in await self.bot.user_db.get_duel_problem_names(userid)
         }
 
-        def get_problems(rating: int) -> list[Any]:
-            return [
-                prob
-                for prob in self.bot.cf_cache.problem_cache.problems
-                if prob.rating == rating
-                and prob.name not in solved
+        def is_candidate(prob: cf.Problem) -> bool:
+            return (
+                prob.name not in solved
                 and prob.name not in seen
                 and not any(
                     cf_common.is_contest_writer(prob.contestId, handle)
@@ -431,16 +463,23 @@ class Dueling(commands.Cog):
                 and not cf_common.is_nonstandard_problem(prob)
                 and prob.matches_all_tags(tags)
                 and not prob.matches_any_tag(bantags)
-            ]
+            )
 
-        for problems in map(get_problems, range(rating, 400, -100)):
+        by_rating: defaultdict[int, list[cf.Problem]] = defaultdict(list)
+        for prob in self.bot.cf_cache.problem_cache.problems:
+            if prob.rating is not None and prob.rating <= rating:
+                by_rating[prob.rating].append(prob)
+
+        # The hardest rating that has a candidate.
+        problems: list[cf.Problem] = []
+        for _, rated in sorted(by_rating.items(), reverse=True):
+            problems = [prob for prob in rated if is_candidate(prob)]
             if problems:
                 break
 
-        rstr = f'{rating} rated ' if rating else ''
         if not problems:
             raise DuelCogError(
-                f'No unsolved {rstr}problems left for'
+                f'No unsolved {rating} rated problems left for'
                 f' {ctx.author.mention} vs {opponent.mention}.'
             )
 
@@ -471,7 +510,7 @@ class Dueling(commands.Cog):
         )
         view.message = await ctx.send(
             f'{ctx.author.mention} is challenging'
-            f' {opponent.mention} to {ostr} {rstr}duel!\n\u200b',
+            f' {opponent.mention} to {ostr} {rating} rated duel!\n\u200b',
             view=view,
         )
 

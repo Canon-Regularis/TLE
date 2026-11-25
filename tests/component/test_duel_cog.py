@@ -11,7 +11,7 @@ itself (the server, its members, the interaction) is mocked.
 import asyncio
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -149,6 +149,7 @@ def make_ctx(author: MagicMock) -> MagicMock:
     ctx.guild = author.guild
     ctx.author = author
     ctx.channel = MagicMock(spec=discord.TextChannel)
+    ctx.command = MagicMock(spec=commands.Command)
     ctx.send = AsyncMock()
     return ctx
 
@@ -320,6 +321,7 @@ async def test_withdrawing_mentions_both_duelists(
     ('name', 'quoted'),
     [
         ('challenge', f'rated about {-duel._DUEL_RATING_DELTA} below the lower'),
+        ('challenge', 'a rating: a multiple of 100 from 800 to 3500.'),
         (
             'challenge',
             'The challenge expires after '
@@ -337,7 +339,7 @@ async def test_withdrawing_mentions_both_duelists(
         ),
     ],
 )
-def test_the_help_quotes_the_times_the_cog_uses(name: str, quoted: str) -> None:
+def test_the_help_quotes_the_numbers_the_cog_uses(name: str, quoted: str) -> None:
     # As /help shows it: the lines of a paragraph joined.
     description, examples = split_help(getattr(Dueling, name).help)
 
@@ -634,6 +636,279 @@ async def test_complete_outside_a_duel_answers_at_once(
         await type(cog).complete.callback(cog, ctx)
 
     assert events == []
+
+
+# The rating of a challenge
+
+
+RATING_REFUSAL = (
+    'Give at most one rating, a multiple of 100 from 800 to 3500.'
+    ' Tags start with + or ~.'
+)
+
+
+class CountingProblemCache:
+    """A problem cache that counts how often its problems are read."""
+
+    def __init__(self, problems: list[cf.Problem]) -> None:
+        self._problems = problems
+        self.reads = 0
+
+    @property
+    def problems(self) -> list[cf.Problem]:
+        self.reads += 1
+        return self._problems
+
+
+@pytest.fixture
+def status(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Codeforces' answer about a member's submissions: none."""
+    status = AsyncMock(return_value=[])
+    monkeypatch.setattr(cf.user, 'status', status)
+    return status
+
+
+@pytest.fixture
+def resolve_handles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    resolve_handles = AsyncMock()
+    monkeypatch.setattr(cf_common, 'resolve_handles', resolve_handles)
+    return resolve_handles
+
+
+@pytest.fixture
+def offer(
+    bot: DuelBot,
+    status: AsyncMock,
+    resolve_handles: AsyncMock,
+    make_problem: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., CountingProblemCache]:
+    """Makes the problem set: a problem of each rating given, named after it."""
+
+    def offer(*ratings: int | None) -> CountingProblemCache:
+        cache = CountingProblemCache(
+            [make_problem(name=f'P{rating}', rating=rating) for rating in ratings]
+        )
+        bot.cf_cache.problem_cache = cache
+        return cache
+
+    monkeypatch.setattr(cf_common, 'cf_cache', bot.cf_cache)
+    return offer
+
+
+async def challenge_bob(cog: Dueling, ctx: MagicMock, *args: str) -> None:
+    """Challenge Bob with the arguments ``args``."""
+    bob = ctx.guild.get_member(BOB)
+    await type(cog).challenge.callback(cog, ctx, bob, *args)
+
+
+async def stored_duels(user_db: UserDbConn) -> list[tuple[str, DuelType]]:
+    """The problem and type of every duel stored."""
+    cursor = await user_db.conn.execute('SELECT problem_name, type FROM duel')
+    return [(name, DuelType(dtype)) for name, dtype in await cursor.fetchall()]
+
+
+@pytest.mark.parametrize(
+    'args',
+    [
+        ('0',),
+        ('400',),
+        ('700',),
+        ('799',),
+        ('801',),
+        ('1550',),
+        ('3499',),
+        ('3501',),
+        ('3600',),
+        ('9' * 4000,),
+        ('-1600',),
+        ('1600.0',),
+        ('1e3',),
+        ('1_600',),
+        ('01600',),
+        ('²',),  # a superscript 2
+        ('１６００',),  # 1600 in fullwidth digits
+        (' 1600',),
+        ('',),
+        ('greedy',),
+        ('1600', '1700'),
+        ('+dp', '1600', 'greedy'),
+    ],
+    ids=lambda args: ascii(' '.join(args)[:20]),
+)
+async def test_a_challenge_with_anything_but_a_rating_and_tags_is_refused(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    offer: Callable[..., CountingProblemCache],
+    status: AsyncMock,
+    resolve_handles: AsyncMock,
+    args: tuple[str, ...],
+) -> None:
+    cache = offer(800, 1600)
+    ctx = make_ctx(members[ALICE])
+
+    with pytest.raises(DuelCogError) as refused:
+        await challenge_bob(cog, ctx, *args)
+
+    assert str(refused.value) == RATING_REFUSAL
+    resolve_handles.assert_not_awaited()
+    status.assert_not_awaited()
+    assert cache.reads == 0
+    assert await stored_duels(user_db) == []
+    # It cost nothing, so it doesn't hold the member back.
+    ctx.command.reset_cooldown.assert_called_once_with(ctx)
+
+
+@pytest.mark.parametrize('rating', [800, 900, 3400, 3500])
+async def test_a_challenge_takes_ratings_up_to_each_bound(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    offer: Callable[..., CountingProblemCache],
+    rating: int,
+) -> None:
+    offer(800, 900, 3400, 3500)
+    ctx = make_ctx(members[ALICE])
+
+    await challenge_bob(cog, ctx, str(rating))
+
+    assert [name for name, _ in await stored_duels(user_db)] == [f'P{rating}']
+    assert f'{rating} rated duel!' in ctx.send.await_args.args[0]
+    ctx.command.reset_cooldown.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    'args',
+    [
+        ('1600', '+dp', '~math'),
+        ('+dp', '1600', '~math'),
+        ('+dp', '~math', '1600'),
+    ],
+)
+async def test_tags_go_before_or_after_the_rating(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    offer: Callable[..., CountingProblemCache],
+    make_problem: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    # The last candidate is chosen, so one let through by mistake would be.
+    monkeypatch.setattr(duel.random, 'randrange', lambda stop: stop - 1)
+    offer().problems.extend(
+        [
+            make_problem(name='wanted', rating=1600, tags=['dp']),
+            make_problem(name='no tag', rating=1600),
+            make_problem(name='left out', rating=1600, tags=['dp', 'math']),
+        ]
+    )
+
+    await challenge_bob(cog, make_ctx(members[ALICE]), *args)
+
+    assert await stored_duels(user_db) == [('wanted', DuelType.UNOFFICIAL)]
+
+
+@pytest.mark.parametrize(
+    ('lower', 'rating'),
+    [
+        (None, 800),
+        (900, 800),
+        (1200, 800),
+        (1300, 900),
+        (3900, 3500),
+        (4000, 3500),
+    ],
+)
+async def test_the_default_rating_is_one_that_problems_have(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    make_user: Any,
+    offer: Callable[..., CountingProblemCache],
+    lower: int | None,
+    rating: int,
+) -> None:
+    await user_db.cache_cf_user(make_user(handle='alice', rating=4000))
+    await user_db.cache_cf_user(make_user(handle='bob', rating=lower))
+    offer(800, 900, 3400, 3500)
+    ctx = make_ctx(members[ALICE])
+
+    await challenge_bob(cog, ctx)
+
+    assert await stored_duels(user_db) == [(f'P{rating}', DuelType.OFFICIAL)]
+    assert f'{rating} rated duel!' in ctx.send.await_args.args[0]
+
+
+@pytest.mark.parametrize(
+    ('rating', 'dtype'),
+    [(2500, DuelType.OFFICIAL), (2600, DuelType.OFFICIAL), (2700, DuelType.UNOFFICIAL)],
+)
+async def test_a_rating_above_the_default_makes_the_duel_unofficial(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    offer: Callable[..., CountingProblemCache],
+    rating: int,
+    dtype: DuelType,
+) -> None:
+    # Both members are rated 3000.
+    offer(rating)
+
+    await challenge_bob(cog, make_ctx(members[ALICE]), str(rating))
+
+    assert await stored_duels(user_db) == [(f'P{rating}', dtype)]
+
+
+async def test_a_challenge_falls_back_to_the_hardest_easier_problem(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    status: AsyncMock,
+    offer: Callable[..., CountingProblemCache],
+    make_problem: Any,
+) -> None:
+    # In no order, with gaps; a problem may have no rating.
+    cache = offer(900, None, 1700, 1300, 1600)
+    status.return_value = [
+        SimpleNamespace(problem=make_problem(name='P1600'), verdict='WRONG_ANSWER')
+    ]
+
+    await challenge_bob(cog, make_ctx(members[ALICE]), '1600')
+
+    assert await stored_duels(user_db) == [('P1300', DuelType.OFFICIAL)]
+    assert cache.reads == 1
+
+
+@pytest.mark.parametrize('ratings', [(), (None,), (1700, 3500), (800, 1600)], ids=str)
+async def test_a_challenge_without_a_problem_says_so(
+    cog: Dueling,
+    user_db: UserDbConn,
+    members: dict[int, Any],
+    status: AsyncMock,
+    offer: Callable[..., CountingProblemCache],
+    make_problem: Any,
+    ratings: tuple[int | None, ...],
+) -> None:
+    cache = offer(*ratings)
+    status.return_value = [
+        SimpleNamespace(problem=make_problem(name=f'P{rating}'), verdict='OK')
+        for rating in (800, 1600)
+    ]
+    ctx = make_ctx(members[ALICE])
+
+    with pytest.raises(DuelCogError) as refused:
+        await challenge_bob(cog, ctx, '1600')
+
+    assert str(refused.value) == (
+        f'No unsolved 1600 rated problems left for <@{ALICE}> vs <@{BOB}>.'
+    )
+    assert cache.reads == 1
+    assert await stored_duels(user_db) == []
+    # Codeforces was asked, so the cooldown stays.
+    assert status.await_count == 2
+    ctx.command.reset_cooldown.assert_not_called()
 
 
 # The buttons of a challenge follow their commands' access rules
