@@ -6,8 +6,7 @@ and manage starboards, with slash commands and the `;` prefix. Each
 server's admins choose where its commands answer publicly, and can limit
 who may use each one (see §3).
 
-If you have Docker ≥ 24 (or Docker Desktop on Win/Mac) you are ready to
-go.
+To set it up on your own server, follow [INSTALLATION.md](INSTALLATION.md).
 
 ---
 
@@ -559,23 +558,8 @@ Members can use:
 
 ## 2 · Quick start (production)
 
-```bash
-# 1 · clone the repo
-git clone https://github.com/cheran-senthil/TLE
-cd TLE
-
-# 2 · create a config file
-cp .env.example .env          # then edit BOT_TOKEN, LOGGING_COG_CHANNEL_ID …
-
-# 3 · create the data directory and start the bot (first run takes ~2 min)
-mkdir -p data
-docker compose up -d
-```
-
-That’s it.  
-The bot will appear online in your Discord server. Give the server a staff
-channel and a bot channel with `/access` (step 4 of §4), then use `/help`
-inside Discord to explore commands.
+[INSTALLATION.md](INSTALLATION.md) covers the Discord application, the
+configuration, the first start and the server's setup.
 
 Compose restarts the bot after a crash or a reboot (`restart: unless-stopped`),
 so the bot owner's `;meta kill` restarts it; stop it with
