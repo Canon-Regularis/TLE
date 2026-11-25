@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from dotenv import dotenv_values
 
 from tle import constants
 from tle.config import Settings
@@ -307,6 +308,13 @@ def test_env_example_shows_the_defaults_and_otherwise_examples(name: str) -> Non
 @pytest.mark.parametrize('name', ROLE_VARS_BY_ID)
 def test_env_example_gives_these_roles_by_id(name: str) -> None:
     assert env_example_values()[name].isdigit()
+
+
+def test_env_example_leaves_codeforces_oauth_off() -> None:
+    # tle.constants counts any values as credentials, placeholders too.
+    values = dotenv_values(REPO_ROOT / '.env.example')
+
+    assert [name for name in values if name.startswith('OAUTH_')] == []
 
 
 def developer_role_from(monkeypatch: pytest.MonkeyPatch, value: str | None) -> object:
