@@ -72,6 +72,8 @@ PINGS_ROLE_ID = 1_300_000_000_000_000_001
 OTHER_ROLE_ID = 1_300_000_000_000_000_002
 BOT_ROLE_ID = 1_300_000_000_000_000_009
 MEMBER_ID = 1_400_000_000_000_000_001
+OTHER_ID = 1_400_000_000_000_000_002
+THIRD_ID = 1_400_000_000_000_000_003
 CONTEST_ID = 1950
 CONTEST_NAME = 'Codeforces Round 1950'
 # The bot's highest role is at this position.
@@ -1114,10 +1116,60 @@ async def test_vcratings_defers_its_answer_before_finding_the_members(
     assert steps == ['typing', 'found a member', 'typed', 'answered']
 
 
+@pytest.mark.usefixtures('rated')
+async def test_vcrating_plots_each_member_once_whatever_they_are_called(
+    cog: Contests,
+    guild: MagicMock,
+    user_db: UserDbConn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for finish, rating in ((2.0, 1300), (3.0, 1350)):
+        vc_id = await user_db.create_rated_vc(
+            CONTEST_ID, 0.0, finish, GUILD_ID, [OTHER_ID]
+        )
+        await user_db.update_vc_rating(vc_id, OTHER_ID, rating)
+    alice, namesake = make_member(), make_member()
+    namesake.id = OTHER_ID
+    plt = MagicMock()
+    monkeypatch.setattr(contests, 'plt', plt)
+    monkeypatch.setattr(contests, 'gc', MagicMock(StrWrap=str))
+    monkeypatch.setattr(contests.discord_common, 'attach_image', MagicMock())
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), alice)
+
+    await type(cog).vcrating.callback(cog, ctx, namesake, alice, namesake)
+
+    assert [drawn.args[1] for drawn in plt.plot.call_args_list] == [
+        (1300, 1350),
+        (1600,),
+    ]
+    # Each with the rating they have now.
+    assert plt.legend.call_args.args[0] == ['Alice (1350)', 'Alice (1600)']
+
+    plt.reset_mock()
+    await type(cog).vcrating.callback(cog, ctx)
+
+    assert [drawn.args[1] for drawn in plt.plot.call_args_list] == [(1600,)]
+
+
+async def test_vcrating_counts_a_member_named_twice_once(
+    cog: Contests, guild: MagicMock
+) -> None:
+    members = []
+    for number in range(6):
+        member = make_member()
+        member.id = MEMBER_ID + number
+        members.append(member)
+    ctx = make_ctx(guild, make_channel(BOT_CHANNEL_ID), members[0])
+
+    with pytest.raises(ContestCogError, match='^Name at most 5 members.$'):
+        await type(cog).vcrating.callback(cog, ctx, *members)
+    # Five members, so the first one's missing ratings are noticed instead.
+    with pytest.raises(ContestCogError, match="hasn't finished a rated"):
+        await type(cog).vcrating.callback(cog, ctx, *members[:5], members[0])
+
+
 # The rated virtual contest watcher
 
-OTHER_ID = 1_400_000_000_000_000_002
-THIRD_ID = 1_400_000_000_000_000_003
 # A rated virtual contest of the 2-hour contest, which ends 10 minutes later,
 # as its members have 10 minutes to start it.
 VC_START = 1_700_000_000
