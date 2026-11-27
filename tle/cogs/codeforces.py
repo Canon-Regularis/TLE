@@ -117,9 +117,7 @@ class Codeforces(commands.Cog):
             ;upsolve 2
         """
         await self._validate_gitgud_status(ctx, delta=None)
-        (handle,) = await cf_common.resolve_handles(
-            ctx, self.converter, ('!' + str(ctx.author),)
-        )
+        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         user = await self.bot.user_db.fetch_cf_user(handle)
         rating = round(user.effective_rating, -2)
         # Codeforces may take longer than the 3 seconds a slash command has to
@@ -180,9 +178,7 @@ class Codeforces(commands.Cog):
             ;gimme 1800
             ;gimme +dp ~math 1600
         """
-        (handle,) = await cf_common.resolve_handles(
-            ctx, self.converter, ('!' + str(ctx.author),)
-        )
+        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         cf_user = await self.bot.user_db.fetch_cf_user(handle)
         rating = round(cf_user.effective_rating, -2)
         tags = cf_common.parse_tags(args, prefix='+')
@@ -256,8 +252,9 @@ class Codeforces(commands.Cog):
         (hardest,), remaining = cf_common.filter_flags(args, ['+hardest'])
         filt = cf_common.SubFilter(False)
         filtered_args = filt.parse(remaining)
-        handles = filtered_args or ['!' + str(ctx.author)]
-        handles = await cf_common.resolve_handles(ctx, self.converter, handles)
+        handles = await cf_common.resolve_handles(
+            ctx, self.converter, filtered_args or (ctx.author,)
+        )
         all_subs = [await cf.user.status(handle=handle) for handle in handles]
         submissions = [sub for subs in all_subs for sub in subs]
         submissions = filt.filter_subs(submissions)
@@ -319,12 +316,13 @@ class Codeforces(commands.Cog):
             ;mashup
             ;mashup tourist !alice +greedy ~math
         """
-        handles: list[str] = [arg for arg in args if arg[0] not in '+~']
+        names = [arg for arg in args if arg[0] not in '+~']
         tags = cf_common.parse_tags(args, prefix='+')
         bantags = cf_common.parse_tags(args, prefix='~')
 
-        handles = handles or ['!' + str(ctx.author)]
-        handles = await cf_common.resolve_handles(ctx, self.converter, handles)
+        handles = await cf_common.resolve_handles(
+            ctx, self.converter, names or (ctx.author,)
+        )
         resp = [await cf.user.status(handle=handle) for handle in handles]
         submissions = [sub for user in resp for sub in user]
         solved = {sub.problem.name for sub in submissions}
@@ -400,9 +398,7 @@ class Codeforces(commands.Cog):
             ;gitgud -100
         """
         await self._validate_gitgud_status(ctx, delta)
-        (handle,) = await cf_common.resolve_handles(
-            ctx, self.converter, ('!' + str(ctx.author),)
-        )
+        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         user = await self.bot.user_db.fetch_cf_user(handle)
         rating = round(user.effective_rating, -2)
         # Codeforces may take longer than the 3 seconds a slash command has to
@@ -507,9 +503,7 @@ class Codeforces(commands.Cog):
             /gotgud
             ;gotgud
         """
-        (handle,) = await cf_common.resolve_handles(
-            ctx, self.converter, ('!' + str(ctx.author),)
-        )
+        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         user_id = ctx.message.author.id
         active = await self.bot.user_db.check_challenge(user_id)
         if not active:
@@ -550,7 +544,7 @@ class Codeforces(commands.Cog):
             /nogud
             ;nogud
         """
-        await cf_common.resolve_handles(ctx, self.converter, ('!' + str(ctx.author),))
+        await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         user_id = ctx.message.author.id
         active = await self.bot.user_db.check_challenge(user_id)
         if not active:
@@ -613,9 +607,9 @@ class Codeforces(commands.Cog):
             ;vc tourist !alice +global
         """
         markers = [x for x in args if x[0] == '+']
-        handles = [x for x in args if x[0] != '+'] or ['!' + str(ctx.author)]
+        names = [x for x in args if x[0] != '+']
         handles = await cf_common.resolve_handles(
-            ctx, self.converter, handles, maxcnt=25
+            ctx, self.converter, names or (ctx.author,), maxcnt=25
         )
         info = await cf.user.info(handles=handles)
         contests = self.bot.cf_cache.contest_cache.get_contests_in_phase('FINISHED')
@@ -691,9 +685,7 @@ class Codeforces(commands.Cog):
             ;fullsolve
             ;fullsolve +edu
         """
-        (handle,) = await cf_common.resolve_handles(
-            ctx, self.converter, ('!' + str(ctx.author),)
-        )
+        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (ctx.author,))
         tags = [x for x in args if x[0] == '+']
 
         problem_to_contests = self.bot.cf_cache.problemset_cache.problem_to_contests
@@ -809,10 +801,9 @@ class Codeforces(commands.Cog):
             ;teamrate +server
         """
 
-        (is_entire_server, peak), handles = cf_common.filter_flags(
+        (is_entire_server, peak), players = cf_common.filter_flags(
             args, ['+server', '+peak']
         )
-        handles = handles or ['!' + str(ctx.author)]
 
         def rating(user: cf.User) -> int | None:
             return user.maxRating if peak else user.rating
@@ -824,49 +815,52 @@ class Codeforces(commands.Cog):
             ]
             user_str = '+server'
         else:
-
-            def normalize(x: list[str] | tuple[str, ...]) -> list[str]:
-                return [i.lower() for i in x]
-
-            handle_counts: dict[str, int] = {}
-            parsed_handles: list[str] = []
-            for i in handles:
-                parse_str = normalize(i.split('*'))
-                if len(parse_str) > 1:
-                    try:
-                        handle_counts[parse_str[0]] = int(parse_str[1])
-                    except ValueError:
-                        raise CodeforcesCogError("Can't multiply by non-integer")
-                else:
-                    handle_counts[parse_str[0]] = 1
-                parsed_handles.append(parse_str[0])
-
-            cf_handles = await cf_common.resolve_handles(
-                ctx, self.converter, parsed_handles, mincnt=1, maxcnt=1000
-            )
-            cf_handles = normalize(cf_handles)
-            cf_to_original = {
-                a: b for a, b in zip(cf_handles, parsed_handles, strict=False)
-            }
-            original_to_cf = {
-                a: b for a, b in zip(parsed_handles, cf_handles, strict=False)
-            }
-            users = await cf.user.info(handles=cf_handles)
-            user_strs: list[str] = []
-            for a, b in handle_counts.items():
-                if b > 1:
-                    user_strs.append(f'{original_to_cf[a]}*{b}')
-                elif b == 1:
-                    user_strs.append(original_to_cf[a])
-                elif b <= 0:
+            # What each player was typed as, and how many times they count.
+            team: list[tuple[str | discord.abc.User, int]] = []
+            for player in players:
+                name, times, multiplier = player.partition('*')
+                if name in ('', '!'):
+                    raise CodeforcesCogError('Name a player before each *.')
+                # Case matters in members' names, but not in Codeforces handles.
+                if not name.startswith('!'):
+                    name = name.lower()
+                try:
+                    count = int(multiplier) if times else 1
+                except ValueError:
+                    raise CodeforcesCogError("Can't multiply by non-integer")
+                if count <= 0:
                     raise CodeforcesCogError(
                         'How can you have nonpositive members in team?'
                     )
+                team.append((name, count))
+            team = team or [(ctx.author, 1)]
 
-            user_str = ', '.join(user_strs)
+            pairs = await cf_common.resolve_handle_pairs(
+                ctx, self.converter, [name for name, _ in team], maxcnt=1000
+            )
+            handles: dict[str | discord.abc.User, list[str]] = defaultdict(list)
+            for name, handle in pairs:
+                handles[name].append(handle.lower())
+            # A player named twice counts with the last multiplier given. +server
+            # gives its own to the players named through it alone.
+            handle_counts: dict[str, int] = {}
+            server_count = 1
+            for name, count in team:
+                if name == '+server':
+                    server_count = count
+                else:
+                    handle_counts[handles[name][0]] = count
+            for handle in handles['+server']:
+                handle_counts.setdefault(handle, server_count)
+            # Codeforces answers in the order asked.
+            users = await cf.user.info(handles=list(handle_counts))
+            user_str = ', '.join(
+                f'{handle}*{count}' if count > 1 else handle
+                for handle, count in handle_counts.items()
+            )
             ratings = [
-                (rating(user), handle_counts[cf_to_original[user.handle.lower()]])
-                for user in users
+                (rating(user), count)
+                for user, count in zip(users, handle_counts.values(), strict=True)
                 if user.rating
             ]
 

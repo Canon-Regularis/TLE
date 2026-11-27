@@ -1425,10 +1425,10 @@ class Contests(commands.Cog):
             ;vcrating @alice @bob
         """
         assert isinstance(ctx.author, discord.Member)
-        members = members or (ctx.author,)
+        members = tuple(dict.fromkeys(members)) or (ctx.author,)
         if len(members) > 5:
             raise ContestCogError('Name at most 5 members.')
-        plot_data = defaultdict(list)
+        plot_data = defaultdict(list)  # by member ID
 
         min_rating = 1100
         max_rating = 1800
@@ -1442,7 +1442,7 @@ class Contests(commands.Cog):
             for vc_id, rating in rating_history:
                 vc = await self.bot.user_db.get_rated_vc(vc_id)
                 date = dt.datetime.fromtimestamp(vc.finish_time)
-                plot_data[member.display_name].append((date, rating))
+                plot_data[member.id].append((date, rating))
                 min_rating = min(min_rating, rating)
                 max_rating = max(max_rating, rating)
 
@@ -1465,8 +1465,8 @@ class Contests(commands.Cog):
 
         plt.ylim(min_rating - 100, max_rating + 200)
         labels = [
-            gc.StrWrap('{} ({})'.format(member_display_name, rating_data[-1][1]))
-            for member_display_name, rating_data in plot_data.items()
+            gc.StrWrap(f'{member.display_name} ({plot_data[member.id][-1][1]})')
+            for member in members
         ]
         plt.legend(labels, loc='upper left', prop=gc.fontprop)
 
