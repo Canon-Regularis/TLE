@@ -193,6 +193,14 @@ class FindMemberFailedError(ResolveHandleError):
         super().__init__(f'Unable to convert `{member}` to a server member')
 
 
+class AmbiguousMemberError(ResolveHandleError):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f'More than one member is called {discord.utils.escape_markdown(name)}.'
+            ' Put ! before a mention of the one you mean, or before their ID.'
+        )
+
+
 class HandleNotRegisteredError(ResolveHandleError):
     def __init__(self, member: discord.Member) -> None:
         super().__init__(
@@ -265,48 +273,102 @@ def days_ago(t: float) -> str:
     return f'{math.floor(days)} days ago'
 
 
+async def _find_member(
+    ctx: commands.Context, converter: Any, name: str
+) -> discord.Member:
+    """The member that ``name`` means: an ID, a mention, or a name that only one
+    member has, as username, global name or nickname.
+    """
+    try:
+        member: discord.Member = await converter.convert(ctx, name)
+    except commands.CommandError:
+        raise FindMemberFailedError(name)
+    if name in (str(member.id), f'<@{member.id}>', f'<@!{member.id}>'):
+        return member
+    # The converter takes the first member with the name.
+    if any(
+        other.id != member.id and name in (other.name, other.global_name, other.nick)
+        for other in ctx.guild.members
+    ):
+        raise AmbiguousMemberError(name)
+    return member
+
+
+async def resolve_handle_pairs(
+    ctx: commands.Context,
+    converter: Any,
+    names: Iterable[str | discord.Member],
+    *,
+    mincnt: int = 1,
+    maxcnt: int | None = 5,
+    default_to_all_server: bool = False,
+) -> list[tuple[str | discord.Member, str]]:
+    """Pair each of ``names`` with the CF handle it means, in the order given and
+    without duplicates.
+
+    A member means the handle they linked, and so does a string that begins with
+    ! and names a member. +server is paired with each handle linked in the server
+    that no other name means, after the rest. Any other string is a raw CF handle,
+    left unchanged.
+    """
+    unique = list(dict.fromkeys(names))
+    if default_to_all_server and not unique:
+        unique = ['+server']
+    server_handles: list[str] = []
+    if '+server' in unique:
+        unique.remove('+server')
+        linked = await user_db.get_handles_for_guild(ctx.guild.id)
+        server_handles = [handle for _, handle in linked if handle not in unique]
+    # Counted before any lookup, so that a long list costs nothing.
+    count = len(unique) + len(server_handles)
+    if count < mincnt or (maxcnt is not None and maxcnt < count):
+        raise HandleCountOutOfBoundsError(mincnt, maxcnt or 0)
+
+    pairs: list[tuple[str | discord.Member, str]] = []
+    for name in unique:
+        if isinstance(name, str) and not name.startswith('!'):
+            pairs.append((name, name))
+            continue
+        member = (
+            await _find_member(ctx, converter, name[1:])
+            if isinstance(name, str)
+            else name
+        )
+        handle = await user_db.get_handle(member.id, ctx.guild.id)
+        if handle is None:
+            raise HandleNotRegisteredError(member)
+        pairs.append((name, handle))
+    named = {handle for _, handle in pairs}
+    pairs += [('+server', handle) for handle in server_handles if handle not in named]
+
+    for _, handle in pairs:
+        if handle in HandleIsVjudgeError.HANDLES:
+            raise HandleIsVjudgeError(handle)
+    return pairs
+
+
 async def resolve_handles(
     ctx: commands.Context,
     converter: Any,
-    handles: Iterable[str],
+    names: Iterable[str | discord.Member],
     *,
     mincnt: int = 1,
     maxcnt: int | None = 5,
     default_to_all_server: bool = False,
 ) -> list[str]:
-    """Convert an iterable of strings to CF handles.
-
-    A string beginning with ! indicates Discord username, otherwise it is a raw
-    CF handle to be left unchanged.
+    """The CF handles that ``names`` mean, as ``resolve_handle_pairs`` finds them,
+    each once.
     """
-    handles = set(handles)
-    if default_to_all_server and not handles:
-        handles.add('+server')
-    if '+server' in handles:
-        handles.remove('+server')
-        guild_handles = {
-            handle
-            for discord_id, handle in await user_db.get_handles_for_guild(ctx.guild.id)
-        }
-        handles.update(guild_handles)
-    if len(handles) < mincnt or (maxcnt is not None and maxcnt < len(handles)):
-        raise HandleCountOutOfBoundsError(mincnt, maxcnt or 0)
-    resolved_handles = []
-    for handle in handles:
-        if handle.startswith('!'):
-            # ! denotes Discord user
-            member_identifier = handle[1:]
-            try:
-                member = await converter.convert(ctx, member_identifier)
-            except commands.errors.CommandError:
-                raise FindMemberFailedError(member_identifier)
-            handle = await user_db.get_handle(member.id, ctx.guild.id)
-            if handle is None:
-                raise HandleNotRegisteredError(member)
-        if handle in HandleIsVjudgeError.HANDLES:
-            raise HandleIsVjudgeError(handle)
-        resolved_handles.append(handle)
-    return resolved_handles
+    pairs = await resolve_handle_pairs(
+        ctx,
+        converter,
+        names,
+        mincnt=mincnt,
+        maxcnt=maxcnt,
+        default_to_all_server=default_to_all_server,
+    )
+    # Compared exactly: a ranklist finds a handle only as Codeforces spells it.
+    return list(dict.fromkeys(handle for _, handle in pairs))
 
 
 async def members_to_handles(
@@ -385,7 +447,7 @@ class SubFilter:
         self.indices: list[str] = []
 
     def parse(self, args: Iterable[str]) -> list[str]:
-        args = list(set(args))
+        args = list(dict.fromkeys(args))
         rest = []
 
         for arg in args:

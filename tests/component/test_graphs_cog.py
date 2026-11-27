@@ -915,9 +915,10 @@ async def test_the_plot_group_s_help_explains_how_to_name_handles_and_filters(
 
     description, examples = split_help(plot.help)
 
-    # Members by name, with quotes around a name with spaces.
+    # Members by name, with quotes around a name with spaces, or by mention.
     assert '`!Alice`' in description
     assert '`"!Alice Smith"`' in description
+    assert 'put `!` before\na mention' in plot.help.replace('        ', '')
     # /help shows each filter on a line of its own.
     lines = description.splitlines()
     for token in (

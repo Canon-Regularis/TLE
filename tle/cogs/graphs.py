@@ -348,7 +348,8 @@ class Graphs(commands.Cog):
         type the others after ;plot, such as ;plot rating. Most of them plot the
         Codeforces handles you name, or yours if you name none. For the handle
         a member linked, type `!` and their name: `!Alice`, or `"!Alice Smith"`
-        if the name has spaces.
+        if the name has spaces. If several members have the name, put `!` before
+        a mention of the one you mean, or before their ID.
 
         The plots of solved problems also take these filters, in any order:
         - `+contest`, `+outof`, `+virtual`, `+practice`: only problems solved that way
@@ -397,8 +398,9 @@ class Graphs(commands.Cog):
         )
         filt = cf_common.SubFilter()
         remaining = filt.parse(remaining)
-        handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
-        handles = await cf_common.resolve_handles(ctx, self.converter, handles)
+        handles = await cf_common.resolve_handles(
+            ctx, self.converter, remaining or (ctx.author,)
+        )
         resp = [await cf.user.rating(handle=handle) for handle in handles]
         resp = [filt.filter_rating_changes(rating_changes) for rating_changes in resp]
 
@@ -484,8 +486,9 @@ class Graphs(commands.Cog):
         if not solved and not unsolved:
             solved = unsolved = True
 
-        handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
-        (handle,) = await cf_common.resolve_handles(ctx, self.converter, handles)
+        (handle,) = await cf_common.resolve_handles(
+            ctx, self.converter, remaining or (ctx.author,)
+        )
         ratingchanges = await cf.user.rating(handle=handle)
         if not ratingchanges:
             raise GraphCogError(f'User {handle} is not rated')
@@ -562,8 +565,9 @@ class Graphs(commands.Cog):
         """
         filt = cf_common.SubFilter()
         remaining = filt.parse(args)
-        handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
-        handles = await cf_common.resolve_handles(ctx, self.converter, handles)
+        handles = await cf_common.resolve_handles(
+            ctx, self.converter, remaining or (ctx.author,)
+        )
         resp = [await cf.user.status(handle=handle) for handle in handles]
         all_solved_subs = [filt.filter_subs(submissions) for submissions in resp]
 
@@ -663,7 +667,7 @@ class Graphs(commands.Cog):
         phase_time = dt.timedelta(days=phase_days)
 
         handles = await cf_common.resolve_handles(
-            ctx, self.converter, handle_list or ['!' + str(ctx.author)]
+            ctx, self.converter, handle_list or (ctx.author,)
         )
         resp = [await cf.user.status(handle=handle) for handle in handles]
         all_solved_subs = [filt.filter_subs(submissions) for submissions in resp]
@@ -778,8 +782,9 @@ class Graphs(commands.Cog):
         """
         filt = cf_common.SubFilter()
         remaining = filt.parse(args)
-        handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
-        handles = await cf_common.resolve_handles(ctx, self.converter, handles)
+        handles = await cf_common.resolve_handles(
+            ctx, self.converter, remaining or (ctx.author,)
+        )
         resp = [await cf.user.status(handle=handle) for handle in handles]
         all_solved_subs = [filt.filter_subs(submissions) for submissions in resp]
 
@@ -860,8 +865,9 @@ class Graphs(commands.Cog):
         if bin_size < 1 or point_size < 1 or point_size > 100:
             raise GraphCogError('Invalid parameters')
 
-        handle = handle or '!' + str(ctx.author)
-        (handle,) = await cf_common.resolve_handles(ctx, self.converter, (handle,))
+        (handle,) = await cf_common.resolve_handles(
+            ctx, self.converter, (handle or ctx.author,)
+        )
         rating_resp = [await cf.user.rating(handle=handle)]
         rating_resp = [
             filt.filter_rating_changes(rating_changes) for rating_changes in rating_resp
@@ -1122,11 +1128,10 @@ class Graphs(commands.Cog):
 
         users_to_mark = {}
         if not nomarker:
-            handles: Sequence[str] = remaining or ('!' + str(ctx.author),)
             handles = await cf_common.resolve_handles(
-                ctx, self.converter, handles, mincnt=0, maxcnt=50
+                ctx, self.converter, remaining or (ctx.author,), mincnt=0, maxcnt=50
             )
-            infos = await cf.user.info(handles=list(set(handles)))
+            infos = await cf.user.info(handles=handles)
 
             for info in infos:
                 if info.rating is None:
@@ -1547,7 +1552,7 @@ class Graphs(commands.Cog):
                 handle_list.append(arg)
 
         handles = await cf_common.resolve_handles(
-            ctx, self.converter, handle_list or ['!' + str(ctx.author)]
+            ctx, self.converter, handle_list or (ctx.author,)
         )
         resp = [await cf.user.status(handle=handle) for handle in handles]
         all_solved_subs = [filt.filter_subs(submissions) for submissions in resp]
